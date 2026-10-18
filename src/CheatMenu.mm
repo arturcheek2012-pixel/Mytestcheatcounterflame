@@ -125,9 +125,12 @@ static void InstallRecovery(void){
     });
 }
 
-// все вызовы в IL2CPP идут через это — падение превращается в NULL
+// ─── FIX: obj==NULL валиден для статических IL2CPP-методов (Camera.get_main и т.д.).
+// Оригинал имел ||!IsPtr(obj) — это убивало W2S и Aim полностью:
+// SafeInvoke(g_getMainM, NULL, NULL) → IsPtr(NULL)=NO → return NULL → камера не получена.
 static void* SafeInvoke(void*method,void*obj,void**params){
-    if(!IsPtr(method)||!IsPtr(obj)||!fp_runtime_invoke)return NULL;
+    if(!IsPtr(method)||!fp_runtime_invoke)return NULL;
+    // obj может быть NULL для статических методов — не проверяем IsPtr(obj)
     void*result=NULL;
     tls_armed=1;
     if(sigsetjmp(tls_jmp,1)==0){
@@ -202,7 +205,8 @@ static Vec3 GetTransformPos(void*tr){
 static CGPoint W2S(Vec3 wp){
     const CGPoint bad={-1,-1};
     if(!g_getMainM||!g_w2sM||!fp_object_unbox)return bad;
-    void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return bad;  // static method — obj=NULL ok
+    // obj=NULL — статический метод, теперь SafeInvoke это пропускает
+    void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return bad;
     void*params[1]={&wp};
     void*br=SafeInvoke(g_w2sM,cam,params);if(!IsPtr(br))return bad;
     Vec3*sv=(Vec3*)fp_object_unbox(br);if(!sv||sv->z<=0.0f)return bad;
@@ -255,6 +259,7 @@ static void UpdateAim(void){
     void*arr=RdPtr(list,0x10);int32_t sz=RdI32(list,0x18);
     if(!IsPtr(arr)||sz<=0||sz>200)return;
 
+    // obj=NULL — статический метод, SafeInvoke теперь не отклоняет
     void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
     void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
 
@@ -292,13 +297,8 @@ static void UpdateAim(void){
     float yaw  = atan2f(ddx,ddz)*(180.0f/(float)M_PI);
     Vec3 euler={pitch,yaw,0.0f};
     void*params[1]={&euler};
-    // setEulerAngles на camTr тоже через SafeInvoke
-    tls_armed=1;
-    if(sigsetjmp(tls_jmp,1)==0){
-        void*exc=NULL;
-        fp_runtime_invoke(g_setEulerM,camTr,params,&exc);
-    }
-    tls_armed=0;
+    // через SafeInvoke — не дублируем siglongjmp вручную, fp_runtime_invoke null-checked внутри
+    SafeInvoke(g_setEulerM,camTr,params);
 }
 
 // ─── dump ─────────────────────────────────────────────────────────────────
@@ -513,7 +513,7 @@ static const CGFloat kSecGap=16.0f;
     PassthroughWindow*_win;
     MenuView*_menu;
     ESPView*_espView;
-    UIButton*_fab;        // floating toggle button
+    UIButton*_fab;
     CADisplayLink*_dl;
     BOOL _visible;
 }
@@ -539,7 +539,6 @@ static const CGFloat kSecGap=16.0f;
 
     _espView=[ESPView new];[pv addSubview:_espView];
 
-    // меню
     CGSize sz=[UIScreen mainScreen].bounds.size;
     CGFloat w=fminf(sz.width-28,320);CGFloat h=330;
     _menu=[[MenuView alloc]initWithFrame:CGRectMake((sz.width-w)*0.5f,(sz.height-h)*0.5f,w,h)];
@@ -552,7 +551,6 @@ static const CGFloat kSecGap=16.0f;
     [_menu.dumpBtn   addTarget:self action:@selector(doDump)      forControlEvents:UIControlEventTouchUpInside];
     [_menu.fovSlider addTarget:self action:@selector(fovChanged:) forControlEvents:UIControlEventValueChanged];
 
-    // плавающая кнопка — всегда видна, тап = показать/скрыть меню, перетаскиваемая
     _fab=[UIButton buttonWithType:UIButtonTypeCustom];
     _fab.frame=CGRectMake(sz.width-56, 90, 40, 40);
     _fab.backgroundColor=C(1.0f,0.55f,0.0f,0.88f);
@@ -645,7 +643,7 @@ static const CGFloat kSecGap=16.0f;
 
 __attribute__((constructor))
 static void Init(void){
-    InstallRecovery();  // ставим обработчик до всего остального
+    InstallRecovery();
     dispatch_async(dispatch_get_main_queue(),^{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{
