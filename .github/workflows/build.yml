@@ -1,0 +1,37 @@
+name: Build MemScan
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: brew install ldid
+
+      - name: Build
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang++ \
+            -arch arm64 -arch arm64e \
+            -fobjc-arc -std=c++17 -O2 \
+            -dynamiclib -fPIC \
+            -framework UIKit -framework Foundation \
+            -lc++ \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -o MemScan.dylib Tweak.mm
+
+      - name: Sign
+        run: ldid -S MemScan.dylib
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemScan
+          path: MemScan.dylib
+          retention-days: 30
