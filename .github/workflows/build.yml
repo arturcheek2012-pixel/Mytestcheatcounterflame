@@ -1,0 +1,38 @@
+name: Build CheatMenu.dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14   # arm64 runner, fat binary выйдет для обоих arch
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile fat dylib
+        run: |
+          clang++ \
+            -dynamiclib \
+            -framework Cocoa \
+            -framework QuartzCore \
+            -framework Carbon \
+            -framework ApplicationServices \
+            -arch arm64 -arch x86_64 \
+            -std=c++17 \
+            -fobjc-arc \
+            -O2 \
+            -o CheatMenu.dylib \
+            src/CheatMenu.mm
+
+      - name: Verify archs
+        run: lipo -info CheatMenu.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheatMenu-${{ github.sha }}
+          path: CheatMenu.dylib
+          retention-days: 30
