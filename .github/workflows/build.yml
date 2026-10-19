@@ -19,6 +19,7 @@ jobs:
             -shared \
             -framework UIKit \
             -framework Foundation \
+            -framework CoreGraphics \
             -o ConterFlame.dylib \
             ConterFlame.mm
 
