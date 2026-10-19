@@ -1,0 +1,28 @@
+name: Build ConterFlame
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile dylib
+        run: |
+          clang++ \
+            -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -shared \
+            -framework UIKit \
+            -framework Foundation \
+            -o ConterFlame.dylib \
+            ConterFlame.mm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConterFlame.dylib
+          path: ConterFlame.dylib
