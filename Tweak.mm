@@ -1,34 +1,21 @@
 #import <UIKit/UIKit.h>
-#import <dobby.h>
 #include <mach/mach.h>
 #include <sys/mman.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // OFFSETS — CounterFlame / base: 0x112a70000
 // ═══════════════════════════════════════════════════════════════════════════════
-// PlayerController
-#define OFF_PC_VIEW            0x80   // _view  -> PhotonView*
-#define OFF_PC_IS_DEATH        0xA8   // bool
-// PhotonView
-#define OFF_PV_IS_MINE         0x60   // bool <IsMine>k__BackingField
-// MonoBehaviour -> Component -> get_transform RVA
+#define OFF_PC_VIEW            0x80
+#define OFF_PC_IS_DEATH        0xA8
+#define OFF_PV_IS_MINE         0x60
 #define RVA_GET_TRANSFORM      0x2BAA1E8
-// Transform -> get_position RVA
 #define RVA_GET_POSITION       0x2BB4894
-// Camera::WorldToScreenPoint(Vector3, Eye) RVA
 #define RVA_W2S                0x2B73E5C
-// Camera::get_main RVA
 #define RVA_CAM_MAIN           0x2B741F0
-// GameController Singleton _instance  (static field, 0x0 inside class obj)
-#define RVA_GC_STATIC          0x1415FA4  // get_Player — не нужен; берём _alivePlayers через Instance
-// GameController Instance — это static поле _instance внутри static object
-// Singleton`1._instance offset = 0x0 внутри статик объекта класса
-#define OFF_GC_ALIVE_PLAYERS   0x118  // List<PlayerController> _alivePlayers
-// List<T> internals
-#define OFF_LIST_ITEMS         0x10   // backing array _items
-#define OFF_LIST_SIZE          0x18   // int _size
-#define OFF_ARRAY_DATA         0x20   // first element
-
+#define OFF_GC_ALIVE_PLAYERS   0x118
+#define OFF_LIST_ITEMS         0x10
+#define OFF_LIST_SIZE          0x18
+#define OFF_ARRAY_DATA         0x20
 #define BASE                   0x112a70000ULL
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -48,10 +35,46 @@ static inline bool ReadBool(uint64_t addr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Unity function typedefs (ARM64 IL2CPP calling convention)
+// inline hook — без dobby
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARM64 абсолютный прыжок: LDR X16, #8; BR X16; <addr64> = 16 байт
+static void _install_hook(void *target, void *replacement, void **orig_out) {
+    uintptr_t t    = (uintptr_t)target;
+    uintptr_t page = t & ~(uintptr_t)(PAGE_SIZE - 1);
+
+    // RWX на страницу цели
+    mprotect((void *)page, PAGE_SIZE * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    // трамплин для orig: копируем 16 байт оригинала + прыжок обратно
+    uint8_t *stub = (uint8_t *)mmap(NULL, PAGE_SIZE,
+                                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // первые 16 байт — оригинальный пролог
+    memcpy(stub, target, 16);
+    // прыжок на target+16
+    uintptr_t resume = t + 16;
+    *(uint32_t *)(stub + 16) = 0x58000050; // LDR X16, #8
+    *(uint32_t *)(stub + 20) = 0xD61F0200; // BR X16
+    *(uint64_t *)(stub + 24) = (uint64_t)resume;
+
+    sys_icache_invalidate(stub, 32);
+    *orig_out = stub;
+
+    // патч цели
+    uint8_t patch[16];
+    *(uint32_t *)(patch + 0) = 0x58000050; // LDR X16, #8
+    *(uint32_t *)(patch + 4) = 0xD61F0200; // BR X16
+    *(uint64_t *)(patch + 8) = (uint64_t)replacement;
+    memcpy(target, patch, 16);
+
+    sys_icache_invalidate(target, 16);
+    mprotect((void *)page, PAGE_SIZE * 2, PROT_READ | PROT_EXEC);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unity function typedefs
 // ═══════════════════════════════════════════════════════════════════════════════
 typedef struct { float x, y, z; } Vec3;
-typedef struct { float x, y, z, w; } Vec3s; // WorldToScreenPoint returns 3 floats via sret
 
 typedef uint64_t (*fn_get_transform_t)(uint64_t component, void *method);
 typedef Vec3     (*fn_get_position_t) (uint64_t transform,  void *method);
@@ -71,26 +94,14 @@ static void _resolveRVAs(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GameController Instance helper
+// PlayerController cache via hooks
 // ═══════════════════════════════════════════════════════════════════════════════
-// Singleton`1 хранит _instance как static поле (offset 0x0 в static storage).
-// Класс GameController — il2cpp_class получаем через любой живой объект или
-// через klass pointer (offset 0x0 от объекта). Проще: ищем живой GameController
-// через _alivePlayers косвенно или через photonViewList.
-// Самый надёжный путь без дополнительных API — пройти photonViewList и найти
-// PlayerController по типу. Делаем проще: держим кэш из OnEnable-хука.
+static NSMutableArray *gPlayerControllers;
 
-static NSMutableArray *gPlayerControllers; // кэш PlayerController*
-
-// Идём через photonViewList (NetworkingClient._photonViewList) offset 0xB0
-// NetworkingClient — статик в PhotonNetwork
-// PhotonNetwork статика: RVA get_CurrentRoom = 0x24B9FA4 (не нужен)
-// Проще и надёжнее — хукаем PlayerController Awake / OnDestroy
-
-typedef void (*fn_pc_awake_t)(uint64_t self, void *method);
-static fn_pc_awake_t orig_pc_awake;
-
+typedef void (*fn_pc_awake_t)  (uint64_t self, void *method);
 typedef void (*fn_pc_destroy_t)(uint64_t self, void *method);
+
+static fn_pc_awake_t   orig_pc_awake;
 static fn_pc_destroy_t orig_pc_destroy;
 
 static void hook_pc_awake(uint64_t self, void *method) {
@@ -111,20 +122,20 @@ static void hook_pc_destroy(uint64_t self, void *method) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// w2s wrapper — возвращает CGPoint в screen coords (origin top-left)
+// w2s
 // ═══════════════════════════════════════════════════════════════════════════════
 static BOOL w2s(uint64_t cam, Vec3 worldPos, CGPoint *out) {
     if (!cam || !fn_w2s) return NO;
     Vec3 sp = fn_w2s(cam, worldPos, 0, nil);
-    if (sp.z <= 0.f) return NO;   // за камерой
+    if (sp.z <= 0.f) return NO;
     CGSize screen = UIScreen.mainScreen.bounds.size;
     out->x = sp.x;
-    out->y = screen.height - sp.y; // Unity Y — снизу, UIKit — сверху
+    out->y = screen.height - sp.y;
     return YES;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ESP overlay view
+// ESP overlay
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezESPView : UIView
 @end
@@ -133,7 +144,7 @@ static BOOL w2s(uint64_t cam, Vec3 worldPos, CGPoint *out) {
 
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
-    self.backgroundColor   = [UIColor clearColor];
+    self.backgroundColor        = [UIColor clearColor];
     self.userInteractionEnabled = NO;
     return self;
 }
@@ -141,33 +152,29 @@ static BOOL w2s(uint64_t cam, Vec3 worldPos, CGPoint *out) {
 - (void)drawRect:(CGRect)r {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
-
     if (!fn_cam_main || !fn_get_transform || !fn_get_position || !fn_w2s) return;
 
     uint64_t cam = fn_cam_main(nil);
     if (!cam) return;
 
     CGContextSetLineWidth(ctx, 1.5f);
-    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
+    CGContextSetStrokeColorWithColor(ctx,
+        [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
 
     for (NSValue *v in [gPlayerControllers copy]) {
         uint64_t pc = 0;
         [v getValue:&pc];
         if (!pc) continue;
 
-        // мёртвый игрок — пропуск
         if (ReadBool(pc + OFF_PC_IS_DEATH)) continue;
 
-        // свой — пропуск (IsMine на PhotonView)
         uint64_t pv = ReadU64(pc + OFF_PC_VIEW);
         if (pv && ReadBool(pv + OFF_PV_IS_MINE)) continue;
 
-        // позиция
         uint64_t tfm = fn_get_transform(pc, nil);
         if (!tfm) continue;
         Vec3 pos = fn_get_position(tfm, nil);
 
-        // верх бокса: +1.8м
         Vec3 top = { pos.x, pos.y + 1.8f, pos.z };
 
         CGPoint scBot, scTop;
@@ -179,17 +186,14 @@ static BOOL w2s(uint64_t cam, Vec3 worldPos, CGPoint *out) {
         CGFloat w = h * 0.45f;
         CGFloat x = scBot.x - w * .5f;
 
-        // 2D box
         CGContextStrokeRect(ctx, CGRectMake(x, scTop.y, w, h));
 
-        // маленький хедер-бар сверху (акцент)
         CGContextSetStrokeColorWithColor(ctx,
             [UIColor colorWithRed:.9f green:.2f blue:.1f alpha:.9f].CGColor);
         CGContextMoveToPoint(ctx, x, scTop.y);
         CGContextAddLineToPoint(ctx, x + w, scTop.y);
         CGContextStrokePath(ctx);
 
-        // сброс цвета обратно
         CGContextSetStrokeColorWithColor(ctx,
             [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
     }
@@ -198,13 +202,13 @@ static BOOL w2s(uint64_t cam, Vec3 worldPos, CGPoint *out) {
 @end
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UI — меню
+// UI constants & colors
 // ═══════════════════════════════════════════════════════════════════════════════
-static const CGFloat kMenuW      = 420.f;
-static const CGFloat kMenuH      = 380.f;
-static const CGFloat kSidebarW   = 130.f;
-static const CGFloat kHeaderH    = 44.f;
-static const CGFloat kMarginUI   = 12.f;
+static const CGFloat kMenuW    = 420.f;
+static const CGFloat kMenuH    = 380.f;
+static const CGFloat kSidebarW = 130.f;
+static const CGFloat kHeaderH  = 44.f;
+static const CGFloat kMarginUI = 12.f;
 
 static UIColor *BG(void)       { return [UIColor colorWithRed:.10f green:.10f blue:.10f alpha:.97f]; }
 static UIColor *Sidebar(void)  { return [UIColor colorWithRed:.07f green:.07f blue:.07f alpha:1.f ]; }
@@ -214,20 +218,21 @@ static UIColor *TextMain(void) { return [UIColor colorWithWhite:.92f alpha:1.f];
 static UIColor *TextDim(void)  { return [UIColor colorWithWhite:.45f alpha:1.f]; }
 static UIColor *Divider(void)  { return [UIColor colorWithWhite:.2f  alpha:1.f]; }
 
-// ── ESP toggle state ──────────────────────────────────────────────────────────
-static BOOL gESPEnabled = NO;
-static CrezESPView *gESPView;
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESP state
+// ═══════════════════════════════════════════════════════════════════════════════
+static BOOL           gESPEnabled = NO;
+static CrezESPView   *gESPView;
 static CADisplayLink *gDisplayLink;
 
-static void espTick(id sender) {
-    [gESPView setNeedsDisplay];
-}
-
-// ── toggle switch ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Toggle switch
+// ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezToggleSwitch : UIControl
 @property (nonatomic, assign) BOOL on;
-@property (nonatomic, copy) void (^onChange)(BOOL);
+@property (nonatomic, copy)   void (^onChange)(BOOL);
 @end
+
 @implementation CrezToggleSwitch {
     UIView *_track, *_thumb;
 }
@@ -235,11 +240,11 @@ static void espTick(id sender) {
     self = [super initWithFrame:CGRectMake(0,0,44,24)];
     _track = [[UIView alloc] initWithFrame:self.bounds];
     _track.layer.cornerRadius = 12.f;
-    _track.backgroundColor = [UIColor colorWithWhite:.25f alpha:1.f];
+    _track.backgroundColor    = [UIColor colorWithWhite:.25f alpha:1.f];
     [self addSubview:_track];
     _thumb = [[UIView alloc] initWithFrame:CGRectMake(2,2,20,20)];
     _thumb.layer.cornerRadius = 10.f;
-    _thumb.backgroundColor = [UIColor whiteColor];
+    _thumb.backgroundColor    = [UIColor whiteColor];
     [self addSubview:_thumb];
     [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
     return self;
@@ -247,23 +252,24 @@ static void espTick(id sender) {
 - (void)_tap {
     self.on = !self.on;
     [UIView animateWithDuration:.18f animations:^{
-        self->_thumb.frame = self.on
-            ? CGRectMake(22,2,20,20)
-            : CGRectMake(2,2,20,20);
+        self->_thumb.frame = self.on ? CGRectMake(22,2,20,20) : CGRectMake(2,2,20,20);
         self->_track.backgroundColor = self.on ? Accent() : [UIColor colorWithWhite:.25f alpha:1.f];
     }];
     if (self.onChange) self.onChange(self.on);
 }
 @end
 
-// ── side item ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Sidebar item
+// ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezSideItem : UIControl
 @property (nonatomic, assign) BOOL   active;
 @property (nonatomic, copy)   void  (^action)(void);
 @end
+
 @implementation CrezSideItem {
-    UIView  *_activeBG, *_bar;
-    UILabel *_lbl;
+    UIView      *_activeBG, *_bar;
+    UILabel     *_lbl;
     UIImageView *_ico;
 }
 - (instancetype)initWithTitle:(NSString *)t icon:(NSString *)sf {
@@ -278,8 +284,8 @@ static void espTick(id sender) {
     [self addSubview:_bar];
     _ico = [[UIImageView alloc] init];
     if (@available(iOS 13,*)) { _ico.image = [UIImage systemImageNamed:sf]; }
-    _ico.tintColor = TextDim();
-    _ico.contentMode = UIViewContentModeScaleAspectFit;
+    _ico.tintColor    = TextDim();
+    _ico.contentMode  = UIViewContentModeScaleAspectFit;
     [self addSubview:_ico];
     _lbl = [[UILabel alloc] init];
     _lbl.text      = t;
@@ -306,39 +312,42 @@ static void espTick(id sender) {
 }
 @end
 
-// ── контент вкладок ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Content view (tabs)
+// ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezContentView : UIView
 - (instancetype)initForTab:(NSInteger)tab;
 @end
+
 @implementation CrezContentView
 - (instancetype)initForTab:(NSInteger)tab {
     self = [super initWithFrame:CGRectZero];
     self.backgroundColor = [UIColor clearColor];
 
-    if (tab == 0) { // Aim — пусто
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0,0,0,0)];
-        l.tag = 99;
-        l.text = @"— пусто —";
+    if (tab == 0) {
+        UILabel *l  = [[UILabel alloc] init];
+        l.tag       = 99;
+        l.text      = @"— пусто —";
         l.textColor = [UIColor colorWithWhite:1.f alpha:.15f];
-        l.font = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
+        l.font      = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
         l.textAlignment = NSTextAlignmentCenter;
         [self addSubview:l];
-    } else if (tab == 1) { // Visuals — ESP toggle
-        UILabel *lbl = [[UILabel alloc] init];
-        lbl.text = @"ESP";
+    } else if (tab == 1) {
+        UILabel *lbl  = [[UILabel alloc] init];
+        lbl.text      = @"ESP";
         lbl.textColor = TextMain();
-        lbl.font = [UIFont systemFontOfSize:13.f weight:UIFontWeightMedium];
+        lbl.font      = [UIFont systemFontOfSize:13.f weight:UIFontWeightMedium];
+        lbl.tag       = 1;
         [self addSubview:lbl];
 
         CrezToggleSwitch *sw = [[CrezToggleSwitch alloc] init];
-        sw.on = gESPEnabled;
+        sw.on  = gESPEnabled;
+        sw.tag = 2;
         sw.onChange = ^(BOOL on) {
-            gESPEnabled = on;
+            gESPEnabled    = on;
             gESPView.hidden = !on;
             if (on) {
                 [gDisplayLink invalidate];
-                gDisplayLink = [CADisplayLink displayLinkWithTarget:[NSBlockOperation blockOperationWithBlock:^{}]
-                                                           selector:@selector(invoke)];
                 gDisplayLink = [CADisplayLink displayLinkWithTarget:gESPView
                                                            selector:@selector(setNeedsDisplay)];
                 [gDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -348,9 +357,6 @@ static void espTick(id sender) {
             }
         };
         [self addSubview:sw];
-
-        lbl.tag = 1;
-        sw.tag  = 2;
     }
     return self;
 }
@@ -359,7 +365,6 @@ static void espTick(id sender) {
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
     UILabel *placeholder = [self viewWithTag:99];
     if (placeholder) { placeholder.frame = CGRectMake(0,0,w,h); return; }
-
     UILabel *lbl = [self viewWithTag:1];
     UIView  *sw  = [self viewWithTag:2];
     if (lbl && sw) {
@@ -370,14 +375,16 @@ static void espTick(id sender) {
 }
 @end
 
-// ── основное меню ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Main menu
+// ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezMenu : UIView
 @end
+
 @implementation CrezMenu {
     NSMutableArray  *_sideItems;
     NSInteger        _activeIdx;
     CrezContentView *_contentView;
-    UIButton        *_closeBtn;
     UIButton        *_showBtn;
     BOOL             _menuHidden;
     CGPoint          _dragStart;
@@ -385,8 +392,8 @@ static void espTick(id sender) {
 }
 
 - (instancetype)init {
-    CGFloat sw  = UIScreen.mainScreen.bounds.size.width;
-    CGFloat mw  = MIN(kMenuW, sw - kMarginUI * 2.f);
+    CGFloat sw = UIScreen.mainScreen.bounds.size.width;
+    CGFloat mw = MIN(kMenuW, sw - kMarginUI * 2.f);
     self = [super initWithFrame:CGRectMake(kMarginUI, 80.f, mw, kMenuH)];
     self.backgroundColor    = BG();
     self.layer.cornerRadius = 4.f;
@@ -403,30 +410,30 @@ static void espTick(id sender) {
 }
 
 - (void)_buildHeader {
-    CGFloat fw = self.bounds.size.width;
+    CGFloat fw  = self.bounds.size.width;
     UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,fw,kHeaderH)];
-    hdr.backgroundColor = [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:1.f];
-    hdr.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    hdr.backgroundColor    = [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:1.f];
+    hdr.autoresizingMask   = UIViewAutoresizingFlexibleWidth;
     [self addSubview:hdr];
 
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(14.f,0,fw-60.f,kHeaderH)];
-    t.text = @"⬡  CHEAT";
-    t.font = [UIFont systemFontOfSize:15.f weight:UIFontWeightBold];
-    t.textColor = TextMain();
+    t.text            = @"⬡  CHEAT";
+    t.font            = [UIFont systemFontOfSize:15.f weight:UIFontWeightBold];
+    t.textColor       = TextMain();
     t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [hdr addSubview:t];
 
-    _closeBtn = [[UIButton alloc] initWithFrame:CGRectMake(fw-36.f,0,36.f,kHeaderH)];
-    _closeBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [_closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-    [_closeBtn setTitleColor:TextDim() forState:UIControlStateNormal];
-    _closeBtn.titleLabel.font = [UIFont systemFontOfSize:14.f];
-    [_closeBtn addTarget:self action:@selector(_toggleHide)
-        forControlEvents:UIControlEventTouchUpInside];
-    [hdr addSubview:_closeBtn];
+    UIButton *closeBtn = [[UIButton alloc] initWithFrame:CGRectMake(fw-36.f,0,36.f,kHeaderH)];
+    closeBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:TextDim() forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont systemFontOfSize:14.f];
+    [closeBtn addTarget:self action:@selector(_toggleHide)
+       forControlEvents:UIControlEventTouchUpInside];
+    [hdr addSubview:closeBtn];
 
     UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0,kHeaderH-1.f,fw,1.f)];
-    div.backgroundColor = Divider();
+    div.backgroundColor  = Divider();
     div.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [hdr addSubview:div];
 }
@@ -459,7 +466,7 @@ static void espTick(id sender) {
 
 - (void)_buildContent:(NSInteger)idx {
     [_contentView removeFromSuperview];
-    CGFloat fw = self.bounds.size.width;
+    CGFloat fw   = self.bounds.size.width;
     _contentView = [[CrezContentView alloc] initForTab:idx];
     _contentView.frame = CGRectMake(kSidebarW, kHeaderH,
                                     fw - kSidebarW, kMenuH - kHeaderH);
@@ -478,15 +485,17 @@ static void espTick(id sender) {
     switch (gr.state) {
         case UIGestureRecognizerStateBegan:
             _dragStart   = [gr locationInView:sv];
-            _originStart = self.frame.origin; break;
+            _originStart = self.frame.origin;
+            break;
         case UIGestureRecognizerStateChanged: {
             CGPoint c = [gr locationInView:sv];
-            CGRect f  = self.frame;
+            CGRect  f = self.frame;
             f.origin.x = _originStart.x + (c.x - _dragStart.x);
             f.origin.y = _originStart.y + (c.y - _dragStart.y);
             f.origin.x = MAX(kMarginUI, MIN(f.origin.x, sv.bounds.size.width  - f.size.width  - kMarginUI));
             f.origin.y = MAX(kMarginUI, MIN(f.origin.y, sv.bounds.size.height - f.size.height - kMarginUI));
-            self.frame = f; break;
+            self.frame = f;
+            break;
         }
         default: break;
     }
@@ -503,7 +512,7 @@ static void espTick(id sender) {
     if (_menuHidden) {
         if (!_showBtn) {
             _showBtn = [[UIButton alloc] initWithFrame:CGRectMake(0,0,36.f,36.f)];
-            _showBtn.backgroundColor = Accent();
+            _showBtn.backgroundColor    = Accent();
             _showBtn.layer.cornerRadius = 4.f;
             [_showBtn setTitle:@"⬡" forState:UIControlStateNormal];
             [_showBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -525,6 +534,7 @@ static void espTick(id sender) {
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface CrezMenuWindow : UIWindow
 @end
+
 @implementation CrezMenuWindow
 
 - (instancetype)init {
@@ -535,7 +545,6 @@ static void espTick(id sender) {
     self.rootViewController.view.backgroundColor = [UIColor clearColor];
     self.hidden = NO;
 
-    // ESP overlay — под меню
     gESPView = [[CrezESPView alloc] initWithFrame:UIScreen.mainScreen.bounds];
     gESPView.hidden = YES;
     [self.rootViewController.view addSubview:gESPView];
@@ -545,7 +554,7 @@ static void espTick(id sender) {
 
     [[NSNotificationCenter defaultCenter]
         addObserver:self selector:@selector(_rotate)
-               name:UIApplicationDidChangeStatusBarOrientationNotification object:nil];
+               name:UIWindowDidBecomeVisibleNotification object:nil];
     return self;
 }
 
@@ -574,12 +583,10 @@ __attribute__((constructor)) static void _init(void) {
     gPlayerControllers = [NSMutableArray new];
     _resolveRVAs();
 
-    // хуки на PlayerController.Awake / OnDestroy
-    // RVA: Awake = 0x157AB60, OnDestroy = 0x157C050
     void *awake_ptr   = (void *)(BASE + 0x157AB60);
     void *destroy_ptr = (void *)(BASE + 0x157C050);
-    DobbyHook(awake_ptr,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
-    DobbyHook(destroy_ptr, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
+    _install_hook(awake_ptr,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
+    _install_hook(destroy_ptr, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         gWin = [[CrezMenuWindow alloc] init];
