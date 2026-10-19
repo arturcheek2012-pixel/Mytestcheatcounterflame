@@ -1,57 +1,60 @@
 #import <UIKit/UIKit.h>
 
 // ── config ────────────────────────────────────────────────────────────────────
-static const CGFloat kToggleW  = 32.f;   // ширина кнопки скрыть
-static const CGFloat kBorder   = 1.5f;
-static const CGFloat kMargin   = 10.f;   // отступ от краёв экрана
-static const CGFloat kMaxW     = 460.f;  // макс ширина панели
+static const CGFloat kToggleW   = 32.f;
+static const CGFloat kTabW      = 80.f;   // ширина одного таба каталога
+static const CGFloat kDividerW  = 1.f;    // вертикальная черта между табами и контентом
+static const CGFloat kBorder    = 1.5f;
+static const CGFloat kMargin    = 10.f;
+static const CGFloat kMaxW      = 480.f;
+
+static NSArray<NSString *> *kTabs(void) {
+    return @[@"Aim", @"Visuals"];
+}
 
 static CGFloat MenuH(void) {
-    // 5.5% короткой стороны экрана, зажато в [44, 54]
     CGFloat s = MIN(UIScreen.mainScreen.bounds.size.width,
                     UIScreen.mainScreen.bounds.size.height);
     return MAX(44.f, MIN(s * 0.055f, 54.f));
 }
 
-static UIColor *BG(void)     { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.96f]; }
-static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f]; }
+static UIColor *BG(void)       { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.97f]; }
+static UIColor *Accent(void)   { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f ]; }
+static UIColor *TabBG(void)    { return [UIColor colorWithRed:.12f green:.12f blue:.12f alpha:1.f ]; }
+static UIColor *TextDim(void)  { return [UIColor colorWithWhite:1.f alpha:.4f]; }
+static UIColor *TextHot(void)  { return [UIColor whiteColor]; }
 // ─────────────────────────────────────────────────────────────────────────────
 
 @interface CrezBar : UIView
-- (void)relayoutForBounds:(CGRect)windowBounds;
+- (void)relayoutForBounds:(CGRect)wb;
 @end
-
 @interface CrezMenuWindow : UIWindow
 @property (nonatomic, strong) CrezBar *bar;
 @end
 
-// ── кнопка ◀ / ▶ ─────────────────────────────────────────────────────────────
+// ── ◀/▶ кнопка ───────────────────────────────────────────────────────────────
 @interface CrezToggleBtn : UIControl
-@property (nonatomic, assign) BOOL expanded;   // YES = меню открыто
+@property (nonatomic, assign) BOOL expanded;
 @property (nonatomic, copy)   void (^action)(void);
 @end
-
 @implementation CrezToggleBtn
-
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     self.backgroundColor = Accent();
     self.expanded = YES;
-    [self addTarget:self action:@selector(_tap)
-   forControlEvents:UIControlEventTouchUpInside];
+    [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
     return self;
 }
 - (void)_tap { if (self.action) self.action(); }
 - (void)setExpanded:(BOOL)v { _expanded = v; [self setNeedsDisplay]; }
 - (void)drawRect:(CGRect)r {
-    CGFloat cx = r.size.width*.5f, cy = r.size.height*.5f;
-    CGFloat aw = 5.f, ah = 8.f;
+    CGFloat cx = r.size.width*.5f, cy = r.size.height*.5f, aw = 5.f, ah = 8.f;
     UIBezierPath *p = [UIBezierPath new];
-    if (_expanded) {            // ◀ скрыть
+    if (_expanded) {
         [p moveToPoint:CGPointMake(cx+aw, cy-ah)];
         [p addLineToPoint:CGPointMake(cx-aw, cy)];
         [p addLineToPoint:CGPointMake(cx+aw, cy+ah)];
-    } else {                    // ▶ показать
+    } else {
         [p moveToPoint:CGPointMake(cx-aw, cy-ah)];
         [p addLineToPoint:CGPointMake(cx+aw, cy)];
         [p addLineToPoint:CGPointMake(cx-aw, cy+ah)];
@@ -62,15 +65,63 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue
 }
 @end
 
-// ── панель ────────────────────────────────────────────────────────────────────
+// ── таб каталога ──────────────────────────────────────────────────────────────
+@interface CrezTabBtn : UIControl
+@property (nonatomic, assign) BOOL active;
+@property (nonatomic, copy)   NSString *title;
+@property (nonatomic, copy)   void (^action)(void);
+@end
+@implementation CrezTabBtn {
+    UILabel *_lbl;
+    UIView  *_accent;   // нижняя/левая оранжевая черта
+}
+- (instancetype)initWithTitle:(NSString *)t {
+    self = [super initWithFrame:CGRectZero];
+    self.title = t;
+    self.backgroundColor = [UIColor clearColor];
+
+    _lbl = [[UILabel alloc] initWithFrame:CGRectZero];
+    _lbl.text          = t;
+    _lbl.textAlignment = NSTextAlignmentCenter;
+    _lbl.font          = [UIFont systemFontOfSize:12.f weight:UIFontWeightSemibold];
+    _lbl.textColor     = TextDim();
+    [self addSubview:_lbl];
+
+    // левая оранжевая черта (активный таб)
+    _accent = [[UIView alloc] initWithFrame:CGRectZero];
+    _accent.backgroundColor = Accent();
+    _accent.hidden = YES;
+    [self addSubview:_accent];
+
+    [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
+    return self;
+}
+- (void)_tap { if (self.action) self.action(); }
+- (void)setActive:(BOOL)v {
+    _active = v;
+    _lbl.textColor  = v ? TextHot() : TextDim();
+    _accent.hidden  = !v;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _lbl.frame    = self.bounds;
+    // левая вертикальная черта 3pt
+    _accent.frame = CGRectMake(0, 4.f, 3.f, self.bounds.size.height - 8.f);
+}
+@end
+
+// ── основная панель ───────────────────────────────────────────────────────────
 @implementation CrezBar {
-    CrezToggleBtn *_btn;
-    UIScrollView  *_scroll;
-    UILabel       *_placeholder;
-    BOOL           _expanded;
-    CGPoint        _dragStart;
-    CGPoint        _originStart;
-    CGFloat        _fullWidth;   // ширина в развёрнутом виде
+    CrezToggleBtn        *_toggle;
+    NSMutableArray       *_tabs;      // CrezTabBtn[]
+    UIView               *_divider;
+    UIView               *_content;  // правая часть — будущие опции
+    UILabel              *_empty;
+    NSInteger             _activeTab;
+    BOOL                  _expanded;
+    CGFloat               _fullWidth;
+    CGPoint               _dragStart;
+    CGPoint               _originStart;
 }
 
 - (instancetype)initWithBounds:(CGRect)wb {
@@ -82,32 +133,46 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue
     self.layer.borderWidth  = kBorder;
     self.layer.cornerRadius = 0;
     self.clipsToBounds      = YES;
-    _expanded = YES;
+    _expanded  = YES;
+    _activeTab = 0;
 
-    // scroll
-    _scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
-    _scroll.backgroundColor = [UIColor clearColor];
-    _scroll.showsHorizontalScrollIndicator = NO;
-    _scroll.showsVerticalScrollIndicator   = NO;
-    _scroll.bounces = YES;
-    [self addSubview:_scroll];
+    // ── левая колонка табов ───────────────────────────────────────────────────
+    NSArray *names = kTabs();
+    _tabs = [NSMutableArray new];
+    for (NSString *n in names) {
+        CrezTabBtn *t = [[CrezTabBtn alloc] initWithTitle:n];
+        NSInteger idx = [names indexOfObject:n];
+        __weak CrezBar *ws = self;
+        t.action = ^{ [ws _selectTab:idx]; };
+        [self addSubview:t];
+        [_tabs addObject:t];
+    }
+    ((CrezTabBtn *)_tabs[0]).active = YES;
 
-    // placeholder
-    _placeholder = [[UILabel alloc] initWithFrame:CGRectZero];
-    _placeholder.text          = @"— пусто —";
-    _placeholder.textColor     = [UIColor colorWithWhite:1.f alpha:.22f];
-    _placeholder.font          = [UIFont monospacedSystemFontOfSize:11.f
-                                                             weight:UIFontWeightRegular];
-    _placeholder.textAlignment = NSTextAlignmentCenter;
-    [_scroll addSubview:_placeholder];
+    // ── разделитель ───────────────────────────────────────────────────────────
+    _divider = [[UIView alloc] initWithFrame:CGRectZero];
+    _divider.backgroundColor = [UIColor colorWithWhite:1.f alpha:.1f];
+    [self addSubview:_divider];
 
-    // кнопка
-    _btn = [[CrezToggleBtn alloc] initWithFrame:CGRectZero];
+    // ── контент (правая часть) ────────────────────────────────────────────────
+    _content = [[UIView alloc] initWithFrame:CGRectZero];
+    _content.backgroundColor = [UIColor clearColor];
+    [self addSubview:_content];
+
+    _empty = [[UILabel alloc] initWithFrame:CGRectZero];
+    _empty.text          = @"— пусто —";
+    _empty.textColor     = [UIColor colorWithWhite:1.f alpha:.18f];
+    _empty.font          = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
+    _empty.textAlignment = NSTextAlignmentCenter;
+    [_content addSubview:_empty];
+
+    // ── кнопка скрыть ─────────────────────────────────────────────────────────
+    _toggle = [[CrezToggleBtn alloc] initWithFrame:CGRectZero];
     __weak CrezBar *ws = self;
-    _btn.action = ^{ [ws _toggle]; };
-    [self addSubview:_btn];
+    _toggle.action = ^{ [ws _toggleVisibility]; };
+    [self addSubview:_toggle];
 
-    // drag — только по самой панели, не по scroll
+    // drag
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
     pan.maximumNumberOfTouches = 1;
@@ -117,34 +182,56 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue
     return self;
 }
 
-// вызывается при init и при каждом повороте
+- (void)_selectTab:(NSInteger)idx {
+    _activeTab = idx;
+    for (NSInteger i = 0; i < (NSInteger)_tabs.count; i++)
+        ((CrezTabBtn *)_tabs[i]).active = (i == idx);
+    // здесь будет переключение контента
+}
+
+// ── layout ────────────────────────────────────────────────────────────────────
 - (void)relayoutForBounds:(CGRect)wb {
     CGFloat h  = MenuH();
     CGFloat sw = wb.size.width - kMargin * 2.f;
     _fullWidth  = MIN(sw, kMaxW);
     CGFloat x  = kMargin + (sw - _fullWidth) * .5f;
-
-    // сохраняем Y если уже позиционировали, иначе — верх
-    CGFloat y = (self.frame.size.height > 0) ? self.frame.origin.y : kMargin;
-    // clamp y
+    CGFloat y  = (self.frame.size.height > 0) ? self.frame.origin.y : kMargin;
     y = MAX(kMargin, MIN(y, wb.size.height - h - kMargin));
-
     CGFloat curW = _expanded ? _fullWidth : kToggleW;
     self.frame = CGRectMake(x, y, curW, h);
-    [self _applyInternalLayout];
+    [self _applyLayout];
 }
 
-- (void)_applyInternalLayout {
+- (void)_applyLayout {
     CGFloat w = self.bounds.size.width;
     CGFloat h = self.bounds.size.height;
-    _scroll.frame       = CGRectMake(0, 0, w - kToggleW, h);
-    _placeholder.frame  = _scroll.bounds;
-    _btn.frame          = CGRectMake(w - kToggleW, 0, kToggleW, h);
+    NSInteger n = (NSInteger)_tabs.count;
+
+    // ширина левой колонки = n * kTabW, но не больше 40% панели
+    CGFloat tabsAreaW = MIN(n * kTabW, w * .4f);
+    CGFloat tabW      = (n > 0) ? tabsAreaW / n : kTabW;
+
+    for (NSInteger i = 0; i < n; i++) {
+        UIView *t = _tabs[i];
+        t.frame = CGRectMake(i * tabW, 0, tabW, h);
+        t.hidden = !_expanded;
+    }
+
+    _divider.frame  = CGRectMake(tabsAreaW, 0, kDividerW, h);
+    _divider.hidden = !_expanded;
+
+    CGFloat contentX = tabsAreaW + kDividerW;
+    CGFloat contentW = MAX(0, w - contentX - kToggleW);
+    _content.frame   = CGRectMake(contentX, 0, contentW, h);
+    _content.hidden  = !_expanded;
+    _empty.frame     = _content.bounds;
+
+    _toggle.frame    = CGRectMake(w - kToggleW, 0, kToggleW, h);
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    [self _applyInternalLayout];
+    [self _applyLayout];
 }
 
 // ── drag ──────────────────────────────────────────────────────────────────────
@@ -173,14 +260,12 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue
 }
 
 // ── toggle ────────────────────────────────────────────────────────────────────
-- (void)_toggle {
+- (void)_toggleVisibility {
     _expanded = !_expanded;
-    _btn.expanded = _expanded;
+    _toggle.expanded = _expanded;
 
     UIView *sv = self.superview;
     CGFloat targetW = _expanded ? _fullWidth : kToggleW;
-
-    // при открытии — clamp x чтобы не вылезло за экран
     CGRect f = self.frame;
     if (_expanded) {
         CGFloat maxX = sv.bounds.size.width - targetW - kMargin;
@@ -188,12 +273,11 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue
     }
     f.size.width = targetW;
 
-    [UIView animateWithDuration:.2f
-                          delay:0
+    [UIView animateWithDuration:.2f delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
         self.frame = f;
-        self->_scroll.alpha = self->_expanded ? 1.f : 0.f;
+        [self _applyLayout];
     } completion:nil];
 }
 
