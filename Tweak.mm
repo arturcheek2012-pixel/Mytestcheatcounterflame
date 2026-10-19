@@ -198,8 +198,9 @@ static UIColor *kColorText()   { return [UIColor whiteColor]; }
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width;
-    _itemsScroll.frame = CGRectMake(0, 0, w - kToggleWidth, kMenuHeight);
-    _toggleTab.frame   = CGRectMake(w - kToggleWidth, 0, kToggleWidth, kMenuHeight);
+    CGFloat h = MenuHeight();
+    _itemsScroll.frame = CGRectMake(0, 0, w - kToggleWidth, h);
+    _toggleTab.frame   = CGRectMake(w - kToggleWidth, 0, kToggleWidth, h);
 }
 
 @end
