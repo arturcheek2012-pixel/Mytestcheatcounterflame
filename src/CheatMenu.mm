@@ -24,6 +24,13 @@ typedef struct { float x,y,z; } Vec3;
 #define OFF_SKEL_HEAD         0xA8
 #define OFF_SKEL_CHEST        0xB0
 
+// CameraMovementController — игра сама читает и применяет эти поля каждый Update()
+// пишем сюда вместо set_eulerAngles, которое сразу перезатирается игрой
+#define OFF_CAMC_PITCH    0x3C   // float  — вертикальный угол (degrees)
+#define OFF_CAMC_YAW      0x40   // float  — горизонтальный угол (degrees)
+#define OFF_CAMC_CAMPITCH 0x50   // float  — cameraPitch, тоже применяется к transform
+#define OFF_CAMC_RECOIL   0x64   // Vec3   — recoilRotation, зануляем чтобы не мешал
+
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
 static void*    (*fp_assembly_image)(void*);
@@ -44,6 +51,8 @@ static void*    (*fp_class_static_data)(void*);
 static void*    (*fp_class_method_from_name)(void*,const char*,int);
 static void*    (*fp_runtime_invoke)(void*,void*,void**,void**);
 static void*    (*fp_object_unbox)(void*);
+static void*    (*fp_class_get_type)(void*);      // il2cpp_class_get_type
+static void*    (*fp_type_get_object)(void*);     // il2cpp_type_get_object → System.Type
 
 static BOOL g_apiLoaded=NO;
 static BOOL LoadAPI(void){
@@ -69,6 +78,8 @@ static BOOL LoadAPI(void){
     R(fp_class_method_from_name,"il2cpp_class_get_method_from_name");
     R(fp_runtime_invoke,"il2cpp_runtime_invoke");
     R(fp_object_unbox,"il2cpp_object_unbox");
+    R(fp_class_get_type,"il2cpp_class_get_type");
+    R(fp_type_get_object,"il2cpp_type_get_object");
 #undef R
     g_apiLoaded=(fp_domain_get!=NULL&&fp_class_from_name!=NULL);
     return g_apiLoaded;
@@ -93,9 +104,6 @@ static int32_t RdI32(const void*b,size_t o){int32_t v=0;SafeRead((const uint8_t*
 static BOOL    RdBool(const void*b,size_t o){bool v=false;SafeRead((const uint8_t*)b+o,&v,sizeof(bool));return v?YES:NO;}
 
 // ─── signal recovery ──────────────────────────────────────────────────────
-// @try/@catch не ловит EXC_BAD_ACCESS — это сигнал, не ObjC-исключение.
-// runtime_invoke на уничтоженном Unity-объекте → SIGSEGV/SIGBUS.
-// siglongjmp восстанавливает выполнение после крита.
 
 static __thread sigjmp_buf   tls_jmp;
 static __thread volatile int tls_armed = 0;
@@ -106,7 +114,6 @@ static void sig_recover(int sig, siginfo_t *info, void *uctx){
         tls_armed=0;
         siglongjmp(tls_jmp,1);
     }
-    // не наш сигнал — отдаём старому хэндлеру
     struct sigaction *old=(sig==SIGSEGV)?&g_oldSEGV:&g_oldBUS;
     sigaction(sig,old,NULL);
     raise(sig);
@@ -125,12 +132,9 @@ static void InstallRecovery(void){
     });
 }
 
-// ─── FIX: obj==NULL валиден для статических IL2CPP-методов (Camera.get_main и т.д.).
-// Оригинал имел ||!IsPtr(obj) — это убивало W2S и Aim полностью:
-// SafeInvoke(g_getMainM, NULL, NULL) → IsPtr(NULL)=NO → return NULL → камера не получена.
+// obj=NULL валиден для статических IL2CPP-методов (Camera.get_main, FindObjectOfType и т.д.)
 static void* SafeInvoke(void*method,void*obj,void**params){
     if(!IsPtr(method)||!fp_runtime_invoke)return NULL;
-    // obj может быть NULL для статических методов — не проверяем IsPtr(obj)
     void*result=NULL;
     tls_armed=1;
     if(sigsetjmp(tls_jmp,1)==0){
@@ -140,6 +144,15 @@ static void* SafeInvoke(void*method,void*obj,void**params){
     }
     tls_armed=0;
     return result;
+}
+
+// прямая запись float в managed-объект — игра читает это сама в следующем Update()
+static void SafeWriteF(void*obj,size_t off,float val){
+    if(!IsPtr(obj))return;
+    tls_armed=1;
+    if(sigsetjmp(tls_jmp,1)==0)
+        *(float*)((uint8_t*)obj+off)=val;
+    tls_armed=0;
 }
 
 // ─── unity base ───────────────────────────────────────────────────────────
@@ -156,7 +169,8 @@ static uintptr_t UnityBase(void){
 
 static void*g_imgCSharp=NULL,*g_imgUnity=NULL,*g_pcClass=NULL;
 static void*g_getTransM=NULL,*g_getPosM=NULL,*g_getMainM=NULL,*g_w2sM=NULL;
-static void*g_setEulerM=NULL;
+static void*g_camMovClass=NULL,*g_findObjTypeM=NULL;
+static void*g_camMovInst=NULL;   // кэш CameraMovementController текущего матча
 static BOOL g_initDone=NO;
 
 static void InitClasses(void){
@@ -171,16 +185,22 @@ static void InitClasses(void){
         if(!g_imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||
                          strcmp(nm,"UnityEngine.dll")==0))g_imgUnity=img;
     }
-    if(g_imgCSharp)g_pcClass=fp_class_from_name(g_imgCSharp,"","PlayerCulling");
+    if(g_imgCSharp){
+        g_pcClass    =fp_class_from_name(g_imgCSharp,"","PlayerCulling");
+        // CameraMovementController — namespace: ScarletWork.Game.Camera
+        g_camMovClass=fp_class_from_name(g_imgCSharp,"ScarletWork.Game.Camera","CameraMovementController");
+    }
     if(g_imgUnity){
         void*camC =fp_class_from_name(g_imgUnity,"UnityEngine","Camera");
         void*compC=fp_class_from_name(g_imgUnity,"UnityEngine","Component");
         void*trnC =fp_class_from_name(g_imgUnity,"UnityEngine","Transform");
+        void*objC =fp_class_from_name(g_imgUnity,"UnityEngine","Object");
         if(camC) {g_getMainM=fp_class_method_from_name(camC,"get_main",0);
                   g_w2sM    =fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
         if(compC)  g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
-        if(trnC)  {g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
-                   g_setEulerM=fp_class_method_from_name(trnC,"set_eulerAngles",1);}
+        if(trnC)   g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
+        // FindObjectOfType(Type) — статический, 1 параметр
+        if(objC)   g_findObjTypeM=fp_class_method_from_name(objC,"FindObjectOfType",1);
     }
     UnityBase();g_initDone=YES;
 }
@@ -205,7 +225,6 @@ static Vec3 GetTransformPos(void*tr){
 static CGPoint W2S(Vec3 wp){
     const CGPoint bad={-1,-1};
     if(!g_getMainM||!g_w2sM||!fp_object_unbox)return bad;
-    // obj=NULL — статический метод, теперь SafeInvoke это пропускает
     void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return bad;
     void*params[1]={&wp};
     void*br=SafeInvoke(g_w2sM,cam,params);if(!IsPtr(br))return bad;
@@ -250,18 +269,28 @@ static void UpdateESP(void){
     }
 }
 
+// ─── получить инстанс CameraMovementController через FindObjectOfType ──────
+// кэшируем, ищем заново если старый указатель протух (смена сцены)
+static void* GetCamMovInst(void){
+    if(IsPtr(g_camMovInst))return g_camMovInst;
+    if(!g_camMovClass||!g_findObjTypeM||!fp_class_get_type||!fp_type_get_object)return NULL;
+    void*il2Type=fp_class_get_type(g_camMovClass);if(!IsPtr(il2Type))return NULL;
+    void*sysType=fp_type_get_object(il2Type);if(!IsPtr(sysType))return NULL;
+    void*params[1]={sysType};
+    // FindObjectOfType — статический, obj=NULL
+    void*inst=SafeInvoke(g_findObjTypeM,NULL,params);
+    g_camMovInst=IsPtr(inst)?inst:NULL;
+    return g_camMovInst;
+}
+
 static void UpdateAim(void){
     if(!g_aimOn||!g_initDone||!IsPtr(g_pcClass)||!fp_class_static_data)return;
-    if(!g_getMainM||!g_getTransM||!g_getPosM||!g_setEulerM||!fp_object_unbox)return;
+    if(!g_getTransM||!g_getPosM||!fp_object_unbox)return;
 
     void*sd=fp_class_static_data(g_pcClass);if(!IsPtr(sd))return;
     void*list=RdPtr(sd,0x8);if(!IsPtr(list))return;
     void*arr=RdPtr(list,0x10);int32_t sz=RdI32(list,0x18);
     if(!IsPtr(arr)||sz<=0||sz>200)return;
-
-    // obj=NULL — статический метод, SafeInvoke теперь не отклоняет
-    void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
-    void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
 
     CGSize  scr=[UIScreen mainScreen].bounds.size;
     CGPoint ctr=CGPointMake(scr.width*0.5f,scr.height*0.5f);
@@ -287,18 +316,34 @@ static void UpdateAim(void){
         CGFloat d=sqrtf(dx*dx+dy*dy);
         if(d<bestDist){bestDist=d;bestWP=bwp;found=YES;}
     }
+    if(!found){g_camMovInst=NULL;return;}  // нет цели — сбрасываем кэш на случай смены сцены
 
-    if(!found)return;
+    // Позиция камеры через Camera.main.transform
+    void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
+    void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
     Vec3 cp=GetTransformPos(camTr);
-    float ddx=bestWP.x-cp.x,ddy=bestWP.y-cp.y,ddz=bestWP.z-cp.z;
+
+    float ddx=bestWP.x-cp.x, ddy=bestWP.y-cp.y, ddz=bestWP.z-cp.z;
     float dist3d=sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
     if(dist3d<0.01f)return;
+
+    // pitch: отрицательный = вверх (Unity X rotation convention)
     float pitch=-asinf(ddy/dist3d)*(180.0f/(float)M_PI);
+    // yaw: world-space Y angle — ровно то, что хранит CameraMovementController.yaw
     float yaw  = atan2f(ddx,ddz)*(180.0f/(float)M_PI);
-    Vec3 euler={pitch,yaw,0.0f};
-    void*params[1]={&euler};
-    // через SafeInvoke — не дублируем siglongjmp вручную, fp_runtime_invoke null-checked внутри
-    SafeInvoke(g_setEulerM,camTr,params);
+
+    // ─── Ключевой фикс: пишем в CameraMovementController, а не в camera.transform ───
+    // camera.transform.eulerAngles = игра перезатирает это каждый кадр в своём Update.
+    // CameraMovementController.pitch/yaw — именно отсюда игра сама строит поворот.
+    void*cmc=GetCamMovInst();if(!IsPtr(cmc))return;
+
+    SafeWriteF(cmc,OFF_CAMC_PITCH,   pitch);
+    SafeWriteF(cmc,OFF_CAMC_YAW,     yaw);
+    SafeWriteF(cmc,OFF_CAMC_CAMPITCH,pitch);
+    // recoilRotation — зануляем, иначе отдача дерётся с нашим aim
+    SafeWriteF(cmc,OFF_CAMC_RECOIL+0, 0.f);
+    SafeWriteF(cmc,OFF_CAMC_RECOIL+4, 0.f);
+    SafeWriteF(cmc,OFF_CAMC_RECOIL+8, 0.f);
 }
 
 // ─── dump ─────────────────────────────────────────────────────────────────
@@ -599,7 +644,7 @@ static const CGFloat kSecGap=16.0f;
 
 -(void)doAim{
     g_aimOn=!g_aimOn;
-    if(g_aimOn&&!g_initDone)InitClasses();
+    if(g_aimOn){if(!g_initDone)InitClasses();g_camMovInst=NULL;}  // сброс кэша при включении
     [_menu.aimBtn setTitle:g_aimOn?@"ON":@"OFF" forState:UIControlStateNormal];
     _menu.aimBtn.layer.borderColor=g_aimOn?C(1.0f,0.55f,0.0f,0.65f).CGColor:C(1.0f,0.55f,0.0f,0.22f).CGColor;
     _menu.statusLabel.text=g_aimOn?@"aim active":@"aim off";
