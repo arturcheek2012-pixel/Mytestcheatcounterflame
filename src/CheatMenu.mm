@@ -18,7 +18,8 @@ typedef struct { float x,y,z; } Vec3;
 // PlayerCulling static:       Instances          0x08
 // PlayerCulling instance:     _controller        0x18
 //                             _occluded          0x48
-// PlayerController:           _movementController 0x40
+// PlayerController:           _fpsCamera         0x28  (PlayerFPSCamera)
+//                             _movementController 0x40
 //                             _view              0x80  (PhotonView)
 //                             _animatorController 0x98 (PlayerAnimatorController)
 //                             _isDeath           0xA8
@@ -26,7 +27,9 @@ typedef struct { float x,y,z; } Vec3;
 // PlayerAnimatorController:   _skeleton          0x68  (PlayerSkeleton)
 // PlayerSkeleton:             _headBone          0xA8  (Transform)
 //                             _chestBone         0xB0  (Transform)
-// MovementController:         rotationX          0xDC  (pitch accumulator)
+// PlayerFPSCamera:            _movement          0x130 (CameraMovementController)
+// CameraMovementController:   pitch              0x3C
+//                             yaw                0x40
 #define OFF_CULLING_CTRL     0x18
 #define OFF_CTRL_VIEW        0x80
 #define OFF_VIEW_ISMINE      0x60
@@ -36,8 +39,10 @@ typedef struct { float x,y,z; } Vec3;
 #define OFF_ANIMATOR_SKEL    0x68
 #define OFF_SKEL_HEAD        0xA8
 #define OFF_SKEL_CHEST       0xB0
-#define OFF_CTRL_MOVECTRL    0x40
-#define OFF_MOVE_ROTX        0xDC
+#define OFF_CTRL_FPSCAM      0x28
+#define OFF_FPSCAM_MOVEMENT  0x130
+#define OFF_CAMCTRL_PITCH    0x3C
+#define OFF_CAMCTRL_YAW      0x40
 
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
@@ -150,7 +155,6 @@ static uintptr_t UnityBase(void){
 
 static void*g_imgCSharp=NULL,*g_imgUnity=NULL,*g_pcClass=NULL;
 static void*g_getTransM=NULL,*g_getPosM=NULL,*g_getMainM=NULL,*g_w2sM=NULL;
-static void*g_setEulerM=NULL,*g_getEulerM=NULL;
 static BOOL g_initDone=NO;
 
 static void InitClasses(void){
@@ -172,12 +176,9 @@ static void InitClasses(void){
         if(camC){g_getMainM=fp_class_method_from_name(camC,"get_main",0);
                  g_w2sM    =fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
         if(compC) g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
-        if(trnC){g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
-                 g_setEulerM=fp_class_method_from_name(trnC,"set_eulerAngles",1);
-                 g_getEulerM=fp_class_method_from_name(trnC,"get_eulerAngles",0);}
+        if(trnC)  g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
     }
     UnityBase();
-    // помечаем done только когда минимально необходимое есть
     g_initDone=(g_pcClass!=NULL&&g_getTransM!=NULL&&g_getPosM!=NULL&&
                 g_getMainM!=NULL&&g_w2sM!=NULL&&fp_object_unbox!=NULL);
 }
@@ -209,8 +210,7 @@ static CGPoint W2S(Vec3 wp){
     return CGPointMake(sv->x/sc,uH-sv->y/sc);
 }
 
-// ─── helper: тянет headBone Transform из PlayerController ─────────────────
-// возвращает NULL если цепочка рвётся
+// ─── helper: тянет bone Transform из PlayerController ────────────────────
 static void* BoneFromCtrl(void*ctrl, size_t boneOff){
     void*animator=RdPtr(ctrl,OFF_CTRL_ANIMATOR);if(!IsPtr(animator))return NULL;
     void*skel    =RdPtr(animator,OFF_ANIMATOR_SKEL);if(!IsPtr(skel))return NULL;
@@ -244,12 +244,9 @@ static void UpdateESP(void){
         if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE))continue;
         if(RdBool(culling,OFF_CULLING_OCCLUDED))continue;
 
-        // ── foot: позиция самого объекта PlayerCulling (уровень ног) ──
         Vec3 foot=GetPos(culling);
         if(foot.x==0&&foot.y==0&&foot.z==0)continue;
 
-        // ── head: берём _headBone→Transform→position ──
-        // fallback — foot + эмпирическая высота только если кость недоступна
         Vec3 head={foot.x,foot.y+1.75f,foot.z};
         void*hbone=BoneFromCtrl(ctrl,OFF_SKEL_HEAD);
         if(IsPtr(hbone)){
@@ -298,7 +295,6 @@ static void UpdateAim(void){
     }
     if(!found||!IsPtr(localCtrl))return;
 
-    // ── позиция камеры ──
     void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
     void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
     Vec3 cp=GetTransformPos(camTr);
@@ -310,31 +306,16 @@ static void UpdateAim(void){
     float pitch=-asinf(ddy/dist3d)*(180.0f/(float)M_PI);
     float yaw  = atan2f(ddx,ddz)*(180.0f/(float)M_PI);
 
-    // ── PITCH ────────────────────────────────────────────────────────────
-    // MovementController.rotationX — накопитель питча, игра читает каждый Update
-    // и применяет к playerCamera. Пишем сюда, не в camera.transform (он
-    // перезаписывается сразу после нас). Работает при 60fps DisplayLink:
-    // мы обновляем синхронно с Unity Update, race window = 0 кадров.
-    void*movCtrl=RdPtr(localCtrl,OFF_CTRL_MOVECTRL);
-    if(IsPtr(movCtrl)) SafeWriteF(movCtrl,OFF_MOVE_ROTX,pitch);
-
-    // ── YAW ──────────────────────────────────────────────────────────────
-    // Тело вращается аддитивно в MovementController.Update через Rotate(Y*delta).
-    // Когда игрок не касается экрана — delta=0, наш угол держится.
-    // При 60fps мы пишем каждый кадр — race window ≤1 Unity-кадр (≈16мс),
-    // это приемлемо. Сохраняем текущие X и Z, меняем только Y.
-    if(g_setEulerM&&g_getEulerM&&g_getTransM){
-        void*bodyTr=SafeInvoke(g_getTransM,localCtrl,NULL);
-        if(IsPtr(bodyTr)){
-            // читаем текущий euler чтобы не обнулять X/Z (физический наклон)
-            Vec3 cur={0,0,0};
-            void*eb=SafeInvoke(g_getEulerM,bodyTr,NULL);
-            if(IsPtr(eb)&&fp_object_unbox){Vec3*ep=(Vec3*)fp_object_unbox(eb);if(ep)cur=*ep;}
-            Vec3 euler={cur.x,yaw,cur.z};
-            void*params[1]={&euler};
-            SafeInvoke(g_setEulerM,bodyTr,params);
-        }
-    }
+    // ── CameraMovementController ─────────────────────────────────────────
+    // localCtrl → _fpsCamera (0x28) → _movement (0x130) → pitch/yaw
+    // defeats: CameraMovementController.LateUpdate читает pitch/yaw сам —
+    //          Unity не перезаписывает transform камеры поверх нас
+    // caught-by: если _fpsCamera или _movement сменились после патча —
+    //            FILL: re-derive OFF_CTRL_FPSCAM / OFF_FPSCAM_MOVEMENT из нового дампа
+    void*fpsCam  =RdPtr(localCtrl,OFF_CTRL_FPSCAM);    if(!IsPtr(fpsCam))  return;
+    void*camCtrl =RdPtr(fpsCam,   OFF_FPSCAM_MOVEMENT); if(!IsPtr(camCtrl)) return;
+    SafeWriteF(camCtrl,OFF_CAMCTRL_PITCH,pitch);
+    SafeWriteF(camCtrl,OFF_CAMCTRL_YAW,  yaw);
 }
 
 // ─── dump ────────────────────────────────────────────────────────────────
@@ -368,8 +349,6 @@ static NSString* PerformDump(void){
             while((mth=fp_class_methods(klass,&mi))){
                 const char*mn=fp_method_name(mth);
                 uint32_t np=fp_method_params(mth);
-                // FIX: SafeRead вместо прямого dereference — MethodInfo может
-                // указывать на невалидную память для некоторых generic-методов
                 uintptr_t ptr=0;
                 SafeRead(mth,&ptr,sizeof(uintptr_t));
                 (base&&ptr>base)?
@@ -591,8 +570,7 @@ static const CGFloat kSecGap=16.0f;
     [pv addSubview:_fab];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    // FIX: 60fps — aim yaw пишется каждый кадр, race window ≤1 Unity-кадр (≈16мс)
-    // вместо 30fps где gap 33мс = 2 Unity-кадра и yaw стабильно перетирался
+    // 60fps — race window с Unity LateUpdate ≤1 кадр (≈16мс)
     _dl.preferredFramesPerSecond=60;
     [_dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
