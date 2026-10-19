@@ -171,7 +171,7 @@ static void espTick(void) {
         if (CGPointEqualToPoint(screenHead, CGPointZero)) continue;
         if (screenFeet.y < 0 || screenFeet.y > sh)       continue;
 
-        CGFloat height = fabsf(screenFeet.y - screenHead.y);
+        CGFloat height = fabs(screenFeet.y - screenHead.y);
         if (height < 5.f) continue;
 
         CGFloat width = height * 0.4f;
@@ -295,7 +295,7 @@ static BOOL bindIl2cppSymbols(void) {
     if (!handle) return NO;
 
 #define BIND(var, name) \
-    var = dlsym(handle, name); \
+    var = (__typeof__(var))dlsym(handle, name); \
     if (!var) { NSLog(@"[esp] missing: " name); return NO; }
 
     BIND(_domain_get,            "il2cpp_domain_get")
