@@ -16,7 +16,7 @@ jobs:
       - name: Compile
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang \
+          xcrun -sdk iphoneos clang++ \
             -arch arm64 \
             -isysroot $SDK \
             -fobjc-arc \
@@ -24,7 +24,9 @@ jobs:
             -dynamiclib \
             -framework UIKit \
             -framework CoreGraphics \
+            -framework QuartzCore \
             -lobjc \
+            -lc++ \
             -o CFEsp.dylib \
             Tweak.mm
 
