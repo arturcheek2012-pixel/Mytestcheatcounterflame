@@ -1,5 +1,5 @@
 #import <UIKit/UIKit.h>
-#import <substrate.h>
+#import <dobby.h>
 #include <mach/mach.h>
 #include <sys/mman.h>
 
@@ -578,8 +578,8 @@ __attribute__((constructor)) static void _init(void) {
     // RVA: Awake = 0x157AB60, OnDestroy = 0x157C050
     void *awake_ptr   = (void *)(BASE + 0x157AB60);
     void *destroy_ptr = (void *)(BASE + 0x157C050);
-    MSHookFunction(awake_ptr,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
-    MSHookFunction(destroy_ptr, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
+    DobbyHook(awake_ptr,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
+    DobbyHook(destroy_ptr, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         gWin = [[CrezMenuWindow alloc] init];
