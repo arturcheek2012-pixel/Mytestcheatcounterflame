@@ -1,19 +1,28 @@
-- name: Build dylib
-  run: |
-    SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-    xcrun -sdk iphoneos clang++ \
-      -arch arm64 \
-      -dynamiclib \
-      -isysroot "$SDK" \
-      -framework UIKit \
-      -framework QuartzCore \
-      -framework Foundation \
-      -ObjC \
-      -o CheatMenu.dylib \
-      src/CheatMenu.mm
+name: Build
 
-- name: Upload artifact
-  uses: actions/upload-artifact@v4
-  with:
-    name: CheatMenu.dylib
-    path: CheatMenu.dylib
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build
+        run: make
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheatMenu
+          path: CheatMenu.dylib
