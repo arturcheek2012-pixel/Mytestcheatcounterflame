@@ -1,10 +1,16 @@
 #import <UIKit/UIKit.h>
 
 // ── config ────────────────────────────────────────────────────────────────────
-static const CGFloat kMenuHeight   = 52.f;
 static const CGFloat kToggleWidth  = 34.f;
-static const CGFloat kCornerRadius = 0.f;   // острые углы
-static const UIEdgeInsets kSafeMargin = {8, 8, 8, 8};
+static const CGFloat kCornerRadius = 0.f;
+static const UIEdgeInsets kSafeMargin = {10, 10, 10, 10};
+static const CGFloat kMaxMenuWidth = 480.f;
+
+static CGFloat MenuHeight() {
+    CGFloat h = UIScreen.mainScreen.bounds.size.height;
+    CGFloat v = h * 0.055f;
+    return MAX(44.f, MIN(v, 56.f));
+}
 
 static UIColor *kColorBG()     { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.96f]; }
 static UIColor *kColorAccent() { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f ]; }
@@ -81,9 +87,12 @@ static UIColor *kColorText()   { return [UIColor whiteColor]; }
 }
 
 - (instancetype)initWithScreenSize:(CGSize)screen {
-    CGFloat w = screen.width - kSafeMargin.left - kSafeMargin.right;
-    CGFloat y = kSafeMargin.top;
-    self = [super initWithFrame:CGRectMake(kSafeMargin.left, y, w, kMenuHeight)];
+    CGFloat h  = MenuHeight();
+    CGFloat sw = screen.width - kSafeMargin.left - kSafeMargin.right;
+    CGFloat w  = MIN(sw, kMaxMenuWidth);
+    CGFloat x  = kSafeMargin.left + (sw - w) * .5f;
+    CGFloat y  = kSafeMargin.top;
+    self = [super initWithFrame:CGRectMake(x, y, w, h)];
     if (!self) return nil;
 
     self.backgroundColor    = kColorBG();
@@ -95,24 +104,22 @@ static UIColor *kColorText()   { return [UIColor whiteColor]; }
 
     // scroll-область для будущих кнопок
     _itemsScroll = [[UIScrollView alloc] initWithFrame:
-                    CGRectMake(0, 0, w - kToggleWidth, kMenuHeight)];
+                    CGRectMake(0, 0, w - kToggleWidth, h)];
     _itemsScroll.backgroundColor       = [UIColor clearColor];
     _itemsScroll.showsHorizontalScrollIndicator = NO;
     _itemsScroll.showsVerticalScrollIndicator   = NO;
     _itemsScroll.bounces = YES;
     [self addSubview:_itemsScroll];
 
-    // заглушка "пусто"
     UILabel *placeholder = [[UILabel alloc] initWithFrame:_itemsScroll.bounds];
     placeholder.text          = @"— меню пусто —";
     placeholder.textColor     = [UIColor colorWithWhite:1.f alpha:.25f];
-    placeholder.font          = [UIFont monospacedSystemFontOfSize:12.f weight:UIFontWeightRegular];
+    placeholder.font          = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
     placeholder.textAlignment = NSTextAlignmentCenter;
     [_itemsScroll addSubview:placeholder];
 
-    // toggle-таб
     _toggleTab = [[CrezToggleTab alloc] initWithFrame:
-                  CGRectMake(w - kToggleWidth, 0, kToggleWidth, kMenuHeight)];
+                  CGRectMake(w - kToggleWidth, 0, kToggleWidth, h)];
     __weak typeof(self) ws = self;
     _toggleTab.onTap = ^{ [ws _toggleVisibility]; };
     [self addSubview:_toggleTab];
@@ -165,12 +172,10 @@ static UIColor *kColorText()   { return [UIColor whiteColor]; }
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
         if (self->_menuVisible) {
-            // полная ширина
             CGRect f = self.frame;
             UIView *sv = self.superview;
-            f.size.width = sv.bounds.size.width
-                         - kSafeMargin.left - kSafeMargin.right;
-            // clamp x
+            CGFloat sw = sv.bounds.size.width - kSafeMargin.left - kSafeMargin.right;
+            f.size.width = MIN(sw, kMaxMenuWidth);
             CGFloat maxX = sv.bounds.size.width - f.size.width - kSafeMargin.right;
             f.origin.x = MAX(kSafeMargin.left, MIN(f.origin.x, maxX));
             self.frame = f;
