@@ -1,4 +1,4 @@
-- name: Build dylib
+name: Build dylib
   run: |
     SDK=$(xcrun --sdk iphoneos --show-sdk-path)
     xcrun -sdk iphoneos clang++ \
