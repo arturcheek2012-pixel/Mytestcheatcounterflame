@@ -36,28 +36,52 @@ static inline bool ReadBool(uint64_t addr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// inline hook — без dobby
+// inline hook — без dobby, с проверкой PC-relative инструкций
 // ═══════════════════════════════════════════════════════════════════════════════
-// ARM64 абсолютный прыжок: LDR X16, #8; BR X16; <addr64> = 16 байт
-static void _install_hook(void *target, void *replacement, void **orig_out) {
+// ARM64: инструкции которые PC-relative и нельзя копировать в трамплин:
+// ADRP  : top 8 bits = 0x90..0x97 (маска 0x9F000000)
+// B/BL  : top 8 bits = 0x14..0x17 (B) / 0x94..0x97 (BL)
+// CBZ/CBNZ, TBZ/TBNZ тоже PC-relative
+// STP/SUB SP — безопасны, их копировать можно
+
+static bool _is_pc_relative(uint32_t insn) {
+    uint32_t op = insn & 0x9F000000;
+    if (op == 0x90000000) return true; // ADRP
+    op = insn & 0xFC000000;
+    if (op == 0x14000000) return true; // B
+    if (op == 0x94000000) return true; // BL
+    op = insn & 0x7E000000;
+    if (op == 0x34000000) return true; // CBZ/CBNZ
+    op = insn & 0x7E000000;
+    if (op == 0x36000000) return true; // TBZ/TBNZ
+    return false;
+}
+
+static bool _install_hook(void *target, void *replacement, void **orig_out) {
     uintptr_t t    = (uintptr_t)target;
     uintptr_t page = t & ~(uintptr_t)(PAGE_SIZE - 1);
 
-    // RWX на страницу цели
+    // проверяем первые 4 инструкции (16 байт) на PC-relative
+    uint32_t *insns = (uint32_t *)target;
+    for (int i = 0; i < 4; i++) {
+        if (_is_pc_relative(insns[i])) {
+            // небезопасно копировать — orig будет вызывать target напрямую
+            // (хук не устанавливаем, возвращаем false)
+            return false;
+        }
+    }
+
     mprotect((void *)page, PAGE_SIZE * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-    // трамплин для orig: копируем 16 байт оригинала + прыжок обратно
+    // трамплин для orig: 16 байт оригинала + абс прыжок обратно
     uint8_t *stub = (uint8_t *)mmap(NULL, PAGE_SIZE,
                                     PROT_READ | PROT_WRITE | PROT_EXEC,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // первые 16 байт — оригинальный пролог
     memcpy(stub, target, 16);
-    // прыжок на target+16
     uintptr_t resume = t + 16;
     *(uint32_t *)(stub + 16) = 0x58000050; // LDR X16, #8
     *(uint32_t *)(stub + 20) = 0xD61F0200; // BR X16
-    *(uint64_t *)(stub + 24) = (uint64_t)resume;
-
+    *(uint64_t *)(stub + 24) = resume;
     sys_icache_invalidate(stub, 32);
     *orig_out = stub;
 
@@ -67,9 +91,9 @@ static void _install_hook(void *target, void *replacement, void **orig_out) {
     *(uint32_t *)(patch + 4) = 0xD61F0200; // BR X16
     *(uint64_t *)(patch + 8) = (uint64_t)replacement;
     memcpy(target, patch, 16);
-
     sys_icache_invalidate(target, 16);
     mprotect((void *)page, PAGE_SIZE * 2, PROT_READ | PROT_EXEC);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -102,11 +126,20 @@ static NSMutableArray *gPlayerControllers;
 typedef void (*fn_pc_awake_t)  (uint64_t self, void *method);
 typedef void (*fn_pc_destroy_t)(uint64_t self, void *method);
 
-static fn_pc_awake_t   orig_pc_awake;
-static fn_pc_destroy_t orig_pc_destroy;
+static fn_pc_awake_t   orig_pc_awake   = NULL;
+static fn_pc_destroy_t orig_pc_destroy = NULL;
+
+// адреса оригиналов для прямого вызова если трамплин не встал
+static void *raw_pc_awake   = NULL;
+static void *raw_pc_destroy = NULL;
 
 static void hook_pc_awake(uint64_t self, void *method) {
-    orig_pc_awake(self, method);
+    // зовём оригинал: либо через трамплин, либо напрямую по RVA+16
+    if (orig_pc_awake)
+        orig_pc_awake(self, method);
+    else if (raw_pc_awake)
+        ((fn_pc_awake_t)((uintptr_t)raw_pc_awake + 16))(self, method);
+
     dispatch_async(dispatch_get_main_queue(), ^{
         NSValue *v = [NSValue valueWithBytes:&self objCType:@encode(uint64_t)];
         if (![gPlayerControllers containsObject:v])
@@ -119,7 +152,10 @@ static void hook_pc_destroy(uint64_t self, void *method) {
         NSValue *v = [NSValue valueWithBytes:&self objCType:@encode(uint64_t)];
         [gPlayerControllers removeObject:v];
     });
-    orig_pc_destroy(self, method);
+    if (orig_pc_destroy)
+        orig_pc_destroy(self, method);
+    else if (raw_pc_destroy)
+        ((fn_pc_destroy_t)((uintptr_t)raw_pc_destroy + 16))(self, method);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -584,10 +620,10 @@ __attribute__((constructor)) static void _init(void) {
     gPlayerControllers = [NSMutableArray new];
     _resolveRVAs();
 
-    void *awake_ptr   = (void *)(BASE + 0x157AB60);
-    void *destroy_ptr = (void *)(BASE + 0x157C050);
-    _install_hook(awake_ptr,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
-    _install_hook(destroy_ptr, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
+    raw_pc_awake   = (void *)(BASE + 0x157AB60);
+    raw_pc_destroy = (void *)(BASE + 0x157C050);
+    _install_hook(raw_pc_awake,   (void *)hook_pc_awake,   (void **)&orig_pc_awake);
+    _install_hook(raw_pc_destroy, (void *)hook_pc_destroy, (void **)&orig_pc_destroy);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         gWin = [[CrezMenuWindow alloc] init];
