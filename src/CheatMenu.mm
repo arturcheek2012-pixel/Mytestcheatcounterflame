@@ -867,11 +867,28 @@ static const CGFloat kSecGap=13.0f;
 // ◄/►: цикл по пулу, каждый вариант пишется в WeaponController.Skin + RefreshMaterial
 -(void)doSkinRead{
     if(!g_initDone)InitClasses();
-    NSString*sid=ReadKnifeSkinId();
+    // step-by-step: показывает где именно NULL
+    void*localCtrl=FindLocalCtrl();
+    if(!IsPtr(localCtrl)){
+        _menu.statusLabel.text=@"DIAG: localCtrl NULL\n(not in Instances list)";return;
+    }
+    void*armsCtrl=RdPtr(localCtrl,OFF_CTRL_ARMS);  // 0x60
+    if(!IsPtr(armsCtrl)){
+        _menu.statusLabel.text=@"DIAG: armsCtrl NULL @0x60";return;
+    }
+    void*knifeWC=RdPtr(armsCtrl,OFF_ARMS_KNIFE);   // 0x58
+    if(!IsPtr(knifeWC)){
+        _menu.statusLabel.text=@"DIAG: knifeWC NULL @0x58\n(take knife out)";return;
+    }
+    void*skinStr=RdPtr(knifeWC,OFF_WC_SKIN);        // 0xE0
+    if(!IsPtr(skinStr)){
+        _menu.statusLabel.text=@"DIAG: skinStr NULL @0xE0";return;
+    }
+    NSString*sid=ReadIL2CppStr(skinStr);
     BuildSkinPool(sid);
     g_skinLabel=sid;
     _menu.skinLabel.text=sid;
-    _menu.statusLabel.text=[NSString stringWithFormat:@"pool: %d IDs",(int)(g_skinPool?g_skinPool.count:0)];
+    _menu.statusLabel.text=[NSString stringWithFormat:@"pool: %d IDs",(int)g_skinPool.count];
 }
 -(void)doSkinPrev{
     if(!g_skinPool||g_skinPool.count==0){[self doSkinRead];return;}
