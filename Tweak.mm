@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #include <mach/mach.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // OFFSETS — CounterFlame / base: 0x112a70000
@@ -564,7 +565,7 @@ static CADisplayLink *gDisplayLink;
         CGRect wb = UIScreen.mainScreen.bounds;
         self.frame = wb;
         self.rootViewController.view.frame = wb;
-        self->gESPView.frame = wb;
+        gESPView.frame = wb;
     });
 }
 
