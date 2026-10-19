@@ -14,22 +14,20 @@ static inline UIColor* C(CGFloat r,CGFloat g,CGFloat b,CGFloat a){
 }
 typedef struct { float x,y,z; } Vec3;
 
-#define OFF_CULLING_CTRL      0x18
-#define OFF_CTRL_VIEW         0x80
-#define OFF_VIEW_ISMINE       0x60
-#define OFF_CTRL_ISDEATH      0xA8
-#define OFF_CULLING_OCCLUDED  0x48
-#define OFF_CTRL_ANIMATOR     0x98
-#define OFF_ANIMATOR_SKEL     0x68
-#define OFF_SKEL_HEAD         0xA8
-#define OFF_SKEL_CHEST        0xB0
-
-// CameraMovementController — игра сама читает и применяет эти поля каждый Update()
-// пишем сюда вместо set_eulerAngles, которое сразу перезатирается игрой
-#define OFF_CAMC_PITCH    0x3C   // float  — вертикальный угол (degrees)
-#define OFF_CAMC_YAW      0x40   // float  — горизонтальный угол (degrees)
-#define OFF_CAMC_CAMPITCH 0x50   // float  — cameraPitch, тоже применяется к transform
-#define OFF_CAMC_RECOIL   0x64   // Vec3   — recoilRotation, зануляем чтобы не мешал
+// PlayerCulling / PlayerController chain
+#define OFF_CULLING_CTRL     0x18
+#define OFF_CTRL_VIEW        0x80
+#define OFF_VIEW_ISMINE      0x60
+#define OFF_CTRL_ISDEATH     0xA8
+#define OFF_CULLING_OCCLUDED 0x48
+#define OFF_CTRL_ANIMATOR    0x98
+#define OFF_ANIMATOR_SKEL    0x68
+#define OFF_SKEL_HEAD        0xA8
+#define OFF_SKEL_CHEST       0xB0
+// PlayerController → MovementController
+#define OFF_CTRL_MOVECTRL    0x40   // PlayerController._movementController
+// MovementController
+#define OFF_MOVE_ROTX        0xDC   // MovementController.rotationX  (float, pitch accumulator)
 
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
@@ -51,8 +49,6 @@ static void*    (*fp_class_static_data)(void*);
 static void*    (*fp_class_method_from_name)(void*,const char*,int);
 static void*    (*fp_runtime_invoke)(void*,void*,void**,void**);
 static void*    (*fp_object_unbox)(void*);
-static void*    (*fp_class_get_type)(void*);      // il2cpp_class_get_type
-static void*    (*fp_type_get_object)(void*);     // il2cpp_type_get_object → System.Type
 
 static BOOL g_apiLoaded=NO;
 static BOOL LoadAPI(void){
@@ -78,8 +74,6 @@ static BOOL LoadAPI(void){
     R(fp_class_method_from_name,"il2cpp_class_get_method_from_name");
     R(fp_runtime_invoke,"il2cpp_runtime_invoke");
     R(fp_object_unbox,"il2cpp_object_unbox");
-    R(fp_class_get_type,"il2cpp_class_get_type");
-    R(fp_type_get_object,"il2cpp_type_get_object");
 #undef R
     g_apiLoaded=(fp_domain_get!=NULL&&fp_class_from_name!=NULL);
     return g_apiLoaded;
@@ -91,71 +85,50 @@ static BOOL IsPtr(const void*p){
     uintptr_t v=(uintptr_t)p;
     return v>0x10000UL&&v<0x00FFFFFFFFFFFFFFULL;
 }
-
 static BOOL SafeRead(const void*src,void*dst,vm_size_t size){
     if(!IsPtr(src))return NO;
     vm_size_t out=0;
-    return vm_read_overwrite(mach_task_self(),
-        (vm_address_t)src,size,(vm_address_t)dst,&out)==KERN_SUCCESS&&out==size;
+    return vm_read_overwrite(mach_task_self(),(vm_address_t)src,size,(vm_address_t)dst,&out)==KERN_SUCCESS&&out==size;
 }
-
 static void*   RdPtr(const void*b,size_t o){if(!IsPtr(b))return NULL;void*v=NULL;return SafeRead((const uint8_t*)b+o,&v,sizeof(void*))?v:NULL;}
 static int32_t RdI32(const void*b,size_t o){int32_t v=0;SafeRead((const uint8_t*)b+o,&v,sizeof(int32_t));return v;}
 static BOOL    RdBool(const void*b,size_t o){bool v=false;SafeRead((const uint8_t*)b+o,&v,sizeof(bool));return v?YES:NO;}
 
-// ─── signal recovery ──────────────────────────────────────────────────────
+// ─── signal recovery ─────────────────────────────────────────────────────
 
 static __thread sigjmp_buf   tls_jmp;
-static __thread volatile int tls_armed = 0;
-static struct sigaction      g_oldSEGV, g_oldBUS;
+static __thread volatile int tls_armed=0;
+static struct sigaction      g_oldSEGV,g_oldBUS;
 
-static void sig_recover(int sig, siginfo_t *info, void *uctx){
-    if(tls_armed){
-        tls_armed=0;
-        siglongjmp(tls_jmp,1);
-    }
-    struct sigaction *old=(sig==SIGSEGV)?&g_oldSEGV:&g_oldBUS;
-    sigaction(sig,old,NULL);
-    raise(sig);
+static void sig_recover(int sig,siginfo_t*info,void*uctx){
+    if(tls_armed){tls_armed=0;siglongjmp(tls_jmp,1);}
+    struct sigaction*old=(sig==SIGSEGV)?&g_oldSEGV:&g_oldBUS;
+    sigaction(sig,old,NULL);raise(sig);
 }
-
 static void InstallRecovery(void){
     static dispatch_once_t once;
     dispatch_once(&once,^{
-        struct sigaction sa;
-        memset(&sa,0,sizeof(sa));
-        sa.sa_sigaction=sig_recover;
-        sa.sa_flags=SA_SIGINFO;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV,&sa,&g_oldSEGV);
-        sigaction(SIGBUS, &sa,&g_oldBUS);
+        struct sigaction sa;memset(&sa,0,sizeof(sa));
+        sa.sa_sigaction=sig_recover;sa.sa_flags=SA_SIGINFO;sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV,&sa,&g_oldSEGV);sigaction(SIGBUS,&sa,&g_oldBUS);
     });
 }
-
-// obj=NULL валиден для статических IL2CPP-методов (Camera.get_main, FindObjectOfType и т.д.)
+// obj=NULL валиден для статических IL2CPP-методов
 static void* SafeInvoke(void*method,void*obj,void**params){
     if(!IsPtr(method)||!fp_runtime_invoke)return NULL;
-    void*result=NULL;
-    tls_armed=1;
-    if(sigsetjmp(tls_jmp,1)==0){
-        void*exc=NULL;
-        result=fp_runtime_invoke(method,obj,params,&exc);
-        if(exc)result=NULL;
-    }
-    tls_armed=0;
-    return result;
+    void*result=NULL;tls_armed=1;
+    if(sigsetjmp(tls_jmp,1)==0){void*exc=NULL;result=fp_runtime_invoke(method,obj,params,&exc);if(exc)result=NULL;}
+    tls_armed=0;return result;
 }
-
-// прямая запись float в managed-объект — игра читает это сама в следующем Update()
+// прямая запись float в managed-объект (игра читает сама в своём Update)
 static void SafeWriteF(void*obj,size_t off,float val){
     if(!IsPtr(obj))return;
     tls_armed=1;
-    if(sigsetjmp(tls_jmp,1)==0)
-        *(float*)((uint8_t*)obj+off)=val;
+    if(sigsetjmp(tls_jmp,1)==0) *(float*)((uint8_t*)obj+off)=val;
     tls_armed=0;
 }
 
-// ─── unity base ───────────────────────────────────────────────────────────
+// ─── unity base ──────────────────────────────────────────────────────────
 
 static uintptr_t g_unityBase=0;
 static uintptr_t UnityBase(void){
@@ -169,43 +142,34 @@ static uintptr_t UnityBase(void){
 
 static void*g_imgCSharp=NULL,*g_imgUnity=NULL,*g_pcClass=NULL;
 static void*g_getTransM=NULL,*g_getPosM=NULL,*g_getMainM=NULL,*g_w2sM=NULL;
-static void*g_camMovClass=NULL,*g_findObjTypeM=NULL;
-static void*g_camMovInst=NULL;   // кэш CameraMovementController текущего матча
+static void*g_setEulerM=NULL;   // Transform.set_eulerAngles — для горизонтального поворота тела
 static BOOL g_initDone=NO;
 
 static void InitClasses(void){
-    if(g_initDone)return;
-    if(!LoadAPI())return;
+    if(g_initDone)return;if(!LoadAPI())return;
     void*domain=fp_domain_get();if(!domain)return;
     size_t n=0;void**asms=fp_domain_assemblies(domain,&n);
     for(size_t i=0;i<n;i++){
         void*img=fp_assembly_image(asms[i]);if(!img)continue;
         const char*nm=fp_image_name(img);if(!nm)continue;
         if(!g_imgCSharp&&strcmp(nm,"Assembly-CSharp.dll")==0)g_imgCSharp=img;
-        if(!g_imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||
-                         strcmp(nm,"UnityEngine.dll")==0))g_imgUnity=img;
+        if(!g_imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||strcmp(nm,"UnityEngine.dll")==0))g_imgUnity=img;
     }
-    if(g_imgCSharp){
-        g_pcClass    =fp_class_from_name(g_imgCSharp,"","PlayerCulling");
-        // CameraMovementController — namespace: ScarletWork.Game.Camera
-        g_camMovClass=fp_class_from_name(g_imgCSharp,"ScarletWork.Game.Camera","CameraMovementController");
-    }
+    if(g_imgCSharp) g_pcClass=fp_class_from_name(g_imgCSharp,"","PlayerCulling");
     if(g_imgUnity){
         void*camC =fp_class_from_name(g_imgUnity,"UnityEngine","Camera");
         void*compC=fp_class_from_name(g_imgUnity,"UnityEngine","Component");
         void*trnC =fp_class_from_name(g_imgUnity,"UnityEngine","Transform");
-        void*objC =fp_class_from_name(g_imgUnity,"UnityEngine","Object");
-        if(camC) {g_getMainM=fp_class_method_from_name(camC,"get_main",0);
-                  g_w2sM    =fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
-        if(compC)  g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
-        if(trnC)   g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
-        // FindObjectOfType(Type) — статический, 1 параметр
-        if(objC)   g_findObjTypeM=fp_class_method_from_name(objC,"FindObjectOfType",1);
+        if(camC){g_getMainM=fp_class_method_from_name(camC,"get_main",0);
+                 g_w2sM    =fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
+        if(compC) g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
+        if(trnC) {g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
+                  g_setEulerM=fp_class_method_from_name(trnC,"set_eulerAngles",1);}
     }
     UnityBase();g_initDone=YES;
 }
 
-// ─── unity helpers ────────────────────────────────────────────────────────
+// ─── unity helpers ───────────────────────────────────────────────────────
 
 static Vec3 GetPos(void*obj){
     Vec3 z={0,0,0};
@@ -214,14 +178,12 @@ static Vec3 GetPos(void*obj){
     void*bp=SafeInvoke(g_getPosM,tr,NULL);if(!IsPtr(bp))return z;
     Vec3*p=(Vec3*)fp_object_unbox(bp);return p?*p:z;
 }
-
 static Vec3 GetTransformPos(void*tr){
     Vec3 z={0,0,0};
     if(!IsPtr(tr)||!g_getPosM||!fp_object_unbox)return z;
     void*bp=SafeInvoke(g_getPosM,tr,NULL);if(!IsPtr(bp))return z;
     Vec3*p=(Vec3*)fp_object_unbox(bp);return p?*p:z;
 }
-
 static CGPoint W2S(Vec3 wp){
     const CGPoint bad={-1,-1};
     if(!g_getMainM||!g_w2sM||!fp_object_unbox)return bad;
@@ -234,10 +196,10 @@ static CGPoint W2S(Vec3 wp){
     return CGPointMake(sv->x/sc,uH-sv->y/sc);
 }
 
-// ─── ESP / Aim ────────────────────────────────────────────────────────────
+// ─── ESP / Aim ───────────────────────────────────────────────────────────
 
 #define MAX_ESP 64
-typedef struct { CGFloat fx,fy,hx,hy; BOOL valid; } ESPEntry;
+typedef struct{CGFloat fx,fy,hx,hy;BOOL valid;}ESPEntry;
 static ESPEntry g_esp[MAX_ESP];
 static int      g_espCount=0;
 static BOOL     g_espOn=NO;
@@ -269,23 +231,9 @@ static void UpdateESP(void){
     }
 }
 
-// ─── получить инстанс CameraMovementController через FindObjectOfType ──────
-// кэшируем, ищем заново если старый указатель протух (смена сцены)
-static void* GetCamMovInst(void){
-    if(IsPtr(g_camMovInst))return g_camMovInst;
-    if(!g_camMovClass||!g_findObjTypeM||!fp_class_get_type||!fp_type_get_object)return NULL;
-    void*il2Type=fp_class_get_type(g_camMovClass);if(!IsPtr(il2Type))return NULL;
-    void*sysType=fp_type_get_object(il2Type);if(!IsPtr(sysType))return NULL;
-    void*params[1]={sysType};
-    // FindObjectOfType — статический, obj=NULL
-    void*inst=SafeInvoke(g_findObjTypeM,NULL,params);
-    g_camMovInst=IsPtr(inst)?inst:NULL;
-    return g_camMovInst;
-}
-
 static void UpdateAim(void){
     if(!g_aimOn||!g_initDone||!IsPtr(g_pcClass)||!fp_class_static_data)return;
-    if(!g_getTransM||!g_getPosM||!fp_object_unbox)return;
+    if(!g_getPosM||!fp_object_unbox)return;
 
     void*sd=fp_class_static_data(g_pcClass);if(!IsPtr(sd))return;
     void*list=RdPtr(sd,0x8);if(!IsPtr(list))return;
@@ -297,6 +245,7 @@ static void UpdateAim(void){
     CGFloat bestDist=g_fovRadius;
     Vec3    bestWP={0,0,0};
     BOOL    found=NO;
+    void*   localCtrl=NULL;   // PlayerController локального игрока
 
     int n=sz<MAX_ESP?sz:MAX_ESP;
     for(int i=0;i<n;i++){
@@ -304,7 +253,13 @@ static void UpdateAim(void){
         void*ctrl   =RdPtr(culling,OFF_CULLING_CTRL);if(!IsPtr(ctrl))continue;
         if(RdBool(ctrl,OFF_CTRL_ISDEATH))continue;
         void*view=RdPtr(ctrl,OFF_CTRL_VIEW);
-        if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE))continue;
+
+        // локальный игрок — запоминаем ctrl, не прицеливаемся в себя
+        if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE)){
+            localCtrl=ctrl;
+            continue;
+        }
+
         if(RdBool(culling,OFF_CULLING_OCCLUDED))continue;
         void*animator=RdPtr(ctrl,OFF_CTRL_ANIMATOR);if(!IsPtr(animator))continue;
         void*skel    =RdPtr(animator,OFF_ANIMATOR_SKEL);if(!IsPtr(skel))continue;
@@ -316,9 +271,10 @@ static void UpdateAim(void){
         CGFloat d=sqrtf(dx*dx+dy*dy);
         if(d<bestDist){bestDist=d;bestWP=bwp;found=YES;}
     }
-    if(!found){g_camMovInst=NULL;return;}  // нет цели — сбрасываем кэш на случай смены сцены
 
-    // Позиция камеры через Camera.main.transform
+    if(!found||!IsPtr(localCtrl))return;
+
+    // позиция камеры — через Camera.main.transform
     void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
     void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
     Vec3 cp=GetTransformPos(camTr);
@@ -327,26 +283,32 @@ static void UpdateAim(void){
     float dist3d=sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
     if(dist3d<0.01f)return;
 
-    // pitch: отрицательный = вверх (Unity X rotation convention)
     float pitch=-asinf(ddy/dist3d)*(180.0f/(float)M_PI);
-    // yaw: world-space Y angle — ровно то, что хранит CameraMovementController.yaw
     float yaw  = atan2f(ddx,ddz)*(180.0f/(float)M_PI);
 
-    // ─── Ключевой фикс: пишем в CameraMovementController, а не в camera.transform ───
-    // camera.transform.eulerAngles = игра перезатирает это каждый кадр в своём Update.
-    // CameraMovementController.pitch/yaw — именно отсюда игра сама строит поворот.
-    void*cmc=GetCamMovInst();if(!IsPtr(cmc))return;
+    // ─── PITCH ──────────────────────────────────────────────────────────
+    // MovementController.rotationX — input-поле, которое игра сама применяет
+    // к playerCamera каждый Update(). Пишем туда, а не в camera.transform
+    // (который игра перезатирает сразу после нас).
+    void*movCtrl=RdPtr(localCtrl,OFF_CTRL_MOVECTRL);
+    if(IsPtr(movCtrl))
+        SafeWriteF(movCtrl,OFF_MOVE_ROTX,pitch);
 
-    SafeWriteF(cmc,OFF_CAMC_PITCH,   pitch);
-    SafeWriteF(cmc,OFF_CAMC_YAW,     yaw);
-    SafeWriteF(cmc,OFF_CAMC_CAMPITCH,pitch);
-    // recoilRotation — зануляем, иначе отдача дерётся с нашим aim
-    SafeWriteF(cmc,OFF_CAMC_RECOIL+0, 0.f);
-    SafeWriteF(cmc,OFF_CAMC_RECOIL+4, 0.f);
-    SafeWriteF(cmc,OFF_CAMC_RECOIL+8, 0.f);
+    // ─── YAW ────────────────────────────────────────────────────────────
+    // Поворачиваем тело игрока (PlayerController.transform), а не камеру.
+    // MovementController крутит тело через transform.Rotate(Y*delta),
+    // т.е. аддитивно. Когда игрок не трогает экран, delta=0 и наш угол держится.
+    if(g_setEulerM&&g_getTransM){
+        void*bodyTr=SafeInvoke(g_getTransM,localCtrl,NULL);
+        if(IsPtr(bodyTr)){
+            Vec3 euler={0.f,yaw,0.f};
+            void*params[1]={&euler};
+            SafeInvoke(g_setEulerM,bodyTr,params);
+        }
+    }
 }
 
-// ─── dump ─────────────────────────────────────────────────────────────────
+// ─── dump ────────────────────────────────────────────────────────────────
 
 static NSString* PerformDump(void){
     if(!LoadAPI())return @"error: API not loaded";
@@ -392,7 +354,7 @@ static NSString* PerformDump(void){
               :[NSString stringWithFormat:@"✓ %lu classes",(unsigned long)total];
 }
 
-// ─── passthrough ──────────────────────────────────────────────────────────
+// ─── passthrough ─────────────────────────────────────────────────────────
 
 @interface PassthroughWindow:UIWindow @end
 @implementation PassthroughWindow
@@ -404,10 +366,12 @@ static NSString* PerformDump(void){
 
 @interface PassthroughView:UIView @end
 @implementation PassthroughView
--(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e{UIView*v=[super hitTest:p withEvent:e];return v==self?nil:v;}
+-(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e{
+    UIView*v=[super hitTest:p withEvent:e];return v==self?nil:v;
+}
 @end
 
-// ─── ESP overlay ──────────────────────────────────────────────────────────
+// ─── ESP overlay ─────────────────────────────────────────────────────────
 
 @interface ESPView:UIView @end
 @implementation ESPView
@@ -439,7 +403,7 @@ static NSString* PerformDump(void){
 }
 @end
 
-// ─── menu ─────────────────────────────────────────────────────────────────
+// ─── menu ────────────────────────────────────────────────────────────────
 
 static const CGFloat kPad   =14.0f;
 static const CGFloat kBtnH  =36.0f;
@@ -447,11 +411,10 @@ static const CGFloat kGap   =10.0f;
 static const CGFloat kSecGap=16.0f;
 
 @interface MenuView:UIView
-@property(strong) UIButton*espBtn,*aimBtn,*targetBtn,*dumpBtn,*closeBtn;
-@property(strong) UILabel*statusLabel,*fovLabel;
-@property(strong) UISlider*fovSlider;
+@property(strong)UIButton*espBtn,*aimBtn,*targetBtn,*dumpBtn,*closeBtn;
+@property(strong)UILabel*statusLabel,*fovLabel;
+@property(strong)UISlider*fovSlider;
 @end
-
 @implementation MenuView{CGPoint _drag;}
 
 -(UILabel*)sectionLabel:(NSString*)t y:(CGFloat)y{
@@ -459,7 +422,6 @@ static const CGFloat kSecGap=16.0f;
     l.text=t;l.font=[UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     l.textColor=C(0.45f,0.45f,0.50f,1);[self addSubview:l];return l;
 }
-
 -(UIButton*)makeBtn:(NSString*)title frame:(CGRect)f{
     UIButton*b=[UIButton buttonWithType:UIButtonTypeCustom];
     b.frame=f;b.backgroundColor=C(0.14f,0.14f,0.16f,1);
@@ -472,7 +434,6 @@ static const CGFloat kSecGap=16.0f;
     [b addTarget:self action:@selector(btnUp:)   forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside];
     [self addSubview:b];return b;
 }
-
 -(UIImage*)thumbImg{
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(14,14),NO,0);
     CGContextRef c=UIGraphicsGetCurrentContext();
@@ -480,22 +441,18 @@ static const CGFloat kSecGap=16.0f;
     CGContextFillEllipseInRect(c,CGRectMake(0,0,14,14));
     UIImage*i=UIGraphicsGetImageFromCurrentImageContext();UIGraphicsEndImageContext();return i;
 }
-
 -(instancetype)initWithFrame:(CGRect)f{
     self=[super initWithFrame:f];
     self.backgroundColor=C(0.08f,0.08f,0.09f,0.96f);
     self.layer.cornerRadius=kR;self.layer.masksToBounds=YES;
     self.layer.borderWidth=1;self.layer.borderColor=C(1.0f,0.55f,0.0f,0.18f).CGColor;
-
     CGFloat W=f.size.width,innerW=W-kPad*2,halfW=(innerW-kGap)*0.5f;
-
     UIView*hdr=[[UIView alloc]initWithFrame:CGRectMake(0,0,W,44)];
     hdr.backgroundColor=C(0.11f,0.11f,0.12f,1);[self addSubview:hdr];
     UILabel*ttl=[[UILabel alloc]initWithFrame:CGRectMake(kPad,0,innerW-36,44)];
     ttl.text=@"cheat";ttl.textAlignment=NSTextAlignmentLeft;
     ttl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     ttl.textColor=C(1,1,1,0.90f);[hdr addSubview:ttl];
-
     self.closeBtn=[UIButton buttonWithType:UIButtonTypeCustom];
     self.closeBtn.frame=CGRectMake(W-38,10,26,26);
     self.closeBtn.backgroundColor=C(0.55f,0.10f,0.10f,1);
@@ -504,43 +461,45 @@ static const CGFloat kSecGap=16.0f;
     [self.closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.closeBtn.titleLabel.font=[UIFont systemFontOfSize:13 weight:UIFontWeightBold];
     [hdr addSubview:self.closeBtn];
-    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(pan:)]];
+
+    // ─── TOUCH FIX: cancelsTouchesInView=NO ─────────────────────────────
+    // По дефолту UIPanGestureRecognizer cancels touches у игры, когда начинает
+    // распознавание. Это ломает tracking пальца в Unity → player freezes.
+    // cancelsTouchesInView=NO + delaysTouchesBegan=NO = жест читает данные,
+    // но не отменяет тачи игры.
+    UIPanGestureRecognizer*hdrPan=[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(pan:)];
+    hdrPan.cancelsTouchesInView=NO;
+    hdrPan.delaysTouchesBegan=NO;
+    [hdr addGestureRecognizer:hdrPan];
 
     CGFloat y=44+kGap;
-    self.espBtn=[self makeBtn:@"ESP" frame:CGRectMake(kPad,          y,halfW,kBtnH)];
-    self.aimBtn=[self makeBtn:@"AIM" frame:CGRectMake(kPad+halfW+kGap,y,halfW,kBtnH)];
+    self.espBtn   =[self makeBtn:@"ESP"  frame:CGRectMake(kPad,            y,halfW,kBtnH)];
+    self.aimBtn   =[self makeBtn:@"AIM"  frame:CGRectMake(kPad+halfW+kGap,y,halfW,kBtnH)];
     y+=kBtnH+kSecGap;
-
     [self sectionLabel:@"TARGET" y:y];y+=15;
     self.targetBtn=[self makeBtn:@"HEAD" frame:CGRectMake(kPad,y,innerW,kBtnH)];
     y+=kBtnH+kSecGap;
-
     [self sectionLabel:@"FOV" y:y];y+=15;
     self.fovLabel=[[UILabel alloc]initWithFrame:CGRectMake(kPad,y,innerW,14)];
     self.fovLabel.font=[UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
     self.fovLabel.textColor=C(1.0f,0.55f,0.0f,0.85f);
     self.fovLabel.text=[NSString stringWithFormat:@"%.0f px",g_fovRadius];
     [self addSubview:self.fovLabel];y+=18;
-
     self.fovSlider=[[UISlider alloc]initWithFrame:CGRectMake(kPad,y,innerW,24)];
     self.fovSlider.minimumValue=20;self.fovSlider.maximumValue=300;self.fovSlider.value=g_fovRadius;
     self.fovSlider.minimumTrackTintColor=C(1.0f,0.55f,0.0f,0.85f);
     self.fovSlider.maximumTrackTintColor=C(0.18f,0.18f,0.18f,1);
     [self.fovSlider setThumbImage:[self thumbImg] forState:UIControlStateNormal];
     [self addSubview:self.fovSlider];y+=30;
-
     self.statusLabel=[[UILabel alloc]initWithFrame:CGRectMake(kPad,y,innerW,32)];
     self.statusLabel.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
     self.statusLabel.textColor=C(0.30f,0.70f,0.35f,1);
     self.statusLabel.numberOfLines=2;[self addSubview:self.statusLabel];y+=38;
-
     self.dumpBtn=[self makeBtn:@"DUMP IL2CPP" frame:CGRectMake(kPad,y,innerW,kBtnH)];
     return self;
 }
-
 -(void)btnDown:(UIButton*)b{[UIView animateWithDuration:0.07 animations:^{b.backgroundColor=C(0.22f,0.22f,0.26f,1);b.layer.borderColor=C(1.0f,0.55f,0.0f,0.65f).CGColor;}];}
 -(void)btnUp:(UIButton*)b  {[UIView animateWithDuration:0.14 animations:^{b.backgroundColor=C(0.14f,0.14f,0.16f,1);b.layer.borderColor=C(1.0f,0.55f,0.0f,0.22f).CGColor;}];}
-
 -(void)pan:(UIPanGestureRecognizer*)g{
     CGPoint loc=[g locationInView:self.superview];
     if(g.state==UIGestureRecognizerStateBegan)_drag=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);
@@ -548,12 +507,11 @@ static const CGFloat kSecGap=16.0f;
 }
 @end
 
-// ─── controller ───────────────────────────────────────────────────────────
+// ─── controller ──────────────────────────────────────────────────────────
 
 @interface CheatController:NSObject
 +(instancetype)shared;-(void)toggle;
 @end
-
 @implementation CheatController{
     PassthroughWindow*_win;
     MenuView*_menu;
@@ -562,7 +520,6 @@ static const CGFloat kSecGap=16.0f;
     CADisplayLink*_dl;
     BOOL _visible;
 }
-
 +(instancetype)shared{
     static CheatController*inst;static dispatch_once_t once;
     dispatch_once(&once,^{inst=[CheatController new];});return inst;
@@ -575,20 +532,21 @@ static const CGFloat kSecGap=16.0f;
         if([s isKindOfClass:[UIWindowScene class]]){scene=(UIWindowScene*)s;break;}
     _win=scene?[[PassthroughWindow alloc]initWithWindowScene:scene]
               :[[PassthroughWindow alloc]initWithFrame:[UIScreen mainScreen].bounds];
-    _win.windowLevel=UIWindowLevelAlert+200;_win.backgroundColor=[UIColor clearColor];
-
+    // ─── TOUCH FIX: уровень Normal+100 вместо Alert+200 ─────────────────
+    // Alert-уровень даёт iOS право перехватывать тачи перед игрой даже
+    // при passthrough hitTest. Normal+100 находится выше игрового окна,
+    // но ниже системных алертов → routing работает корректно.
+    _win.windowLevel=UIWindowLevelNormal+100;
+    _win.backgroundColor=[UIColor clearColor];
     PassthroughView*pv=[[PassthroughView alloc]initWithFrame:[UIScreen mainScreen].bounds];
     pv.backgroundColor=[UIColor clearColor];
     UIViewController*vc=[UIViewController new];vc.view=pv;
     _win.rootViewController=vc;_win.hidden=NO;
-
     _espView=[ESPView new];[pv addSubview:_espView];
-
     CGSize sz=[UIScreen mainScreen].bounds.size;
     CGFloat w=fminf(sz.width-28,320);CGFloat h=330;
     _menu=[[MenuView alloc]initWithFrame:CGRectMake((sz.width-w)*0.5f,(sz.height-h)*0.5f,w,h)];
     [pv addSubview:_menu];
-
     [_menu.closeBtn  addTarget:self action:@selector(doClose)     forControlEvents:UIControlEventTouchUpInside];
     [_menu.espBtn    addTarget:self action:@selector(doESP)       forControlEvents:UIControlEventTouchUpInside];
     [_menu.aimBtn    addTarget:self action:@selector(doAim)       forControlEvents:UIControlEventTouchUpInside];
@@ -597,16 +555,20 @@ static const CGFloat kSecGap=16.0f;
     [_menu.fovSlider addTarget:self action:@selector(fovChanged:) forControlEvents:UIControlEventValueChanged];
 
     _fab=[UIButton buttonWithType:UIButtonTypeCustom];
-    _fab.frame=CGRectMake(sz.width-56, 90, 40, 40);
+    _fab.frame=CGRectMake(sz.width-56,90,40,40);
     _fab.backgroundColor=C(1.0f,0.55f,0.0f,0.88f);
-    _fab.layer.cornerRadius=20;
-    _fab.layer.borderWidth=1.5f;
+    _fab.layer.cornerRadius=20;_fab.layer.borderWidth=1.5f;
     _fab.layer.borderColor=C(1,1,1,0.35f).CGColor;
     [_fab setTitle:@"☰" forState:UIControlStateNormal];
     _fab.titleLabel.font=[UIFont systemFontOfSize:17 weight:UIFontWeightBold];
     [_fab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [_fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-    [_fab addGestureRecognizer:[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(dragFAB:)]];
+
+    // ─── TOUCH FIX: FAB pan тоже не отменяет тачи игры ──────────────────
+    UIPanGestureRecognizer*fabPan=[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(dragFAB:)];
+    fabPan.cancelsTouchesInView=NO;
+    fabPan.delaysTouchesBegan=NO;
+    [_fab addGestureRecognizer:fabPan];
     [pv addSubview:_fab];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
@@ -615,8 +577,7 @@ static const CGFloat kSecGap=16.0f;
 }
 
 -(void)dragFAB:(UIPanGestureRecognizer*)g{
-    static CGPoint drag;
-    UIView*v=g.view;
+    static CGPoint drag;UIView*v=g.view;
     CGPoint loc=[g locationInView:v.superview];
     if(g.state==UIGestureRecognizerStateBegan)
         drag=CGPointMake(loc.x-v.frame.origin.x,loc.y-v.frame.origin.y);
@@ -624,7 +585,6 @@ static const CGFloat kSecGap=16.0f;
         CGRect r=v.frame;r.origin=CGPointMake(loc.x-drag.x,loc.y-drag.y);v.frame=r;
     }
 }
-
 -(void)tick{
     if(!g_espOn&&!g_aimOn)return;
     if(!g_initDone)InitClasses();
@@ -632,7 +592,6 @@ static const CGFloat kSecGap=16.0f;
     if(g_aimOn)UpdateAim();
     [_espView setNeedsDisplay];
 }
-
 -(void)doESP{
     g_espOn=!g_espOn;
     if(g_espOn&&!g_initDone)InitClasses();
@@ -641,27 +600,23 @@ static const CGFloat kSecGap=16.0f;
     _menu.statusLabel.text=g_espOn?@"esp active":@"esp off";
     if(!g_espOn){g_espCount=0;[_espView setNeedsDisplay];}
 }
-
 -(void)doAim{
     g_aimOn=!g_aimOn;
-    if(g_aimOn){if(!g_initDone)InitClasses();g_camMovInst=NULL;}  // сброс кэша при включении
+    if(g_aimOn&&!g_initDone)InitClasses();
     [_menu.aimBtn setTitle:g_aimOn?@"ON":@"OFF" forState:UIControlStateNormal];
     _menu.aimBtn.layer.borderColor=g_aimOn?C(1.0f,0.55f,0.0f,0.65f).CGColor:C(1.0f,0.55f,0.0f,0.22f).CGColor;
     _menu.statusLabel.text=g_aimOn?@"aim active":@"aim off";
     if(!g_aimOn)[_espView setNeedsDisplay];
 }
-
 -(void)doTarget{
     g_aimHead=!g_aimHead;
     [_menu.targetBtn setTitle:g_aimHead?@"HEAD":@"BODY" forState:UIControlStateNormal];
 }
-
 -(void)fovChanged:(UISlider*)s{
     g_fovRadius=s.value;
     _menu.fovLabel.text=[NSString stringWithFormat:@"%.0f px",g_fovRadius];
     if(g_aimOn)[_espView setNeedsDisplay];
 }
-
 -(void)doDump{
     _menu.dumpBtn.enabled=NO;_menu.statusLabel.text=@"dumping...";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
@@ -671,17 +626,14 @@ static const CGFloat kSecGap=16.0f;
         });
     });
 }
-
 -(void)doClose{
     [UIView animateWithDuration:kDur delay:0 options:UIViewAnimationOptionCurveEaseIn
                      animations:^{self->_menu.alpha=0;self->_menu.transform=CGAffineTransformMakeScale(0.88f,0.88f);}
                      completion:^(BOOL _){self->_menu.hidden=YES;self->_menu.transform=CGAffineTransformIdentity;self->_visible=NO;}];
 }
-
 -(void)toggle{
     if(_visible){[self doClose];return;}
-    _visible=YES;_menu.hidden=NO;_menu.alpha=0;
-    _menu.transform=CGAffineTransformMakeScale(0.88f,0.88f);
+    _visible=YES;_menu.hidden=NO;_menu.alpha=0;_menu.transform=CGAffineTransformMakeScale(0.88f,0.88f);
     [UIView animateWithDuration:kDur animations:^{self->_menu.alpha=1;self->_menu.transform=CGAffineTransformIdentity;}];
 }
 @end
@@ -691,8 +643,6 @@ static void Init(void){
     InstallRecovery();
     dispatch_async(dispatch_get_main_queue(),^{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(),^{
-            [[CheatController shared]toggle];
-        });
+                       dispatch_get_main_queue(),^{[[CheatController shared]toggle];});
     });
 }
