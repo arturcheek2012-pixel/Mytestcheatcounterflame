@@ -1,5 +1,6 @@
 CC     = xcrun -sdk iphoneos clang++
 ARCH   = -arch arm64
+FLAGS  = -fobjc-arc -Wno-deprecated-declarations
 FWORKS = -framework UIKit -framework QuartzCore -framework Foundation
 OUT    = CheatMenu.dylib
 SRC    = src/CheatMenu.mm
@@ -9,7 +10,7 @@ SRC    = src/CheatMenu.mm
 all: $(OUT)
 
 $(OUT): $(SRC)
-	$(CC) $(ARCH) -dynamiclib $(FWORKS) -o $@ $<
+	$(CC) $(ARCH) $(FLAGS) -dynamiclib $(FWORKS) -o $@ $<
 	ldid -S $@
 
 clean:
