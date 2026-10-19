@@ -1,5 +1,4 @@
 name: Build IPA
-
 on:
   push:
     branches: [main]
@@ -11,8 +10,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build unsigned IPA
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate xcodeproj
         run: |
+          cd StressKit
+          xcodegen generate
+
+      - name: Build archive
+        run: |
+          cd StressKit
           xcodebuild \
             -scheme StressKit \
             -configuration Release \
@@ -23,12 +31,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-          mkdir -p build/payload/Payload
-          cp -r build/StressKit.xcarchive/Products/Applications/StressKit.app \
-            build/payload/Payload/
-          cd build/payload && zip -r ../StressKit.ipa Payload
+      - name: Package IPA
+        run: |
+          cd StressKit
+          mkdir -p build/Payload
+          cp -r build/StressKit.xcarchive/Products/Applications/StressKit.app build/Payload/
+          cd build && zip -r StressKit.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
           name: StressKit.ipa
-          path: build/StressKit.ipa
+          path: StressKit/build/StressKit.ipa
