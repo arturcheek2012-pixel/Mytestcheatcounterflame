@@ -14,7 +14,19 @@ static inline UIColor* C(CGFloat r,CGFloat g,CGFloat b,CGFloat a){
 }
 typedef struct { float x,y,z; } Vec3;
 
-// PlayerCulling / PlayerController chain
+// ─── offsets — verified from il2cpp_dump.txt ─────────────────────────────
+// PlayerCulling static:       Instances          0x08
+// PlayerCulling instance:     _controller        0x18
+//                             _occluded          0x48
+// PlayerController:           _movementController 0x40
+//                             _view              0x80  (PhotonView)
+//                             _animatorController 0x98 (PlayerAnimatorController)
+//                             _isDeath           0xA8
+// PhotonView:                 <IsMine>backing    0x60
+// PlayerAnimatorController:   _skeleton          0x68  (PlayerSkeleton)
+// PlayerSkeleton:             _headBone          0xA8  (Transform)
+//                             _chestBone         0xB0  (Transform)
+// MovementController:         rotationX          0xDC  (pitch accumulator)
 #define OFF_CULLING_CTRL     0x18
 #define OFF_CTRL_VIEW        0x80
 #define OFF_VIEW_ISMINE      0x60
@@ -24,10 +36,8 @@ typedef struct { float x,y,z; } Vec3;
 #define OFF_ANIMATOR_SKEL    0x68
 #define OFF_SKEL_HEAD        0xA8
 #define OFF_SKEL_CHEST       0xB0
-// PlayerController → MovementController
-#define OFF_CTRL_MOVECTRL    0x40   // PlayerController._movementController
-// MovementController
-#define OFF_MOVE_ROTX        0xDC   // MovementController.rotationX  (float, pitch accumulator)
+#define OFF_CTRL_MOVECTRL    0x40
+#define OFF_MOVE_ROTX        0xDC
 
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
@@ -113,14 +123,12 @@ static void InstallRecovery(void){
         sigaction(SIGSEGV,&sa,&g_oldSEGV);sigaction(SIGBUS,&sa,&g_oldBUS);
     });
 }
-// obj=NULL валиден для статических IL2CPP-методов
 static void* SafeInvoke(void*method,void*obj,void**params){
     if(!IsPtr(method)||!fp_runtime_invoke)return NULL;
     void*result=NULL;tls_armed=1;
     if(sigsetjmp(tls_jmp,1)==0){void*exc=NULL;result=fp_runtime_invoke(method,obj,params,&exc);if(exc)result=NULL;}
     tls_armed=0;return result;
 }
-// прямая запись float в managed-объект (игра читает сама в своём Update)
 static void SafeWriteF(void*obj,size_t off,float val){
     if(!IsPtr(obj))return;
     tls_armed=1;
@@ -142,7 +150,7 @@ static uintptr_t UnityBase(void){
 
 static void*g_imgCSharp=NULL,*g_imgUnity=NULL,*g_pcClass=NULL;
 static void*g_getTransM=NULL,*g_getPosM=NULL,*g_getMainM=NULL,*g_w2sM=NULL;
-static void*g_setEulerM=NULL;   // Transform.set_eulerAngles — для горизонтального поворота тела
+static void*g_setEulerM=NULL,*g_getEulerM=NULL;
 static BOOL g_initDone=NO;
 
 static void InitClasses(void){
@@ -153,7 +161,8 @@ static void InitClasses(void){
         void*img=fp_assembly_image(asms[i]);if(!img)continue;
         const char*nm=fp_image_name(img);if(!nm)continue;
         if(!g_imgCSharp&&strcmp(nm,"Assembly-CSharp.dll")==0)g_imgCSharp=img;
-        if(!g_imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||strcmp(nm,"UnityEngine.dll")==0))g_imgUnity=img;
+        if(!g_imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||
+                         strcmp(nm,"UnityEngine.dll")==0))g_imgUnity=img;
     }
     if(g_imgCSharp) g_pcClass=fp_class_from_name(g_imgCSharp,"","PlayerCulling");
     if(g_imgUnity){
@@ -163,10 +172,14 @@ static void InitClasses(void){
         if(camC){g_getMainM=fp_class_method_from_name(camC,"get_main",0);
                  g_w2sM    =fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
         if(compC) g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
-        if(trnC) {g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
-                  g_setEulerM=fp_class_method_from_name(trnC,"set_eulerAngles",1);}
+        if(trnC){g_getPosM  =fp_class_method_from_name(trnC,"get_position",0);
+                 g_setEulerM=fp_class_method_from_name(trnC,"set_eulerAngles",1);
+                 g_getEulerM=fp_class_method_from_name(trnC,"get_eulerAngles",0);}
     }
-    UnityBase();g_initDone=YES;
+    UnityBase();
+    // помечаем done только когда минимально необходимое есть
+    g_initDone=(g_pcClass!=NULL&&g_getTransM!=NULL&&g_getPosM!=NULL&&
+                g_getMainM!=NULL&&g_w2sM!=NULL&&fp_object_unbox!=NULL);
 }
 
 // ─── unity helpers ───────────────────────────────────────────────────────
@@ -196,6 +209,14 @@ static CGPoint W2S(Vec3 wp){
     return CGPointMake(sv->x/sc,uH-sv->y/sc);
 }
 
+// ─── helper: тянет headBone Transform из PlayerController ─────────────────
+// возвращает NULL если цепочка рвётся
+static void* BoneFromCtrl(void*ctrl, size_t boneOff){
+    void*animator=RdPtr(ctrl,OFF_CTRL_ANIMATOR);if(!IsPtr(animator))return NULL;
+    void*skel    =RdPtr(animator,OFF_ANIMATOR_SKEL);if(!IsPtr(skel))return NULL;
+    void*bone    =RdPtr(skel,boneOff);return IsPtr(bone)?bone:NULL;
+}
+
 // ─── ESP / Aim ───────────────────────────────────────────────────────────
 
 #define MAX_ESP 64
@@ -222,9 +243,20 @@ static void UpdateESP(void){
         void*view=RdPtr(ctrl,OFF_CTRL_VIEW);
         if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE))continue;
         if(RdBool(culling,OFF_CULLING_OCCLUDED))continue;
+
+        // ── foot: позиция самого объекта PlayerCulling (уровень ног) ──
         Vec3 foot=GetPos(culling);
         if(foot.x==0&&foot.y==0&&foot.z==0)continue;
-        Vec3 head={foot.x,foot.y+1.8f,foot.z};
+
+        // ── head: берём _headBone→Transform→position ──
+        // fallback — foot + эмпирическая высота только если кость недоступна
+        Vec3 head={foot.x,foot.y+1.75f,foot.z};
+        void*hbone=BoneFromCtrl(ctrl,OFF_SKEL_HEAD);
+        if(IsPtr(hbone)){
+            Vec3 hp=GetTransformPos(hbone);
+            if(hp.x!=0||hp.y!=0||hp.z!=0) head=hp;
+        }
+
         CGPoint fs=W2S(foot);if(fs.x<0)continue;
         CGPoint hs=W2S(head);if(hs.x<0)continue;
         g_esp[g_espCount++]=(ESPEntry){fs.x,fs.y,hs.x,hs.y,YES};
@@ -233,7 +265,6 @@ static void UpdateESP(void){
 
 static void UpdateAim(void){
     if(!g_aimOn||!g_initDone||!IsPtr(g_pcClass)||!fp_class_static_data)return;
-    if(!g_getPosM||!fp_object_unbox)return;
 
     void*sd=fp_class_static_data(g_pcClass);if(!IsPtr(sd))return;
     void*list=RdPtr(sd,0x8);if(!IsPtr(list))return;
@@ -245,7 +276,7 @@ static void UpdateAim(void){
     CGFloat bestDist=g_fovRadius;
     Vec3    bestWP={0,0,0};
     BOOL    found=NO;
-    void*   localCtrl=NULL;   // PlayerController локального игрока
+    void*   localCtrl=NULL;
 
     int n=sz<MAX_ESP?sz:MAX_ESP;
     for(int i=0;i<n;i++){
@@ -253,17 +284,11 @@ static void UpdateAim(void){
         void*ctrl   =RdPtr(culling,OFF_CULLING_CTRL);if(!IsPtr(ctrl))continue;
         if(RdBool(ctrl,OFF_CTRL_ISDEATH))continue;
         void*view=RdPtr(ctrl,OFF_CTRL_VIEW);
-
-        // локальный игрок — запоминаем ctrl, не прицеливаемся в себя
-        if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE)){
-            localCtrl=ctrl;
-            continue;
-        }
-
+        if(IsPtr(view)&&RdBool(view,OFF_VIEW_ISMINE)){localCtrl=ctrl;continue;}
         if(RdBool(culling,OFF_CULLING_OCCLUDED))continue;
-        void*animator=RdPtr(ctrl,OFF_CTRL_ANIMATOR);if(!IsPtr(animator))continue;
-        void*skel    =RdPtr(animator,OFF_ANIMATOR_SKEL);if(!IsPtr(skel))continue;
-        void*bone    =RdPtr(skel,g_aimHead?OFF_SKEL_HEAD:OFF_SKEL_CHEST);if(!IsPtr(bone))continue;
+
+        void*bone=BoneFromCtrl(ctrl,g_aimHead?OFF_SKEL_HEAD:OFF_SKEL_CHEST);
+        if(!IsPtr(bone))continue;
         Vec3 bwp=GetTransformPos(bone);
         if(bwp.x==0&&bwp.y==0&&bwp.z==0)continue;
         CGPoint sp=W2S(bwp);if(sp.x<0)continue;
@@ -271,37 +296,41 @@ static void UpdateAim(void){
         CGFloat d=sqrtf(dx*dx+dy*dy);
         if(d<bestDist){bestDist=d;bestWP=bwp;found=YES;}
     }
-
     if(!found||!IsPtr(localCtrl))return;
 
-    // позиция камеры — через Camera.main.transform
+    // ── позиция камеры ──
     void*cam=SafeInvoke(g_getMainM,NULL,NULL);if(!IsPtr(cam))return;
     void*camTr=SafeInvoke(g_getTransM,cam,NULL);if(!IsPtr(camTr))return;
     Vec3 cp=GetTransformPos(camTr);
 
-    float ddx=bestWP.x-cp.x, ddy=bestWP.y-cp.y, ddz=bestWP.z-cp.z;
+    float ddx=bestWP.x-cp.x,ddy=bestWP.y-cp.y,ddz=bestWP.z-cp.z;
     float dist3d=sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
     if(dist3d<0.01f)return;
 
     float pitch=-asinf(ddy/dist3d)*(180.0f/(float)M_PI);
     float yaw  = atan2f(ddx,ddz)*(180.0f/(float)M_PI);
 
-    // ─── PITCH ──────────────────────────────────────────────────────────
-    // MovementController.rotationX — input-поле, которое игра сама применяет
-    // к playerCamera каждый Update(). Пишем туда, а не в camera.transform
-    // (который игра перезатирает сразу после нас).
+    // ── PITCH ────────────────────────────────────────────────────────────
+    // MovementController.rotationX — накопитель питча, игра читает каждый Update
+    // и применяет к playerCamera. Пишем сюда, не в camera.transform (он
+    // перезаписывается сразу после нас). Работает при 60fps DisplayLink:
+    // мы обновляем синхронно с Unity Update, race window = 0 кадров.
     void*movCtrl=RdPtr(localCtrl,OFF_CTRL_MOVECTRL);
-    if(IsPtr(movCtrl))
-        SafeWriteF(movCtrl,OFF_MOVE_ROTX,pitch);
+    if(IsPtr(movCtrl)) SafeWriteF(movCtrl,OFF_MOVE_ROTX,pitch);
 
-    // ─── YAW ────────────────────────────────────────────────────────────
-    // Поворачиваем тело игрока (PlayerController.transform), а не камеру.
-    // MovementController крутит тело через transform.Rotate(Y*delta),
-    // т.е. аддитивно. Когда игрок не трогает экран, delta=0 и наш угол держится.
-    if(g_setEulerM&&g_getTransM){
+    // ── YAW ──────────────────────────────────────────────────────────────
+    // Тело вращается аддитивно в MovementController.Update через Rotate(Y*delta).
+    // Когда игрок не касается экрана — delta=0, наш угол держится.
+    // При 60fps мы пишем каждый кадр — race window ≤1 Unity-кадр (≈16мс),
+    // это приемлемо. Сохраняем текущие X и Z, меняем только Y.
+    if(g_setEulerM&&g_getEulerM&&g_getTransM){
         void*bodyTr=SafeInvoke(g_getTransM,localCtrl,NULL);
         if(IsPtr(bodyTr)){
-            Vec3 euler={0.f,yaw,0.f};
+            // читаем текущий euler чтобы не обнулять X/Z (физический наклон)
+            Vec3 cur={0,0,0};
+            void*eb=SafeInvoke(g_getEulerM,bodyTr,NULL);
+            if(IsPtr(eb)&&fp_object_unbox){Vec3*ep=(Vec3*)fp_object_unbox(eb);if(ep)cur=*ep;}
+            Vec3 euler={cur.x,yaw,cur.z};
             void*params[1]={&euler};
             SafeInvoke(g_setEulerM,bodyTr,params);
         }
@@ -337,10 +366,15 @@ static NSString* PerformDump(void){
                 [out appendFormat:@"\t// 0x%zX  %s\n",fp_field_offset(fld),fp_field_name(fld)?:"?"];
             void*mi=NULL,*mth;
             while((mth=fp_class_methods(klass,&mi))){
-                const char*mn=fp_method_name(mth);uint32_t np=fp_method_params(mth);
-                uintptr_t ptr=*(uintptr_t*)mth;
-                (ptr>base)?[out appendFormat:@"\t// RVA: 0x%llX  p:%u  %s\n",(unsigned long long)(ptr-base),np,mn?:"?"]
-                           :[out appendFormat:@"\t// RVA: N/A  p:%u  %s\n",np,mn?:"?"];
+                const char*mn=fp_method_name(mth);
+                uint32_t np=fp_method_params(mth);
+                // FIX: SafeRead вместо прямого dereference — MethodInfo может
+                // указывать на невалидную память для некоторых generic-методов
+                uintptr_t ptr=0;
+                SafeRead(mth,&ptr,sizeof(uintptr_t));
+                (base&&ptr>base)?
+                    [out appendFormat:@"\t// RVA: 0x%llX  p:%u  %s\n",(unsigned long long)(ptr-base),np,mn?:"?"]
+                   :[out appendFormat:@"\t// RVA: N/A  p:%u  %s\n",np,mn?:"?"];
             }
             [out appendString:@"}\n"];total++;
         }
@@ -461,17 +495,9 @@ static const CGFloat kSecGap=16.0f;
     [self.closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.closeBtn.titleLabel.font=[UIFont systemFontOfSize:13 weight:UIFontWeightBold];
     [hdr addSubview:self.closeBtn];
-
-    // ─── TOUCH FIX: cancelsTouchesInView=NO ─────────────────────────────
-    // По дефолту UIPanGestureRecognizer cancels touches у игры, когда начинает
-    // распознавание. Это ломает tracking пальца в Unity → player freezes.
-    // cancelsTouchesInView=NO + delaysTouchesBegan=NO = жест читает данные,
-    // но не отменяет тачи игры.
     UIPanGestureRecognizer*hdrPan=[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(pan:)];
-    hdrPan.cancelsTouchesInView=NO;
-    hdrPan.delaysTouchesBegan=NO;
+    hdrPan.cancelsTouchesInView=NO;hdrPan.delaysTouchesBegan=NO;
     [hdr addGestureRecognizer:hdrPan];
-
     CGFloat y=44+kGap;
     self.espBtn   =[self makeBtn:@"ESP"  frame:CGRectMake(kPad,            y,halfW,kBtnH)];
     self.aimBtn   =[self makeBtn:@"AIM"  frame:CGRectMake(kPad+halfW+kGap,y,halfW,kBtnH)];
@@ -532,10 +558,6 @@ static const CGFloat kSecGap=16.0f;
         if([s isKindOfClass:[UIWindowScene class]]){scene=(UIWindowScene*)s;break;}
     _win=scene?[[PassthroughWindow alloc]initWithWindowScene:scene]
               :[[PassthroughWindow alloc]initWithFrame:[UIScreen mainScreen].bounds];
-    // ─── TOUCH FIX: уровень Normal+100 вместо Alert+200 ─────────────────
-    // Alert-уровень даёт iOS право перехватывать тачи перед игрой даже
-    // при passthrough hitTest. Normal+100 находится выше игрового окна,
-    // но ниже системных алертов → routing работает корректно.
     _win.windowLevel=UIWindowLevelNormal+100;
     _win.backgroundColor=[UIColor clearColor];
     PassthroughView*pv=[[PassthroughView alloc]initWithFrame:[UIScreen mainScreen].bounds];
@@ -563,16 +585,15 @@ static const CGFloat kSecGap=16.0f;
     _fab.titleLabel.font=[UIFont systemFontOfSize:17 weight:UIFontWeightBold];
     [_fab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [_fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-
-    // ─── TOUCH FIX: FAB pan тоже не отменяет тачи игры ──────────────────
     UIPanGestureRecognizer*fabPan=[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(dragFAB:)];
-    fabPan.cancelsTouchesInView=NO;
-    fabPan.delaysTouchesBegan=NO;
+    fabPan.cancelsTouchesInView=NO;fabPan.delaysTouchesBegan=NO;
     [_fab addGestureRecognizer:fabPan];
     [pv addSubview:_fab];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    _dl.preferredFramesPerSecond=30;
+    // FIX: 60fps — aim yaw пишется каждый кадр, race window ≤1 Unity-кадр (≈16мс)
+    // вместо 30fps где gap 33мс = 2 Unity-кадра и yaw стабильно перетирался
+    _dl.preferredFramesPerSecond=60;
     [_dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
