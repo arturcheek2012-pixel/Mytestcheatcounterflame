@@ -1,0 +1,46 @@
+name: Build CFEsp
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ldid
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          curl -LO https://github.com/theos/sdks/releases/download/2023-04-07/iPhoneOS16.5.sdk.tar.xz
+          tar -xJf iPhoneOS16.5.sdk.tar.xz -C $HOME/theos/sdks/
+
+      - name: Compile .dylib
+        run: |
+          $HOME/theos/toolchain/linux/iphone/bin/clang++ \
+            -arch arm64 \
+            -isysroot $HOME/theos/sdks/iPhoneOS16.5.sdk \
+            -fobjc-arc \
+            -O2 \
+            -dynamiclib \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -o CFEsp.dylib \
+            Tweak.mm
+
+      - name: Sign
+        run: ldid -S CFEsp.dylib
+
+      - name: Upload .dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: CFEsp-dylib
+          path: CFEsp.dylib
+          retention-days: 14
