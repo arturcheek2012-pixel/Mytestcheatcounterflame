@@ -13,6 +13,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Build Dobby
+        run: |
+          git clone --depth=1 https://github.com/jmpews/Dobby.git /tmp/Dobby
+          cmake -S /tmp/Dobby -B /tmp/Dobby/build \
+            -DCMAKE_TOOLCHAIN_FILE=/tmp/Dobby/cmake/ios.toolchain.cmake \
+            -DPLATFORM=OS64 \
+            -DDEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDobby_DEBUG=OFF
+          cmake --build /tmp/Dobby/build --config Release
+
       - name: Compile
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -27,6 +38,9 @@ jobs:
             -framework QuartzCore \
             -lobjc \
             -lc++ \
+            -I/tmp/Dobby/include \
+            -L/tmp/Dobby/build \
+            -ldobby \
             -o CFEsp.dylib \
             Tweak.mm
 
