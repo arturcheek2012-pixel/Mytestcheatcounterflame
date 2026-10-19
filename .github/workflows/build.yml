@@ -1,0 +1,34 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build unsigned IPA
+        run: |
+          xcodebuild \
+            -scheme StressKit \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/StressKit.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          mkdir -p build/payload/Payload
+          cp -r build/StressKit.xcarchive/Products/Applications/StressKit.app \
+            build/payload/Payload/
+          cd build/payload && zip -r ../StressKit.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StressKit.ipa
+          path: build/StressKit.ipa
