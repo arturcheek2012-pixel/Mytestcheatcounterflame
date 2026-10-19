@@ -1,6 +1,9 @@
 // src/CheatMenu.mm
-// xcrun -sdk iphoneos clang++ -arch arm64 -dynamiclib
-//   -framework UIKit -framework QuartzCore -framework Foundation
+// xcrun -sdk iphoneos clang++ -arch arm64 -fobjc-arc \
+//   -Wno-deprecated-declarations -dynamiclib \
+//   -framework UIKit -framework QuartzCore \
+//   -framework Foundation -framework CoreGraphics \
+//   -Wl,-undefined,dynamic_lookup \
 //   -o CheatMenu.dylib src/CheatMenu.mm
 
 #import <UIKit/UIKit.h>
@@ -17,9 +20,9 @@
 // ═══════════════════════════════════════════════════════════════
 static void _write_jump(void *at, void *to) {
     uint32_t *w = (uint32_t *)at;
-    w[0] = 0x58000051U;                     // LDR X17, #8
-    w[1] = 0xD61F0220U;                     // BR  X17
-    ((uint64_t *)at)[1] = (uint64_t)to;     // absolute target
+    w[0] = 0x58000051U;
+    w[1] = 0xD61F0220U;
+    ((uint64_t *)at)[1] = (uint64_t)to;
     __builtin___clear_cache((char*)at, (char*)at + 16);
 }
 
@@ -34,19 +37,14 @@ static void *_exec_alloc(size_t size) {
 }
 
 static void _hook(void *target, void *hook, void **orig) {
-    // trampoline: [0..15] = original first 16 bytes, [16..31] = jump back
     uint8_t *tramp = (uint8_t *)_exec_alloc(32);
     if (!tramp) return;
-
     memcpy(tramp, target, 16);
     _write_jump(tramp + 16, (uint8_t *)target + 16);
     if (orig) *orig = tramp;
-
-    // unprotect target page
     vm_address_t page = (vm_address_t)target & ~(vm_page_size - 1);
     vm_protect(mach_task_self(), page, vm_page_size, NO,
                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
-
     _write_jump(target, hook);
 }
 
@@ -61,9 +59,51 @@ static BOOL  gSpd    = NO;
 static float gSpdMul = 2.0f;
 static BOOL  gAmmo   = NO;
 static BOOL  gRecoil = NO;
+static BOOL  gPaused = NO;   // freezes all cheat logic; hooks still fire
 
-static void *gPMI = NULL;   // PlayerMovement instance
-static void *gWHI = NULL;   // WireframeWallhack instance
+static void *gPMI = NULL;
+static void *gWHI = NULL;
+
+// ═══════════════════════════════════════════════════════════════
+//  CONFIG  —  <game_documents>/CheatMenu.json
+//  format: { wallhack, noclip, speed, speed_mul, ammo, recoil }
+// ═══════════════════════════════════════════════════════════════
+static NSString *_cfgPath(void) {
+    NSArray *d = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    return [d[0] stringByAppendingPathComponent:@"CheatMenu.json"];
+}
+
+static void SaveCfg(void) {
+    NSDictionary *d = @{
+        @"wallhack"  : @(gWH),
+        @"noclip"    : @(gNC),
+        @"speed"     : @(gSpd),
+        @"speed_mul" : @(gSpdMul),
+        @"ammo"      : @(gAmmo),
+        @"recoil"    : @(gRecoil),
+    };
+    NSData *j = [NSJSONSerialization dataWithJSONObject:d
+                                               options:NSJSONWritingPrettyPrinted
+                                                 error:nil];
+    [j writeToFile:_cfgPath() atomically:YES];
+}
+
+static BOOL LoadCfg(void) {
+    NSData *j = [NSData dataWithContentsOfFile:_cfgPath()];
+    if (!j) return NO;
+    NSDictionary *d = [NSJSONSerialization JSONObjectWithData:j
+                                                      options:0
+                                                        error:nil];
+    if (!d) return NO;
+    gWH     = [d[@"wallhack"]  boolValue];
+    gNC     = [d[@"noclip"]    boolValue];
+    gSpd    = [d[@"speed"]     boolValue];
+    gSpdMul = [d[@"speed_mul"] floatValue] ?: 2.0f;
+    gAmmo   = [d[@"ammo"]      boolValue];
+    gRecoil = [d[@"recoil"]    boolValue];
+    return YES;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  BASE
@@ -121,21 +161,23 @@ static void (*fnDisableNC)(void *)      = NULL;  // 0x14839E0
 static void (*_o_AC_Awake) (void *) = NULL;
 static void  _h_AC_Awake  (void *s) {
     _o_AC_Awake(s);
-    if (fnSetIsGod) fnSetIsGod(s, 1);          // game's own god flag
+    if (fnSetIsGod) fnSetIsGod(s, 1);
 }
 
 static void (*_o_AC_Update)(void *) = NULL;
 static void  _h_AC_Update (void *s) {
-    if (gRecoil) {
-        WF(s, AC_RMUL, 0.f); WF(s, AC_AMUL, 0.001f);
-        WF(s, AC_CRV,  0.f); WF(s, AC_CRH,  0.f);
-        WF(s, AC_CVV,  0.f); WF(s, AC_CVH,  0.f);
-        WF(s, AC_KV,   0.f); WF(s, AC_KH,   0.f);
-    }
-    if (gAmmo) {
-        WU8(s,  AC_INF,  1);
-        WI16(s, AC_MCAP, 999);
-        WI16(s, AC_CAP,  999);
+    if (!gPaused) {
+        if (gRecoil) {
+            WF(s, AC_RMUL, 0.f); WF(s, AC_AMUL, 0.001f);
+            WF(s, AC_CRV,  0.f); WF(s, AC_CRH,  0.f);
+            WF(s, AC_CVV,  0.f); WF(s, AC_CVH,  0.f);
+            WF(s, AC_KV,   0.f); WF(s, AC_KH,   0.f);
+        }
+        if (gAmmo) {
+            WU8(s,  AC_INF,  1);
+            WI16(s, AC_MCAP, 999);
+            WI16(s, AC_CAP,  999);
+        }
     }
     _o_AC_Update(s);
 }
@@ -143,25 +185,25 @@ static void  _h_AC_Update (void *s) {
 static void (*_o_PM_Update)(void *) = NULL;
 static void  _h_PM_Update (void *s) {
     gPMI = s;
-    if (gNC) { WU8(s, PM_NCE, 1); WF(s, PM_NCS, 22.f); }
+    if (!gPaused && gNC) { WU8(s, PM_NCE, 1); WF(s, PM_NCS, 22.f); }
     _o_PM_Update(s);
 }
 
 static float (*_o_MaxSpd)(void *) = NULL;
 static float  _h_MaxSpd (void *s) {
     float v = _o_MaxSpd(s);
-    return gSpd ? v * gSpdMul : v;
+    return (!gPaused && gSpd) ? v * gSpdMul : v;
 }
 
 static void (*_o_WH_Set)(void *, int) = NULL;
 static void  _h_WH_Set (void *s, int v) {
     gWHI = s;
-    _o_WH_Set(s, gWH ? 1 : v);
+    _o_WH_Set(s, (!gPaused && gWH) ? 1 : v);
 }
 
 static void (*_o_WH_Ref)(void *) = NULL;
 static void  _h_WH_Ref (void *s) {
-    if (!gWHI) { gWHI = s; if (gWH && _o_WH_Set) _o_WH_Set(s, 1); }
+    if (!gWHI) { gWHI = s; if (!gPaused && gWH && _o_WH_Set) _o_WH_Set(s, 1); }
     _o_WH_Ref(s);
 }
 
@@ -214,8 +256,8 @@ static UIColor *C(int r, int g, int b, CGFloat a) {
 typedef void(^ToggleCB)(BOOL);
 
 @interface SCRow : UIControl
-@property (nonatomic) BOOL      isOn;
-@property (copy)      ToggleCB  onChange;
+@property (nonatomic) BOOL     isOn;
+@property (copy)      ToggleCB onChange;
 - (instancetype)initWithTitle:(NSString *)t;
 @end
 
@@ -291,10 +333,12 @@ typedef void(^ToggleCB)(BOOL);
 // ═══════════════════════════════════════════════════════════════
 //  SPEED STEPPER ROW
 // ═══════════════════════════════════════════════════════════════
-@interface SCSpeedCtrl : UIView @end
-@implementation SCSpeedCtrl {
-    UILabel *_val;
-}
+@interface SCSpeedCtrl : UIView
+- (void)syncFromGlobal;
+@end
+
+@implementation SCSpeedCtrl { UILabel *_val; }
+
 - (instancetype)init {
     self = [super initWithFrame:CGRectMake(0,0,216,30)];
     self.backgroundColor = [UIColor clearColor];
@@ -313,9 +357,10 @@ typedef void(^ToggleCB)(BOOL);
 
     [self addSubview:[self _btn:@"−" x:152 sel:@selector(_dec)]];
     [self addSubview:[self _btn:@"+" x:180 sel:@selector(_inc)]];
-    [self _refresh];
+    [self _sync];
     return self;
 }
+
 - (UIButton *)_btn:(NSString *)t x:(CGFloat)x sel:(SEL)s {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = CGRectMake(x,5,22,20);
@@ -328,31 +373,86 @@ typedef void(^ToggleCB)(BOOL);
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
-- (void)_dec { gSpdMul = MAX(1.1f, gSpdMul - 0.5f); [self _refresh]; }
-- (void)_inc { gSpdMul = MIN(10.f, gSpdMul + 0.5f); [self _refresh]; }
-- (void)_refresh { _val.text = [NSString stringWithFormat:@"%.1fx", gSpdMul]; }
+
+- (void)_dec { gSpdMul = MAX(1.1f, gSpdMul - 0.5f); [self _sync]; }
+- (void)_inc { gSpdMul = MIN(10.f, gSpdMul + 0.5f); [self _sync]; }
+- (void)_sync { _val.text = [NSString stringWithFormat:@"%.1fx", gSpdMul]; }
+- (void)syncFromGlobal { [self _sync]; }
+@end
+
+// ═══════════════════════════════════════════════════════════════
+//  CFG CONTROLS
+// ═══════════════════════════════════════════════════════════════
+@protocol SCCfgDelegate <NSObject>
+- (void)cfgDidLoad;
+@end
+
+@interface SCCfgCtrl : UIView
+@property (nonatomic, weak) id<SCCfgDelegate> delegate;
+@end
+
+@implementation SCCfgCtrl
+
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(0,0,216,30)];
+    self.backgroundColor = [UIColor clearColor];
+
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(14,0,50,30)];
+    lbl.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    lbl.textColor = C(75,75,90,1);
+    lbl.text = @"CONFIG";
+    [self addSubview:lbl];
+
+    [self addSubview:[self _btn:@"LOAD" x:86  bg:C(25,55,100,1) sel:@selector(_load)]];
+    [self addSubview:[self _btn:@"SAVE" x:150 bg:C(20,80,45,1)  sel:@selector(_save)]];
+    return self;
+}
+
+- (UIButton *)_btn:(NSString *)t x:(CGFloat)x bg:(UIColor *)bg sel:(SEL)s {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(x,5,56,20);
+    b.backgroundColor = bg;
+    b.layer.cornerRadius = 4;
+    [b setTitle:t forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:8 weight:UIFontWeightBold];
+    [b setTitleColor:C(170,205,255,1) forState:UIControlStateNormal];
+    [b setTitleColor:C(255,255,255,1) forState:UIControlStateHighlighted];
+    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)_load {
+    if (LoadCfg() && _delegate) [_delegate cfgDidLoad];
+}
+- (void)_save { SaveCfg(); }
 @end
 
 // ═══════════════════════════════════════════════════════════════
 //  MENU VIEW
+//  layout (H=403):
+//    hdr(40) + pad(14) + sec(18) +
+//    WH(44) + NC(44) + Spd(42) + SpdCtrl(40) + Ammo(44) + Recoil(46) +
+//    div(9) + sec(18) + CfgCtrl(30) + bot(14)
 // ═══════════════════════════════════════════════════════════════
 static const CGFloat MW = 240.f;
 
-@interface SCMenu : UIView
+@interface SCMenu : UIView <SCCfgDelegate>
 @property (copy) dispatch_block_t onClose;
 @end
 
 @implementation SCMenu {
-    CGPoint _drag;
+    CGPoint      _drag;
+    UIButton    *_pauseBtn;
+    SCRow       *_rWH;
+    SCRow       *_rNC;
+    SCRow       *_rSpd;
+    SCRow       *_rAmmo;
+    SCRow       *_rRec;
+    SCSpeedCtrl *_spdCtrl;
 }
 
 - (instancetype)init {
-    // layout calculation
-    // hdr=40, top_pad=14, section_label=12, sec_gap=6
-    // 5 rows × (36+8) = 220, minus last gap = 212
-    // spd_ctrl=30, spd_gap=10, bot_pad=14
-    // total ≈ 40+14+12+6+212+30+10+14 = 338
-    const CGFloat H = 338.f;
+    const CGFloat H = 403.f;
     CGSize sc = [UIScreen mainScreen].bounds.size;
     self = [super initWithFrame:CGRectMake((sc.width  - MW) * .5f,
                                            (sc.height - H)  * .5f,
@@ -370,19 +470,30 @@ static const CGFloat MW = 240.f;
     sep.backgroundColor = C(35,75,190,0.5f);
     [self addSubview:sep];
 
-    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(12,0,MW-44,40)];
+    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(12,0,MW-72,40)];
     ttl.text = @"✦  CHEAT MENU";
     ttl.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
     ttl.textColor = C(180,185,205,1);
     [hdr addSubview:ttl];
 
+    // ⏸ / ▶  pause button
+    _pauseBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    _pauseBtn.frame = CGRectMake(MW-58, 9, 22, 22);
+    _pauseBtn.layer.cornerRadius = 11;
+    _pauseBtn.titleLabel.font = [UIFont systemFontOfSize:9 weight:UIFontWeightBold];
+    [_pauseBtn addTarget:self action:@selector(_doPause)
+       forControlEvents:UIControlEventTouchUpInside];
+    [hdr addSubview:_pauseBtn];
+    [self _refreshPause];
+
+    // ✕ close
     UIButton *cls = [UIButton buttonWithType:UIButtonTypeCustom];
-    cls.frame = CGRectMake(MW-30,9,22,22);
+    cls.frame = CGRectMake(MW-30, 9, 22, 22);
     cls.backgroundColor = C(50,18,18,1);
     cls.layer.cornerRadius = 11;
     [cls setTitle:@"✕" forState:UIControlStateNormal];
     cls.titleLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
-    [cls setTitleColor:C(200,75,75,1) forState:UIControlStateNormal];
+    [cls setTitleColor:C(200,75,75,1)   forState:UIControlStateNormal];
     [cls setTitleColor:C(255,110,110,1) forState:UIControlStateHighlighted];
     [cls addTarget:self action:@selector(_doClose)
   forControlEvents:UIControlEventTouchUpInside];
@@ -391,45 +502,57 @@ static const CGFloat MW = 240.f;
     [hdr addGestureRecognizer:
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)]];
 
-    // ── section label ────────────────────────────────────────────
+    // ── FEATURES ─────────────────────────────────────────────────
     CGFloat y = 40 + 14;
-    UILabel *sec = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 100, 12)];
-    sec.font = [UIFont systemFontOfSize:8 weight:UIFontWeightBold];
-    sec.textColor = C(40,75,185,1);
-    sec.text = @"FEATURES";
-    [self addSubview:sec];
-    y += 12 + 6;
+    [self addSubview:[self _secLabel:@"FEATURES" y:y]]; y += 12 + 6;
 
-    // ── toggle rows ──────────────────────────────────────────────
-    SCRow *rWH   = [self _row:@"Wallhack"      y:y]; y += 36 + 8;
-    SCRow *rNC   = [self _row:@"Noclip"        y:y]; y += 36 + 8;
-    SCRow *rSpd  = [self _row:@"Speed Hack"    y:y]; y += 36 + 6;
+    _rWH   = [self _row:@"Wallhack"      y:y]; y += 36 + 8;
+    _rNC   = [self _row:@"Noclip"        y:y]; y += 36 + 8;
+    _rSpd  = [self _row:@"Speed Hack"    y:y]; y += 36 + 6;
 
-    SCSpeedCtrl *sc2 = [SCSpeedCtrl new];
-    sc2.frame = CGRectMake(12, y, 216, 30);
-    [self addSubview:sc2];
+    _spdCtrl = [SCSpeedCtrl new];
+    _spdCtrl.frame = CGRectMake(12, y, 216, 30);
+    [self addSubview:_spdCtrl];
     y += 30 + 10;
 
-    SCRow *rAmmo = [self _row:@"Infinite Ammo" y:y]; y += 36 + 8;
-    SCRow *rRec  = [self _row:@"No Recoil"     y:y];
+    _rAmmo = [self _row:@"Infinite Ammo" y:y]; y += 36 + 8;
+    _rRec  = [self _row:@"No Recoil"     y:y]; y += 36 + 10;
 
-    // ── callbacks ────────────────────────────────────────────────
-    rWH.onChange = ^(BOOL on) {
+    // ── divider ───────────────────────────────────────────────────
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(12, y, MW-24, 1)];
+    div.backgroundColor = C(28,28,42,1);
+    [self addSubview:div]; y += 1 + 8;
+
+    // ── CONFIG ────────────────────────────────────────────────────
+    [self addSubview:[self _secLabel:@"CONFIG" y:y]]; y += 12 + 6;
+
+    SCCfgCtrl *cfg = [SCCfgCtrl new];
+    cfg.frame = CGRectMake(12, y, 216, 30);
+    cfg.delegate = self;
+    [self addSubview:cfg];
+
+    // ── callbacks ─────────────────────────────────────────────────
+    _rWH.onChange = ^(BOOL on) {
         gWH = on;
         if (gWHI && _o_WH_Set) _o_WH_Set(gWHI, on ? 1 : 0);
+        SaveCfg();
     };
-    rNC.onChange = ^(BOOL on) {
+    _rNC.onChange = ^(BOOL on) {
         gNC = on;
         if (gPMI) {
             if (on  && fnEnableNC)  fnEnableNC(gPMI);
             if (!on && fnDisableNC) fnDisableNC(gPMI);
         }
+        SaveCfg();
     };
-    rSpd.onChange  = ^(BOOL on) { gSpd    = on; };
-    rAmmo.onChange = ^(BOOL on) { gAmmo   = on; };
-    rRec.onChange  = ^(BOOL on) { gRecoil = on; };
+    _rSpd.onChange  = ^(BOOL on) { gSpd    = on; SaveCfg(); };
+    _rAmmo.onChange = ^(BOOL on) { gAmmo   = on; SaveCfg(); };
+    _rRec.onChange  = ^(BOOL on) { gRecoil = on; SaveCfg(); };
 
-    // outer rim
+    // sync UI → loaded globals
+    [self cfgDidLoad];
+
+    // rim
     CALayer *rim = [CALayer layer];
     rim.frame = CGRectMake(0,0,MW,H);
     rim.borderColor = C(30,30,42,0.9f).CGColor;
@@ -440,6 +563,15 @@ static const CGFloat MW = 240.f;
     return self;
 }
 
+// ── factory helpers ──────────────────────────────────────────────
+- (UILabel *)_secLabel:(NSString *)t y:(CGFloat)y {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 100, 12)];
+    l.font = [UIFont systemFontOfSize:8 weight:UIFontWeightBold];
+    l.textColor = C(40,75,185,1);
+    l.text = t;
+    return l;
+}
+
 - (SCRow *)_row:(NSString *)t y:(CGFloat)y {
     SCRow *r = [[SCRow alloc] initWithTitle:t];
     r.frame = CGRectMake(12, y, 216, 36);
@@ -447,6 +579,31 @@ static const CGFloat MW = 240.f;
     return r;
 }
 
+// ── pause ────────────────────────────────────────────────────────
+- (void)_doPause {
+    gPaused = !gPaused;
+    [self _refreshPause];
+}
+
+- (void)_refreshPause {
+    _pauseBtn.backgroundColor = gPaused ? C(90,50,8,1)  : C(12,45,22,1);
+    [_pauseBtn setTitle:     gPaused ? @"▶" : @"⏸"
+                           forState:UIControlStateNormal];
+    [_pauseBtn setTitleColor:gPaused ? C(255,155,35,1) : C(65,190,65,1)
+                           forState:UIControlStateNormal];
+}
+
+// ── SCCfgDelegate ────────────────────────────────────────────────
+- (void)cfgDidLoad {
+    _rWH.isOn   = gWH;
+    _rNC.isOn   = gNC;
+    _rSpd.isOn  = gSpd;
+    _rAmmo.isOn = gAmmo;
+    _rRec.isOn  = gRecoil;
+    [_spdCtrl syncFromGlobal];
+}
+
+// ── drag ─────────────────────────────────────────────────────────
 - (void)_pan:(UIPanGestureRecognizer *)g {
     CGPoint loc = [g locationInView:self.superview];
     if (g.state == UIGestureRecognizerStateBegan)
@@ -458,6 +615,7 @@ static const CGFloat MW = 240.f;
         self.frame = f;
     }
 }
+
 - (void)_doClose { if (_onClose) _onClose(); }
 @end
 
@@ -598,6 +756,7 @@ static const CGFloat MW = 240.f;
 // ═══════════════════════════════════════════════════════════════
 __attribute__((constructor))
 static void CheatInit(void) {
+    LoadCfg();   // restore last session before hooks fire
     InstallHooks();
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
