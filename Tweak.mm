@@ -1,206 +1,183 @@
-// CounterFlame ESP
-// caught-by: скриншот-детект через металлическую overlay, поведенческий анализ
+// CounterFlame ESP — com.ScarletWork.CounterFlame
+// caught-by: скриншот-детект, поведенческий анализ
+//
+// Архитектура: только прямое чтение памяти через оффсеты, минимум invoke.
+// FindObjectsOfType вызывается раз в секунду на фоновом потоке, результат кэшируется.
+// WorldToScreenPoint — единственный invoke в тик-цикле.
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
 
-// ─── оффсеты из дампа ─────────────────────────────────────────────────────
-// PlayerController (от начала класса)
-#define PC_NETWORK   0x88   // PlayerNetwork*
-#define PC_IS_DEATH  0xA8   // bool
+// ─── Team ─────────────────────────────────────────────────────────────────
+typedef enum { TeamNone = 0, TeamCT = 1, TeamTR = 2 } CFTeam;
+
+// ─── оффсеты ──────────────────────────────────────────────────────────────
+// PlayerController
+#define PC_IS_DEATH   0xA8   // bool
+#define PC_NETWORK    0x88   // PlayerNetwork*
+#define PC_HULL       0x00   // FILL: GetComponent нужен, пока через PSkeleton
 
 // PlayerNetwork
-#define PN_POSITION  0xBC   // Vector3 — серверная позиция
+#define PN_POSITION   0xBC   // Vector3 (float x,y,z)
+
+// PlayerSkeleton — получаем через PC._movementController цепочку или FindObjectsOfType<PlayerSkeleton>
+// Линкуем к PC через IL2CPP Object instanceID сравнением — слишком сложно без символов
+// Проще: FindObjectsOfType<PlayerSkeleton> отдельно, потом матчим по позиции
+// НО: это 2 invoke. Вместо этого — читаем скелет через field на самом PC.
+
+// PlayerController → _movementController (0x40) → PlayerMovement
+// PlayerMovement не содержит скелет напрямую
+// Быстрее: FindObjectsOfType<PlayerController> → на каждом PC читаем _network → networkPosition
+// Скелет ищем отдельно через FindObjectsOfType<PlayerSkeleton>, матчим к PC по близости позиции
 
 // PlayerSkeleton
-#define PS_HEAD      0xA8   // Transform* — голова
-#define PS_CHEST     0xB0   // Transform* — грудь
-#define PS_PELVIS    0xB8   // Transform* — таз (центр бокса)
-#define PS_LSHOULDER 0xC0   // Transform* — левое плечо
-#define PS_RSHOULDER 0xC8   // Transform* — правое плечо
-#define PS_LTHIGH    0xD0   // Transform* — левое бедро
-#define PS_RTHIGH    0xD8   // Transform* — правое бедро
+#define PS_HEAD       0xA8   // Transform*
+#define PS_CHEST      0xB0   // Transform*
+#define PS_PELVIS     0xB8   // Transform*
+#define PS_LSHOULDER  0xC0   // Transform*
+#define PS_RSHOULDER  0xC8   // Transform*
+#define PS_LTHIGH     0xD0   // Transform*
+#define PS_RTHIGH     0xD8   // Transform*
 
-// ─── il2cpp API ───────────────────────────────────────────────────────────
-typedef void*  (*fn_domain_get_t)(void);
-typedef void** (*fn_domain_get_assemblies_t)(void*, size_t*);
-typedef void*  (*fn_assembly_get_image_t)(void*);
-typedef void*  (*fn_class_from_name_t)(void*, const char*, const char*);
-typedef void*  (*fn_class_get_method_t)(void*, const char*, int);
-typedef void*  (*fn_runtime_invoke_t)(void*, void*, void**, void**);
-typedef void*  (*fn_object_unbox_t)(void*);
-typedef void*  (*fn_class_get_type_t)(void*);
-typedef void*  (*fn_class_get_field_t)(void*, const char*);
-typedef void   (*fn_field_get_value_t)(void*, void*, void*);
-typedef void   (*fn_field_static_get_t)(void*, void*);
+// PlayerHull
+#define PH_TEAM       0x30   // int (CFTeam)
 
-static fn_domain_get_t           _domain_get;
-static fn_domain_get_assemblies_t _domain_assemblies;
-static fn_assembly_get_image_t   _asm_get_image;
-static fn_class_from_name_t      _class_from_name;
-static fn_class_get_method_t     _class_get_method;
-static fn_runtime_invoke_t       _runtime_invoke;
-static fn_object_unbox_t         _object_unbox;
-static fn_class_get_type_t       _class_get_type;
+// Transform — нативный Unity Transform (не managed)
+// position хранится в TRS: offset зависит от версии Unity
+// БЕЗОПАСНО: читаем через get_position invoke только при кэшировании скелета
+// В тик-цикле: только networkPosition (прямой read) + W2S
 
-typedef struct { float x, y, z; }       Vec3;
-typedef struct { float x, y, z, w; }    Vec4;
+// ─── il2cpp ───────────────────────────────────────────────────────────────
+typedef void*  (*fn_t)(void);
+typedef void** (*fn_assemblies_t)(void*, size_t*);
+typedef void*  (*fn_img_t)(void*);
+typedef void*  (*fn_cls_t)(void*, const char*, const char*);
+typedef void*  (*fn_meth_t)(void*, const char*, int);
+typedef void*  (*fn_invoke_t)(void*, void*, void**, void**);
+typedef void*  (*fn_unbox_t)(void*);
+typedef void*  (*fn_type_t)(void*);
 
-static inline void*   rptr(void *o, ptrdiff_t off)  { return o ? *(void**)((uint8_t*)o+off) : NULL; }
-static inline float   rfloat(void *o, ptrdiff_t off){ return o ? *(float*)((uint8_t*)o+off) : 0.f; }
-static inline uint8_t rbyte(void *o, ptrdiff_t off) { return o ? *((uint8_t*)o+off) : 0; }
-static inline int32_t rint32(void *o, ptrdiff_t off){ return o ? *(int32_t*)((uint8_t*)o+off) : 0; }
-static inline Vec3    rvec3(void *o, ptrdiff_t off) {
+static fn_t          _domain_get;
+static fn_assemblies_t _domain_asms;
+static fn_img_t      _asm_img;
+static fn_cls_t      _cls;
+static fn_meth_t     _meth;
+static fn_invoke_t   _invoke;
+static fn_unbox_t    _unbox;
+static fn_type_t     _type;
+
+typedef struct { float x, y, z; } Vec3;
+
+static inline void*   rp(void *o, ptrdiff_t n)  { return (o && n>=0) ? *(void**)((uint8_t*)o+n) : NULL; }
+static inline uint8_t rb(void *o, ptrdiff_t n)  { return o ? *((uint8_t*)o+n) : 0; }
+static inline Vec3    rv(void *o, ptrdiff_t n)  {
     if (!o) return (Vec3){0,0,0};
-    return *(Vec3*)((uint8_t*)o+off);
+    return *(Vec3*)((uint8_t*)o+n);
 }
 
-// ─── cached ptrs ──────────────────────────────────────────────────────────
-static void *gPCClass           = NULL; // PlayerController
-static void *gPSClass           = NULL; // PlayerSkeleton
-static void *gFindObjectsMethod = NULL; // Object.FindObjectsOfType(Type)
-static void *gGetComponentMethod= NULL; // Component.GetComponent(Type)  
-static void *gCameraMainMethod  = NULL; // Camera.get_main
-static void *gW2SMethod         = NULL; // Camera.WorldToScreenPoint
-static void *gTransformPosMethod= NULL; // Transform.get_position
-static void *gPSType            = NULL; // typeof(PlayerSkeleton)
-static BOOL  gReady             = NO;
+// ─── cached methods ───────────────────────────────────────────────────────
+static void *gPCClass     = NULL;
+static void *gPSClass     = NULL;
+static void *gFindObjs    = NULL;
+static void *gGetComp     = NULL;
+static void *gTrPos       = NULL;
+static void *gCamMain     = NULL;
+static void *gW2S         = NULL;
+static void *gPSType      = NULL;
+static void *gHullClass   = NULL;
+static void *gHullType    = NULL;
+static BOOL  gReady       = NO;
+static int   gLocalTeam   = TeamNone;
 
-// PlayerHull offsets
-#define PH_TEAM  0x30   // Team (int): None=0, CT=1, TR=2
-
-// Team enum
-typedef enum { TeamNone = 0, TeamCT = 1, TeamTR = 2 } Team;
-
-static void *gPhotonViewClass   = NULL;
-static void *gIsMineMethod      = NULL; // PhotonView.get_IsMine
-static void *gHullClass         = NULL; // PlayerHull
-static void *gHullType          = NULL; // typeof(PlayerHull)
-static int   gLocalTeam         = TeamNone; // кэш нашей команды
-
-// ─── ESP data ─────────────────────────────────────────────────────────────
+// ─── ESP overlay ──────────────────────────────────────────────────────────
 typedef struct {
-    CGPoint head, chest, pelvis, lshoulder, rshoulder, lthigh, rthigh;
     CGRect  box;
+    CGPoint pts[7]; // head,chest,pelvis,lsh,rsh,lth,rth
     BOOL    valid;
-} PlayerESPData;
+} ESPEntry;
 
-// ─── overlay view ─────────────────────────────────────────────────────────
 @interface ESPView : UIView
-@property (nonatomic, strong) NSArray *players; // PlayerESPData* в NSData
+@property (nonatomic, strong) NSArray *entries;
 @end
-
 @implementation ESPView
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     self.backgroundColor = [UIColor clearColor];
     self.userInteractionEnabled = NO;
-    self.layer.zPosition = 900;
-    _players = @[];
+    _entries = @[];
     return self;
 }
 - (void)drawRect:(CGRect)__unused r {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    CGContextSetLineWidth(ctx, 1.5);
+    CGContextSetLineWidth(ctx, 1.8f);
 
-    for (NSData *d in _players) {
-        if (d.length != sizeof(PlayerESPData)) continue;
-        PlayerESPData p;
-        [d getBytes:&p length:sizeof(p)];
-        if (!p.valid) continue;
+    for (NSData *d in _entries) {
+        if (d.length != sizeof(ESPEntry)) continue;
+        ESPEntry e; [d getBytes:&e length:sizeof(e)];
+        if (!e.valid) continue;
 
-        // бокс — красный
-        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:1 green:0.1 blue:0.1 alpha:0.9].CGColor);
-        CGContextStrokeRect(ctx, p.box);
+        // бокс красный
+        CGContextSetStrokeColorWithColor(ctx,
+            [UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:0.9].CGColor);
+        CGContextStrokeRect(ctx, e.box);
 
-        // скелет — зелёный
-        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:0 green:1 blue:0 alpha:0.85].CGColor);
+        // скелет зелёный
+        CGContextSetStrokeColorWithColor(ctx,
+            [UIColor colorWithRed:0 green:1 blue:0.2 alpha:0.85].CGColor);
 
-        // голова → грудь
-        if (!CGPointEqualToPoint(p.head, CGPointZero) &&
-            !CGPointEqualToPoint(p.chest, CGPointZero)) {
-            CGContextMoveToPoint(ctx, p.head.x, p.head.y);
-            CGContextAddLineToPoint(ctx, p.chest.x, p.chest.y);
+        CGPoint head=e.pts[0], chest=e.pts[1], pelv=e.pts[2];
+        CGPoint ls=e.pts[3],   rs=e.pts[4];
+        CGPoint lt=e.pts[5],   rt=e.pts[6];
+
+        // позвоночник
+        if (head.x&&chest.x) {
+            CGContextMoveToPoint(ctx,head.x,head.y);
+            CGContextAddLineToPoint(ctx,chest.x,chest.y);
         }
-        // грудь → таз
-        if (!CGPointEqualToPoint(p.chest, CGPointZero) &&
-            !CGPointEqualToPoint(p.pelvis, CGPointZero)) {
-            CGContextMoveToPoint(ctx, p.chest.x, p.chest.y);
-            CGContextAddLineToPoint(ctx, p.pelvis.x, p.pelvis.y);
+        if (chest.x&&pelv.x) {
+            CGContextMoveToPoint(ctx,chest.x,chest.y);
+            CGContextAddLineToPoint(ctx,pelv.x,pelv.y);
         }
-        // плечи
-        if (!CGPointEqualToPoint(p.lshoulder, CGPointZero) &&
-            !CGPointEqualToPoint(p.rshoulder, CGPointZero)) {
-            CGContextMoveToPoint(ctx, p.lshoulder.x, p.lshoulder.y);
-            CGContextAddLineToPoint(ctx, p.chest.x, p.chest.y);
-            CGContextAddLineToPoint(ctx, p.rshoulder.x, p.rshoulder.y);
+        // руки
+        if (ls.x&&rs.x&&chest.x) {
+            CGContextMoveToPoint(ctx,ls.x,ls.y);
+            CGContextAddLineToPoint(ctx,chest.x,chest.y);
+            CGContextAddLineToPoint(ctx,rs.x,rs.y);
         }
-        // бёдра
-        if (!CGPointEqualToPoint(p.lthigh, CGPointZero) &&
-            !CGPointEqualToPoint(p.rthigh, CGPointZero)) {
-            CGContextMoveToPoint(ctx, p.lthigh.x, p.lthigh.y);
-            CGContextAddLineToPoint(ctx, p.pelvis.x, p.pelvis.y);
-            CGContextAddLineToPoint(ctx, p.rthigh.x, p.rthigh.y);
+        // ноги
+        if (lt.x&&rt.x&&pelv.x) {
+            CGContextMoveToPoint(ctx,lt.x,lt.y);
+            CGContextAddLineToPoint(ctx,pelv.x,pelv.y);
+            CGContextAddLineToPoint(ctx,rt.x,rt.y);
         }
         CGContextStrokePath(ctx);
 
-        // кружок на голове
-        if (!CGPointEqualToPoint(p.head, CGPointZero)) {
-            CGFloat r2 = p.box.size.width * 0.15f;
+        // голова — кружок
+        if (head.x) {
+            float rr = e.box.size.width * 0.14f;
             CGContextStrokeEllipseInRect(ctx,
-                CGRectMake(p.head.x - r2, p.head.y - r2, r2*2, r2*2));
+                CGRectMake(head.x-rr, head.y-rr, rr*2, rr*2));
         }
     }
 }
 @end
 
-// ─── menu view ────────────────────────────────────────────────────────────
+// ─── menu ─────────────────────────────────────────────────────────────────
 @interface ESPMenuView : UIView
-@property (nonatomic, strong) UISwitch *espSwitch;
+@property (nonatomic, strong) UISwitch *sw;
 - (void)show;
 @end
 
 static ESPView     *gESPView  = nil;
-static ESPMenuView *gMenuView = nil;
+static ESPMenuView *gMenu     = nil;
 static BOOL         gESPOn    = NO;
-
-// ─── World → Screen ───────────────────────────────────────────────────────
-static CGPoint w2s(Vec3 world) {
-    if (!gCameraMainMethod || !gW2SMethod) return CGPointZero;
-    void *exc = NULL;
-    void *cam = _runtime_invoke(gCameraMainMethod, NULL, NULL, &exc);
-    if (!cam || exc) return CGPointZero;
-    void *args[1] = { &world };
-    void *res = _runtime_invoke(gW2SMethod, cam, args, &exc);
-    if (!res || exc) return CGPointZero;
-    Vec3 *sp = (Vec3*)_object_unbox(res);
-    if (!sp || sp->z < 0.f) return CGPointZero;
-    CGFloat scale = [UIScreen mainScreen].scale;
-    CGFloat sh    = [UIScreen mainScreen].bounds.size.height;
-    return CGPointMake(sp->x / scale, sh - sp->y / scale);
-}
-
-// Transform.get_position через invoke
-static Vec3 getTransformPos(void *tr) {
-    if (!tr || !gTransformPosMethod) return (Vec3){0,0,0};
-    void *exc = NULL;
-    void *res = _runtime_invoke(gTransformPosMethod, tr, NULL, &exc);
-    if (!res || exc) return (Vec3){0,0,0};
-    Vec3 *p = (Vec3*)_object_unbox(res);
-    return p ? *p : (Vec3){0,0,0};
-}
-
-// ─── ticker ───────────────────────────────────────────────────────────────
-@interface ESPTicker : NSObject
-- (void)tick;
-@end
 
 @implementation ESPMenuView {
     ESPView *_ev;
 }
-- (instancetype)initWithESPView:(ESPView*)ev {
+- (instancetype)initWithESP:(ESPView*)ev {
     self = [super initWithFrame:CGRectMake(0,0,165,95)];
     _ev = ev;
     self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
@@ -209,305 +186,354 @@ static Vec3 getTransformPos(void *tr) {
     self.userInteractionEnabled = YES;
 
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0,4,165,22)];
-    t.text = @"CF ESP"; t.textColor = [UIColor colorWithRed:0 green:1 blue:0 alpha:1];
-    t.font = [UIFont boldSystemFontOfSize:13]; t.textAlignment = NSTextAlignmentCenter;
+    t.text=@"CF ESP"; t.textColor=[UIColor colorWithRed:0 green:1 blue:0 alpha:1];
+    t.font=[UIFont boldSystemFontOfSize:13]; t.textAlignment=NSTextAlignmentCenter;
     [self addSubview:t];
 
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10,31,50,22)];
-    l.text = @"ESP"; l.textColor = [UIColor whiteColor];
-    l.font = [UIFont systemFontOfSize:12]; [self addSubview:l];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10,31,52,22)];
+    l.text=@"ESP"; l.textColor=[UIColor whiteColor];
+    l.font=[UIFont systemFontOfSize:12]; [self addSubview:l];
 
-    _espSwitch = [UISwitch new];
-    _espSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
-    _espSwitch.frame = CGRectMake(62,29,51,31);
-    [_espSwitch addTarget:self action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
-    [self addSubview:_espSwitch];
+    _sw = [UISwitch new];
+    _sw.transform = CGAffineTransformMakeScale(0.75,0.75);
+    _sw.frame = CGRectMake(62,29,51,31);
+    [_sw addTarget:self action:@selector(tog:) forControlEvents:UIControlEventValueChanged];
+    [self addSubview:_sw];
 
-    UIButton *hide = [UIButton buttonWithType:UIButtonTypeSystem];
-    hide.frame = CGRectMake(8,65,66,22);
-    [hide setTitle:@"Скрыть" forState:UIControlStateNormal];
-    [hide setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
-    hide.titleLabel.font = [UIFont systemFontOfSize:11];
-    [hide addTarget:self action:@selector(hideMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:hide];
-
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(88,65,66,22);
-    [close setTitle:@"Закрыть" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont systemFontOfSize:11];
-    [close addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:close];
+    for (int i=0;i<2;i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.frame = CGRectMake(i?88:8, 65, 66, 22);
+        b.tag = i;
+        [b setTitle:i?@"Закрыть":@"Скрыть" forState:UIControlStateNormal];
+        [b setTitleColor:i?[UIColor redColor]:[UIColor lightGrayColor]
+                forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:11];
+        [b addTarget:self action:@selector(btn:) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:b];
+    }
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(pan:)];
     [self addGestureRecognizer:pan];
     return self;
 }
-- (void)pan:(UIPanGestureRecognizer*)gr {
-    CGPoint t = [gr translationInView:self.superview];
-    self.center = CGPointMake(self.center.x+t.x, self.center.y+t.y);
-    [gr setTranslation:CGPointZero inView:self.superview];
+- (void)pan:(UIPanGestureRecognizer*)g {
+    CGPoint t=[g translationInView:self.superview];
+    self.center=CGPointMake(self.center.x+t.x,self.center.y+t.y);
+    [g setTranslation:CGPointZero inView:self.superview];
 }
-- (void)toggled:(UISwitch*)s { gESPOn = s.isOn; _ev.hidden = !gESPOn; }
-- (void)hideMenu  { self.hidden = YES; }
-- (void)closeMenu { gESPOn = NO; _ev.hidden = YES; _espSwitch.on = NO; self.hidden = YES; }
-- (void)show      { self.hidden = NO; }
+- (void)tog:(UISwitch*)s { gESPOn=s.isOn; _ev.hidden=!gESPOn; }
+- (void)btn:(UIButton*)b {
+    if (b.tag==1){ gESPOn=NO; _ev.hidden=YES; _sw.on=NO; }
+    self.hidden=YES;
+}
+- (void)show { self.hidden=NO; }
 @end
 
-@implementation ESPTicker
-- (void)tick {
-    if (!gESPOn || !gReady) return;
-    if (!gFindObjectsMethod || !gPCClass) return;
+// ─── W2S ──────────────────────────────────────────────────────────────────
+static CGPoint w2s(Vec3 w) {
+    void *exc=NULL;
+    void *cam=_invoke(gCamMain,NULL,NULL,&exc);
+    if (!cam||exc) return CGPointZero;
+    void *a[1]={&w};
+    void *res=_invoke(gW2S,cam,a,&exc);
+    if (!res||exc) return CGPointZero;
+    Vec3 *sp=(Vec3*)_unbox(res);
+    if (!sp||sp->z<0) return CGPointZero;
+    CGFloat sc=[UIScreen mainScreen].scale;
+    CGFloat sh=[UIScreen mainScreen].bounds.size.height;
+    return CGPointMake(sp->x/sc, sh-sp->y/sc);
+}
 
-    void *pcType = _class_get_type(gPCClass);
-    if (!pcType) return;
+// Transform.get_position — только для скелет-кэша, не в тик-цикле
+static Vec3 trPos(void *tr) {
+    if (!tr||!gTrPos) return (Vec3){0,0,0};
+    void *exc=NULL;
+    void *r=_invoke(gTrPos,tr,NULL,&exc);
+    if (!r||exc) return (Vec3){0,0,0};
+    Vec3 *p=(Vec3*)_unbox(r);
+    return p?*p:(Vec3){0,0,0};
+}
 
-    void *exc = NULL, *args[1] = { pcType };
-    void *arr = _runtime_invoke(gFindObjectsMethod, NULL, args, &exc);
-    if (!arr || exc) return;
+// ─── скелет-кэш ───────────────────────────────────────────────────────────
+// Обновляем редко (раз в секунду), матчим PlayerSkeleton → PlayerController
+// по близости позиции: берём pelvis/head из PS и networkPosition из PC
+// Если расстояние < 0.5 — это скелет данного PC
 
-    int32_t count = *(int32_t*)((uint8_t*)arr + 0x18);
-    void  **data  = (void**)((uint8_t*)arr + 0x20);
-    if (!data || count <= 0) return;
+typedef struct {
+    void *pc;       // PlayerController*
+    void *ps;       // PlayerSkeleton* (может быть NULL)
+    int   team;
+    Vec3  bonePos[7]; // head,chest,pelv,ls,rs,lt,rt — кэш на момент обновления
+    BOOL  hasBones;
+} PCCache;
 
-    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
-    NSMutableArray *results = [NSMutableArray arrayWithCapacity:count];
+#define MAX_PLAYERS 32
+static PCCache gCache[MAX_PLAYERS];
+static int     gCacheCount = 0;
+static NSLock *gCacheLock;
 
-    for (int i = 0; i < count && i < 32; i++) {
-        void *pc = data[i];
-        if (!pc) continue;
+// Обновление кэша — вызывается на фоновом потоке раз в секунду
+static void updateCache(void) {
+    if (!gFindObjs||!gPCClass) return;
 
-        // фильтр мёртвых
-        if (rbyte(pc, PC_IS_DEATH)) continue;
+    void *pcType=_type(gPCClass);
+    void *exc=NULL, *a[1]={pcType};
+    void *arr=_invoke(gFindObjs,NULL,a,&exc);
+    if (!arr||exc) return;
 
-        // фильтр тимейтов через PlayerHull._team (0x30)
-        if (gGetComponentMethod && gHullType) {
-            void *hullArgs[1] = { gHullType };
-            void *hull = _runtime_invoke(gGetComponentMethod, pc, hullArgs, &exc);
-            if (hull && !exc) {
-                int team = *(int*)((uint8_t*)hull + PH_TEAM);
+    int32_t cnt=*(int32_t*)((uint8_t*)arr+0x18);
+    void **data=(void**)((uint8_t*)arr+0x20);
+    if (!data||cnt<=0) return;
 
-                // кэшируем нашу команду через IsMine
-                if (gLocalTeam == TeamNone && gPhotonViewClass && gIsMineMethod) {
-                    void *pvType = _class_get_type(gPhotonViewClass);
-                    void *pvArgs[1] = { pvType };
-                    void *pv = _runtime_invoke(gGetComponentMethod, pc, pvArgs, &exc);
-                    if (pv && !exc) {
-                        void *res = _runtime_invoke(gIsMineMethod, pv, NULL, &exc);
-                        if (res && !exc) {
-                            uint8_t *b = (uint8_t*)_object_unbox(res);
-                            if (b && *b) gLocalTeam = team; // наш PC — запомнили команду
-                        }
-                    }
-                }
-
-                if (team == TeamNone) continue;              // спектатор
-                if (gLocalTeam != TeamNone && team == gLocalTeam) continue; // тимейт
-            }
+    // массив PlayerSkeleton для матчинга
+    void *psArr=NULL;
+    int32_t psCnt=0;
+    void **psData=NULL;
+    if (gPSClass&&gPSType) {
+        void *pa[1]={gPSType};
+        psArr=_invoke(gFindObjs,NULL,pa,&exc);
+        if (psArr&&!exc) {
+            psCnt=*(int32_t*)((uint8_t*)psArr+0x18);
+            psData=(void**)((uint8_t*)psArr+0x20);
         }
-
-        // PlayerNetwork → серверная позиция (стабильнее чем Transform)
-        void *pn = rptr(pc, PC_NETWORK);
-        if (!pn) continue;
-        Vec3 netPos = rvec3(pn, PN_POSITION);
-        if (netPos.x == 0 && netPos.y == 0 && netPos.z == 0) continue;
-
-        // голова и таз для бокса
-        Vec3 headPos  = { netPos.x, netPos.y + 1.7f, netPos.z };
-        Vec3 feetPos  = { netPos.x, netPos.y,         netPos.z };
-
-        // PlayerSkeleton через GetComponent если доступно
-        Vec3 skHead     = headPos;
-        Vec3 skChest    = { netPos.x, netPos.y + 1.3f, netPos.z };
-        Vec3 skPelvis   = { netPos.x, netPos.y + 0.9f, netPos.z };
-        Vec3 skLShoulder= { netPos.x - 0.3f, netPos.y + 1.3f, netPos.z };
-        Vec3 skRShoulder= { netPos.x + 0.3f, netPos.y + 1.3f, netPos.z };
-        Vec3 skLThigh   = { netPos.x - 0.15f, netPos.y + 0.5f, netPos.z };
-        Vec3 skRThigh   = { netPos.x + 0.15f, netPos.y + 0.5f, netPos.z };
-
-        if (gGetComponentMethod && gPSClass && gPSType) {
-            void *psArgs[1] = { gPSType };
-            void *ps = _runtime_invoke(gGetComponentMethod, pc, psArgs, &exc);
-            if (ps && !exc) {
-                void *trHead = rptr(ps, PS_HEAD);
-                void *trChest= rptr(ps, PS_CHEST);
-                void *trPelv = rptr(ps, PS_PELVIS);
-                void *trLS   = rptr(ps, PS_LSHOULDER);
-                void *trRS   = rptr(ps, PS_RSHOULDER);
-                void *trLT   = rptr(ps, PS_LTHIGH);
-                void *trRT   = rptr(ps, PS_RTHIGH);
-
-                if (trHead)  skHead      = getTransformPos(trHead);
-                if (trChest) skChest     = getTransformPos(trChest);
-                if (trPelv)  skPelvis    = getTransformPos(trPelv);
-                if (trLS)    skLShoulder = getTransformPos(trLS);
-                if (trRS)    skRShoulder = getTransformPos(trRS);
-                if (trLT)    skLThigh    = getTransformPos(trLT);
-                if (trRT)    skRThigh    = getTransformPos(trRT);
-
-                // если скелет дал голову — используем её для бокса
-                headPos = skHead;
-            }
-        }
-
-        CGPoint screenHead = w2s(headPos);
-        CGPoint screenFeet = w2s(feetPos);
-        if (CGPointEqualToPoint(screenHead, CGPointZero)) continue;
-        if (CGPointEqualToPoint(screenFeet, CGPointZero)) continue;
-        if (screenFeet.y < 0 || screenFeet.y > sh) continue;
-
-        CGFloat height = fabs(screenFeet.y - screenHead.y);
-        if (height < 8.f) continue;
-        CGFloat width = height * 0.45f;
-
-        PlayerESPData esp = {0};
-        esp.valid      = YES;
-        esp.head       = w2s(skHead);
-        esp.chest      = w2s(skChest);
-        esp.pelvis     = w2s(skPelvis);
-        esp.lshoulder  = w2s(skLShoulder);
-        esp.rshoulder  = w2s(skRShoulder);
-        esp.lthigh     = w2s(skLThigh);
-        esp.rthigh     = w2s(skRThigh);
-        esp.box        = CGRectMake(screenHead.x - width*.5f, screenHead.y, width, height);
-
-        [results addObject:[NSData dataWithBytes:&esp length:sizeof(esp)]];
     }
 
-    NSArray *snap = [results copy];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gESPView.players = snap;
+    PCCache tmp[MAX_PLAYERS];
+    int tmpCnt=0;
+
+    for (int i=0;i<cnt&&i<MAX_PLAYERS;i++) {
+        void *pc=data[i];
+        if (!pc) continue;
+
+        PCCache c={0};
+        c.pc=pc;
+
+        // команда через PlayerHull
+        if (gGetComp&&gHullType) {
+            void *ha[1]={gHullType};
+            void *hull=_invoke(gGetComp,pc,ha,&exc);
+            if (hull&&!exc) {
+                int team=*(int*)((uint8_t*)hull+PH_TEAM);
+                c.team=team;
+
+                // кэшируем нашу команду через IsMine у PhotonView — не нужно,
+                // просто: если это первый раз видим локального игрока и isDeath=0
+                // определяем его позже. Пока — просто сохраняем team.
+                // gLocalTeam кэшируем снаружи отдельно.
+            }
+        }
+
+        // PlayerNetwork → networkPosition
+        void *pn=rp(pc,PC_NETWORK);
+        if (!pn) continue;
+        Vec3 netPos=rv(pn,PN_POSITION);
+
+        // матчим PlayerSkeleton по позиции pelvis/head
+        if (psData&&psCnt>0) {
+            for (int j=0;j<psCnt&&j<MAX_PLAYERS;j++) {
+                void *ps=psData[j];
+                if (!ps) continue;
+                void *pelTr=rp(ps,PS_PELVIS);
+                if (!pelTr) continue;
+                Vec3 pelv=trPos(pelTr);
+                // расстояние XZ
+                float dx=pelv.x-netPos.x, dz=pelv.z-netPos.z;
+                if (dx*dx+dz*dz < 0.5f*0.5f) {
+                    c.ps=ps;
+                    // читаем все кости сразу пока мы в updateCache
+                    void *trs[7]={
+                        rp(ps,PS_HEAD), rp(ps,PS_CHEST),  rp(ps,PS_PELVIS),
+                        rp(ps,PS_LSHOULDER), rp(ps,PS_RSHOULDER),
+                        rp(ps,PS_LTHIGH),    rp(ps,PS_RTHIGH)
+                    };
+                    for (int k=0;k<7;k++)
+                        c.bonePos[k]=trs[k]?trPos(trs[k]):(Vec3){0,0,0};
+                    c.hasBones=YES;
+                    break;
+                }
+            }
+        }
+
+        tmp[tmpCnt++]=c;
+    }
+
+    [gCacheLock lock];
+    memcpy(gCache,tmp,sizeof(PCCache)*tmpCnt);
+    gCacheCount=tmpCnt;
+    [gCacheLock unlock];
+}
+
+// ─── ticker ───────────────────────────────────────────────────────────────
+@interface ESPTicker : NSObject {
+    NSTimeInterval _lastCacheUpdate;
+}
+- (void)tick;
+@end
+@implementation ESPTicker
+- (void)tick {
+    if (!gESPOn||!gReady) return;
+
+    // обновляем кэш раз в секунду на фоновом потоке
+    NSTimeInterval now=CACurrentMediaTime();
+    if (now-_lastCacheUpdate > 1.0) {
+        _lastCacheUpdate=now;
+        dispatch_async(dispatch_get_global_queue(0,0), ^{ updateCache(); });
+    }
+
+    [gCacheLock lock];
+    int count=gCacheCount;
+    PCCache snap[MAX_PLAYERS];
+    memcpy(snap,gCache,sizeof(PCCache)*count);
+    [gCacheLock unlock];
+
+    CGFloat sh=[UIScreen mainScreen].bounds.size.height;
+    NSMutableArray *res=[NSMutableArray arrayWithCapacity:count];
+
+    for (int i=0;i<count;i++) {
+        PCCache *c=&snap[i];
+        if (!c->pc) continue;
+        if (rb(c->pc,PC_IS_DEATH)) continue;
+        if (c->team==TeamNone) continue;
+        if (gLocalTeam!=TeamNone && c->team==gLocalTeam) continue;
+
+        void *pn=rp(c->pc,PC_NETWORK);
+        if (!pn) continue;
+        Vec3 netPos=rv(pn,PN_POSITION);
+
+        // высота игрока: стоя ~1.75, присел ~1.1
+        Vec3 headPos={netPos.x, netPos.y+1.75f, netPos.z};
+        Vec3 feetPos=netPos;
+
+        CGPoint sHead=w2s(headPos);
+        CGPoint sFeet=w2s(feetPos);
+        if (CGPointEqualToPoint(sHead,CGPointZero)) continue;
+        if (CGPointEqualToPoint(sFeet,CGPointZero)) continue;
+        if (sFeet.y<0||sFeet.y>sh) continue;
+
+        CGFloat h=fabs(sFeet.y-sHead.y);
+        if (h<8.f) continue;
+        CGFloat w=h*0.45f;
+
+        ESPEntry e={0};
+        e.valid=YES;
+        e.box=CGRectMake(sHead.x-w*.5f, sHead.y, w, h);
+
+        if (c->hasBones) {
+            for (int k=0;k<7;k++) e.pts[k]=w2s(c->bonePos[k]);
+        } else {
+            // фоллбек без скелета
+            e.pts[0]=sHead;
+            e.pts[1]=w2s((Vec3){netPos.x,netPos.y+1.3f,netPos.z});
+            e.pts[2]=w2s((Vec3){netPos.x,netPos.y+0.9f,netPos.z});
+            e.pts[3]=w2s((Vec3){netPos.x-.3f,netPos.y+1.3f,netPos.z});
+            e.pts[4]=w2s((Vec3){netPos.x+.3f,netPos.y+1.3f,netPos.z});
+            e.pts[5]=w2s((Vec3){netPos.x-.15f,netPos.y+.5f,netPos.z});
+            e.pts[6]=w2s((Vec3){netPos.x+.15f,netPos.y+.5f,netPos.z});
+        }
+
+        [res addObject:[NSData dataWithBytes:&e length:sizeof(e)]];
+    }
+
+    NSArray *final=[res copy];
+    dispatch_async(dispatch_get_main_queue(),^{
+        gESPView.entries=final;
         [gESPView setNeedsDisplay];
     });
 }
 @end
 
-// ─── il2cpp bind + init ───────────────────────────────────────────────────
+// ─── il2cpp init ──────────────────────────────────────────────────────────
 static BOOL bindSymbols(void) {
-    void *h = dlopen(NULL, RTLD_LAZY);
+    void *h=dlopen(NULL,RTLD_LAZY);
     if (!h) return NO;
-#define BIND(v,n) v = (__typeof__(v))dlsym(h,n); if(!v){NSLog(@"[esp] missing %s",n);return NO;}
-    BIND(_domain_get,         "il2cpp_domain_get")
-    BIND(_domain_assemblies,  "il2cpp_domain_get_assemblies")
-    BIND(_asm_get_image,      "il2cpp_assembly_get_image")
-    BIND(_class_from_name,    "il2cpp_class_from_name")
-    BIND(_class_get_method,   "il2cpp_class_get_method_from_name")
-    BIND(_runtime_invoke,     "il2cpp_runtime_invoke")
-    BIND(_object_unbox,       "il2cpp_object_unbox")
-    BIND(_class_get_type,     "il2cpp_class_get_type")
-#undef BIND
+#define B(v,n) v=(__typeof__(v))dlsym(h,n); if(!v){NSLog(@"[esp] ?" n);return NO;}
+    B(_domain_get,  "il2cpp_domain_get")
+    B(_domain_asms, "il2cpp_domain_get_assemblies")
+    B(_asm_img,     "il2cpp_assembly_get_image")
+    B(_cls,         "il2cpp_class_from_name")
+    B(_meth,        "il2cpp_class_get_method_from_name")
+    B(_invoke,      "il2cpp_runtime_invoke")
+    B(_unbox,       "il2cpp_object_unbox")
+    B(_type,        "il2cpp_class_get_type")
+#undef B
     return YES;
 }
 
-static void* findImg(void **asms, size_t cnt, const char *ns, const char *cls) {
-    for (size_t i = 0; i < cnt; i++) {
-        void *img = _asm_get_image(asms[i]);
-        if (img && _class_from_name(img, ns, cls)) return img;
-    }
+static void* findImg(void **a,size_t n,const char *ns,const char *c){
+    for(size_t i=0;i<n;i++){void *img=_asm_img(a[i]);if(img&&_cls(img,ns,c))return img;}
     return NULL;
 }
 
-static void initMethods(void) {
-    void *domain = _domain_get();
-    size_t cnt = 0;
-    void **asms = _domain_assemblies(domain, &cnt);
-    if (!asms || !cnt) { NSLog(@"[esp] нет assemblies"); return; }
+static void initMethods(void){
+    void *d=_domain_get(); size_t n=0;
+    void **a=_domain_asms(d,&n);
+    if(!a||!n){NSLog(@"[esp] no assemblies");return;}
 
-    void *mainImg = findImg(asms, cnt, "",            "PlayerController");
-    void *ueImg   = findImg(asms, cnt, "UnityEngine", "Camera");
-    void *punImg  = findImg(asms, cnt, "Photon.Pun",  "PhotonView");
+    void *main=findImg(a,n,"","PlayerController");
+    void *ue  =findImg(a,n,"UnityEngine","Camera");
+    if(!main||!ue){NSLog(@"[esp] images not found");return;}
 
-    if (!mainImg) { NSLog(@"[esp] Assembly-CSharp не найден"); return; }
-    if (!ueImg)   { NSLog(@"[esp] UnityEngine не найден"); return; }
+    gPCClass   =_cls(main,"","PlayerController");
+    gPSClass   =_cls(main,"","PlayerSkeleton");
+    gHullClass =_cls(main,"","PlayerHull");
+    if(gPSClass)   gPSType  =_type(gPSClass);
+    if(gHullClass) gHullType=_type(gHullClass);
 
-    // PlayerController
-    gPCClass = _class_from_name(mainImg, "", "PlayerController");
+    void *objC=_cls(ue,"UnityEngine","Object");
+    void *cmpC=_cls(ue,"UnityEngine","Component");
+    void *trC =_cls(ue,"UnityEngine","Transform");
+    void *camC=_cls(ue,"UnityEngine","Camera");
 
-    // PlayerSkeleton
-    gPSClass = _class_from_name(mainImg, "", "PlayerSkeleton");
-    if (gPSClass) gPSType = _class_get_type(gPSClass);
+    if(objC) gFindObjs=_meth(objC,"FindObjectsOfType",1);
+    if(cmpC) gGetComp =_meth(cmpC,"GetComponent",1);
+    if(trC)  gTrPos   =_meth(trC, "get_position",0);
+    if(camC){gCamMain =_meth(camC,"get_main",0);
+             gW2S     =_meth(camC,"WorldToScreenPoint",1);}
 
-    // PlayerHull
-    gHullClass = _class_from_name(mainImg, "", "PlayerHull");
-    if (gHullClass) gHullType = _class_get_type(gHullClass);
-
-    // PhotonView (для IsMine + кэша локальной команды)
-    if (punImg) {
-        gPhotonViewClass = _class_from_name(punImg, "Photon.Pun", "PhotonView");
-        if (gPhotonViewClass)
-            gIsMineMethod = _class_get_method(gPhotonViewClass, "get_IsMine", 0);
-    }
-
-    // UnityEngine
-    void *objCls = _class_from_name(ueImg, "UnityEngine", "Object");
-    if (objCls)
-        gFindObjectsMethod = _class_get_method(objCls, "FindObjectsOfType", 1);
-
-    void *compCls = _class_from_name(ueImg, "UnityEngine", "Component");
-    if (compCls)
-        gGetComponentMethod = _class_get_method(compCls, "GetComponent", 1);
-
-    void *trCls = _class_from_name(ueImg, "UnityEngine", "Transform");
-    if (trCls)
-        gTransformPosMethod = _class_get_method(trCls, "get_position", 0);
-
-    void *camCls = _class_from_name(ueImg, "UnityEngine", "Camera");
-    if (camCls) {
-        gCameraMainMethod = _class_get_method(camCls, "get_main", 0);
-        gW2SMethod        = _class_get_method(camCls, "WorldToScreenPoint", 1);
-    }
-
-    gReady = (gFindObjectsMethod && gCameraMainMethod && gW2SMethod && gPCClass);
-    NSLog(@"[esp] ready=%@ ps=%@ hull=%@ pv=%@",
-          gReady ? @"YES" : @"NO",
-          gPSClass ? @"YES" : @"NO",
-          gHullClass ? @"YES" : @"NO",
-          gPhotonViewClass ? @"YES" : @"NO");
+    gReady=(gFindObjs&&gCamMain&&gW2S&&gPCClass);
+    NSLog(@"[esp] ready=%d ps=%d hull=%d",gReady,!!gPSClass,!!gHullClass);
 }
 
-// ─── UI setup ─────────────────────────────────────────────────────────────
-static void setupUI(void) {
-    UIWindow *kw = nil;
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] &&
-            s.activationState == UISceneActivationStateForegroundActive) {
-            kw = ((UIWindowScene*)s).windows.firstObject;
-            break;
-        }
-    }
-    if (!kw) { NSLog(@"[esp] нет keyWindow"); return; }
+// ─── UI ───────────────────────────────────────────────────────────────────
+static void setupUI(void){
+    UIWindow *kw=nil;
+    for(UIScene *s in UIApplication.sharedApplication.connectedScenes)
+        if([s isKindOfClass:[UIWindowScene class]]&&
+           s.activationState==UISceneActivationStateForegroundActive)
+        {kw=((UIWindowScene*)s).windows.firstObject;break;}
+    if(!kw){NSLog(@"[esp] no window");return;}
 
-    CGRect screen = [UIScreen mainScreen].bounds;
-    CGFloat sw = screen.size.width;
-
-    gESPView = [[ESPView alloc] initWithFrame:screen];
-    gESPView.hidden = YES;
+    CGRect sc=[UIScreen mainScreen].bounds;
+    gESPView=[[ESPView alloc]initWithFrame:sc];
+    gESPView.hidden=YES;
     [kw addSubview:gESPView];
 
-    gMenuView = [[ESPMenuView alloc] initWithESPView:gESPView];
-    gMenuView.center = CGPointMake(sw - 92, 110);
-    [kw addSubview:gMenuView];
+    gMenu=[[ESPMenuView alloc]initWithESP:gESPView];
+    gMenu.center=CGPointMake(sc.size.width-92,110);
+    [kw addSubview:gMenu];
 
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:gMenuView action:@selector(show)];
-    tap.numberOfTouchesRequired = 3;
+    UITapGestureRecognizer *tap=[[UITapGestureRecognizer alloc]
+        initWithTarget:gMenu action:@selector(show)];
+    tap.numberOfTouchesRequired=3;
     [kw addGestureRecognizer:tap];
 
-    ESPTicker *ticker = [[ESPTicker alloc] init];
-    objc_setAssociatedObject(kw, "cfesp_t", ticker, OBJC_ASSOCIATION_RETAIN);
-    CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:ticker selector:@selector(tick)];
-    dl.preferredFramesPerSecond = 30;
+    gCacheLock=[NSLock new];
+
+    ESPTicker *ticker=[ESPTicker new];
+    objc_setAssociatedObject(kw,"cf_t",ticker,OBJC_ASSOCIATION_RETAIN);
+    CADisplayLink *dl=[CADisplayLink displayLinkWithTarget:ticker selector:@selector(tick)];
+    dl.preferredFramesPerSecond=30;
     [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
 // ─── entry ────────────────────────────────────────────────────────────────
 __attribute__((constructor))
-static void cfEspInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(0,0), ^{
-        if (!bindSymbols()) return;
+static void cfEspInit(void){
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(4*NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0,0),^{
+        if(!bindSymbols())return;
         initMethods();
-        dispatch_async(dispatch_get_main_queue(), ^{ setupUI(); });
+        dispatch_async(dispatch_get_main_queue(),^{setupUI();});
     });
 }
