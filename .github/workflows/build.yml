@@ -13,32 +13,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install ldid
         run: brew install ldid
 
-      - name: Install Theos
+      - name: Download iOS SDK
         run: |
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          curl -LO https://github.com/theos/sdks/releases/download/2023-04-07/iPhoneOS16.5.sdk.tar.xz
-          tar -xJf iPhoneOS16.5.sdk.tar.xz -C $HOME/theos/sdks/
+          curl -L https://github.com/xybp888/iOS-SDKs/releases/download/iOS-SDKs/iPhoneOS17.0.sdk.tar.xz -o sdk.tar.xz
+          mkdir -p ~/sdk
+          tar -xJf sdk.tar.xz -C ~/sdk
 
       - name: Compile .dylib
         run: |
-          $HOME/theos/toolchain/linux/iphone/bin/clang++ \
+          SDK=~/sdk/iPhoneOS17.0.sdk
+          clang \
             -arch arm64 \
-            -isysroot $HOME/theos/sdks/iPhoneOS16.5.sdk \
+            -isysroot $SDK \
             -fobjc-arc \
             -O2 \
             -dynamiclib \
             -framework UIKit \
             -framework CoreGraphics \
+            -lobjc \
             -o CFEsp.dylib \
             Tweak.mm
 
       - name: Sign
         run: ldid -S CFEsp.dylib
 
-      - name: Upload .dylib
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: CFEsp-dylib
