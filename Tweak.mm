@@ -1,161 +1,171 @@
 #import <UIKit/UIKit.h>
 
 // ── config ────────────────────────────────────────────────────────────────────
-static const CGFloat kToggleWidth  = 34.f;
-static const CGFloat kCornerRadius = 0.f;
-static const UIEdgeInsets kSafeMargin = {10, 10, 10, 10};
-static const CGFloat kMaxMenuWidth = 480.f;
+static const CGFloat kToggleW  = 32.f;   // ширина кнопки скрыть
+static const CGFloat kBorder   = 1.5f;
+static const CGFloat kMargin   = 10.f;   // отступ от краёв экрана
+static const CGFloat kMaxW     = 460.f;  // макс ширина панели
 
-static CGFloat MenuHeight() {
-    CGFloat h = UIScreen.mainScreen.bounds.size.height;
-    CGFloat v = h * 0.055f;
-    return MAX(44.f, MIN(v, 56.f));
+static CGFloat MenuH(void) {
+    // 5.5% короткой стороны экрана, зажато в [44, 54]
+    CGFloat s = MIN(UIScreen.mainScreen.bounds.size.width,
+                    UIScreen.mainScreen.bounds.size.height);
+    return MAX(44.f, MIN(s * 0.055f, 54.f));
 }
 
-static UIColor *kColorBG()     { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.96f]; }
-static UIColor *kColorAccent() { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f ]; }
-static UIColor *kColorText()   { return [UIColor whiteColor]; }
+static UIColor *BG(void)     { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.96f]; }
+static UIColor *Accent(void) { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f]; }
 // ─────────────────────────────────────────────────────────────────────────────
 
+@interface CrezBar : UIView
+- (void)relayoutForBounds:(CGRect)windowBounds;
+@end
+
 @interface CrezMenuWindow : UIWindow
+@property (nonatomic, strong) CrezBar *bar;
 @end
 
-@interface CrezMenuController : UIViewController
+// ── кнопка ◀ / ▶ ─────────────────────────────────────────────────────────────
+@interface CrezToggleBtn : UIControl
+@property (nonatomic, assign) BOOL expanded;   // YES = меню открыто
+@property (nonatomic, copy)   void (^action)(void);
 @end
 
-// ── toggle tab (торчит сбоку когда меню скрыто) ──────────────────────────────
-@interface CrezToggleTab : UIControl
-@property (nonatomic, assign) BOOL menuVisible;
-@property (nonatomic, copy)   void (^onTap)(void);
-@end
+@implementation CrezToggleBtn
 
-@implementation CrezToggleTab
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (!self) return nil;
-    self.backgroundColor = kColorAccent();
-    self.layer.cornerRadius = 0;
-    self.menuVisible = YES;
-    [self addTarget:self action:@selector(_tapped) forControlEvents:UIControlEventTouchUpInside];
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
+    self.backgroundColor = Accent();
+    self.expanded = YES;
+    [self addTarget:self action:@selector(_tap)
+   forControlEvents:UIControlEventTouchUpInside];
     return self;
 }
-
-- (void)_tapped { if (self.onTap) self.onTap(); }
-
-- (void)drawRect:(CGRect)rect {
-    [super drawRect:rect];
-    // стрелка
+- (void)_tap { if (self.action) self.action(); }
+- (void)setExpanded:(BOOL)v { _expanded = v; [self setNeedsDisplay]; }
+- (void)drawRect:(CGRect)r {
+    CGFloat cx = r.size.width*.5f, cy = r.size.height*.5f;
+    CGFloat aw = 5.f, ah = 8.f;
     UIBezierPath *p = [UIBezierPath new];
-    CGFloat cx = rect.size.width  * .5f;
-    CGFloat cy = rect.size.height * .5f;
-    CGFloat aw = 6.f, ah = 9.f;
-    if (self.menuVisible) {
-        // ◀  (скрыть)
-        [p moveToPoint:    CGPointMake(cx + aw, cy - ah)];
-        [p addLineToPoint: CGPointMake(cx - aw, cy)];
-        [p addLineToPoint: CGPointMake(cx + aw, cy + ah)];
-    } else {
-        // ▶  (показать)
-        [p moveToPoint:    CGPointMake(cx - aw, cy - ah)];
-        [p addLineToPoint: CGPointMake(cx + aw, cy)];
-        [p addLineToPoint: CGPointMake(cx - aw, cy + ah)];
+    if (_expanded) {            // ◀ скрыть
+        [p moveToPoint:CGPointMake(cx+aw, cy-ah)];
+        [p addLineToPoint:CGPointMake(cx-aw, cy)];
+        [p addLineToPoint:CGPointMake(cx+aw, cy+ah)];
+    } else {                    // ▶ показать
+        [p moveToPoint:CGPointMake(cx-aw, cy-ah)];
+        [p addLineToPoint:CGPointMake(cx+aw, cy)];
+        [p addLineToPoint:CGPointMake(cx-aw, cy+ah)];
     }
-    [kColorText() setStroke];
-    p.lineWidth    = 2.f;
-    p.lineCapStyle = kCGLineCapSquare;
+    [[UIColor whiteColor] setStroke];
+    p.lineWidth = 2.f; p.lineCapStyle = kCGLineCapSquare;
     [p stroke];
 }
-
-- (void)setMenuVisible:(BOOL)v {
-    _menuVisible = v;
-    [self setNeedsDisplay];
-}
-
 @end
 
-// ── основная панель ───────────────────────────────────────────────────────────
-@interface CrezMenuBar : UIView
-@property (nonatomic, strong) CrezToggleTab *toggleTab;
-@property (nonatomic, strong) UIScrollView  *itemsScroll;
-@property (nonatomic, assign) BOOL           menuVisible;
-@end
-
-@implementation CrezMenuBar {
-    CGPoint _dragStart;
-    CGPoint _originStart;
+// ── панель ────────────────────────────────────────────────────────────────────
+@implementation CrezBar {
+    CrezToggleBtn *_btn;
+    UIScrollView  *_scroll;
+    UILabel       *_placeholder;
+    BOOL           _expanded;
+    CGPoint        _dragStart;
+    CGPoint        _originStart;
+    CGFloat        _fullWidth;   // ширина в развёрнутом виде
 }
 
-- (instancetype)initWithScreenSize:(CGSize)screen {
-    CGFloat h  = MenuHeight();
-    CGFloat sw = screen.width - kSafeMargin.left - kSafeMargin.right;
-    CGFloat w  = MIN(sw, kMaxMenuWidth);
-    CGFloat x  = kSafeMargin.left + (sw - w) * .5f;
-    CGFloat y  = kSafeMargin.top;
-    self = [super initWithFrame:CGRectMake(x, y, w, h)];
+- (instancetype)initWithBounds:(CGRect)wb {
+    self = [super initWithFrame:CGRectZero];
     if (!self) return nil;
 
-    self.backgroundColor    = kColorBG();
-    self.layer.cornerRadius = kCornerRadius;
-    self.layer.borderColor  = kColorAccent().CGColor;
-    self.layer.borderWidth  = 1.5f;
+    self.backgroundColor    = BG();
+    self.layer.borderColor  = Accent().CGColor;
+    self.layer.borderWidth  = kBorder;
+    self.layer.cornerRadius = 0;
     self.clipsToBounds      = YES;
-    self.menuVisible        = YES;
+    _expanded = YES;
 
-    // scroll-область для будущих кнопок
-    _itemsScroll = [[UIScrollView alloc] initWithFrame:
-                    CGRectMake(0, 0, w - kToggleWidth, h)];
-    _itemsScroll.backgroundColor       = [UIColor clearColor];
-    _itemsScroll.showsHorizontalScrollIndicator = NO;
-    _itemsScroll.showsVerticalScrollIndicator   = NO;
-    _itemsScroll.bounces = YES;
-    [self addSubview:_itemsScroll];
+    // scroll
+    _scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    _scroll.backgroundColor = [UIColor clearColor];
+    _scroll.showsHorizontalScrollIndicator = NO;
+    _scroll.showsVerticalScrollIndicator   = NO;
+    _scroll.bounces = YES;
+    [self addSubview:_scroll];
 
-    UILabel *placeholder = [[UILabel alloc] initWithFrame:_itemsScroll.bounds];
-    placeholder.text          = @"— меню пусто —";
-    placeholder.textColor     = [UIColor colorWithWhite:1.f alpha:.25f];
-    placeholder.font          = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
-    placeholder.textAlignment = NSTextAlignmentCenter;
-    [_itemsScroll addSubview:placeholder];
+    // placeholder
+    _placeholder = [[UILabel alloc] initWithFrame:CGRectZero];
+    _placeholder.text          = @"— пусто —";
+    _placeholder.textColor     = [UIColor colorWithWhite:1.f alpha:.22f];
+    _placeholder.font          = [UIFont monospacedSystemFontOfSize:11.f
+                                                             weight:UIFontWeightRegular];
+    _placeholder.textAlignment = NSTextAlignmentCenter;
+    [_scroll addSubview:_placeholder];
 
-    _toggleTab = [[CrezToggleTab alloc] initWithFrame:
-                  CGRectMake(w - kToggleWidth, 0, kToggleWidth, h)];
-    __weak typeof(self) ws = self;
-    _toggleTab.onTap = ^{ [ws _toggleVisibility]; };
-    [self addSubview:_toggleTab];
+    // кнопка
+    _btn = [[CrezToggleBtn alloc] initWithFrame:CGRectZero];
+    __weak CrezBar *ws = self;
+    _btn.action = ^{ [ws _toggle]; };
+    [self addSubview:_btn];
 
-    // drag
+    // drag — только по самой панели, не по scroll
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
     pan.maximumNumberOfTouches = 1;
     [self addGestureRecognizer:pan];
 
+    [self relayoutForBounds:wb];
     return self;
 }
 
-// ── drag ─────────────────────────────────────────────────────────────────────
+// вызывается при init и при каждом повороте
+- (void)relayoutForBounds:(CGRect)wb {
+    CGFloat h  = MenuH();
+    CGFloat sw = wb.size.width - kMargin * 2.f;
+    _fullWidth  = MIN(sw, kMaxW);
+    CGFloat x  = kMargin + (sw - _fullWidth) * .5f;
+
+    // сохраняем Y если уже позиционировали, иначе — верх
+    CGFloat y = (self.frame.size.height > 0) ? self.frame.origin.y : kMargin;
+    // clamp y
+    y = MAX(kMargin, MIN(y, wb.size.height - h - kMargin));
+
+    CGFloat curW = _expanded ? _fullWidth : kToggleW;
+    self.frame = CGRectMake(x, y, curW, h);
+    [self _applyInternalLayout];
+}
+
+- (void)_applyInternalLayout {
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    _scroll.frame       = CGRectMake(0, 0, w - kToggleW, h);
+    _placeholder.frame  = _scroll.bounds;
+    _btn.frame          = CGRectMake(w - kToggleW, 0, kToggleW, h);
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self _applyInternalLayout];
+}
+
+// ── drag ──────────────────────────────────────────────────────────────────────
 - (void)_pan:(UIPanGestureRecognizer *)gr {
     UIView *sv = self.superview;
     if (!sv) return;
-
     switch (gr.state) {
         case UIGestureRecognizerStateBegan:
-            _dragStart  = [gr locationInView:sv];
+            _dragStart   = [gr locationInView:sv];
             _originStart = self.frame.origin;
             break;
         case UIGestureRecognizerStateChanged: {
-            CGPoint cur   = [gr locationInView:sv];
-            CGFloat dx    = cur.x - _dragStart.x;
-            CGFloat dy    = cur.y - _dragStart.y;
-            CGRect  frame = self.frame;
-            frame.origin.x = _originStart.x + dx;
-            frame.origin.y = _originStart.y + dy;
-            // clamp внутрь экрана
-            CGFloat maxX = sv.bounds.size.width  - frame.size.width  - kSafeMargin.right;
-            CGFloat maxY = sv.bounds.size.height - frame.size.height - kSafeMargin.bottom;
-            frame.origin.x = MAX(kSafeMargin.left, MIN(frame.origin.x, maxX));
-            frame.origin.y = MAX(kSafeMargin.top,  MIN(frame.origin.y, maxY));
-            self.frame = frame;
+            CGPoint c = [gr locationInView:sv];
+            CGRect  f = self.frame;
+            f.origin.x = _originStart.x + (c.x - _dragStart.x);
+            f.origin.y = _originStart.y + (c.y - _dragStart.y);
+            CGFloat maxX = sv.bounds.size.width  - f.size.width  - kMargin;
+            CGFloat maxY = sv.bounds.size.height - f.size.height - kMargin;
+            f.origin.x = MAX(kMargin, MIN(f.origin.x, maxX));
+            f.origin.y = MAX(kMargin, MIN(f.origin.y, maxY));
+            self.frame = f;
             break;
         }
         default: break;
@@ -163,91 +173,77 @@ static UIColor *kColorText()   { return [UIColor whiteColor]; }
 }
 
 // ── toggle ────────────────────────────────────────────────────────────────────
-- (void)_toggleVisibility {
-    _menuVisible = !_menuVisible;
-    _toggleTab.menuVisible = _menuVisible;
+- (void)_toggle {
+    _expanded = !_expanded;
+    _btn.expanded = _expanded;
 
-    [UIView animateWithDuration:.22f
+    UIView *sv = self.superview;
+    CGFloat targetW = _expanded ? _fullWidth : kToggleW;
+
+    // при открытии — clamp x чтобы не вылезло за экран
+    CGRect f = self.frame;
+    if (_expanded) {
+        CGFloat maxX = sv.bounds.size.width - targetW - kMargin;
+        f.origin.x = MAX(kMargin, MIN(f.origin.x, maxX));
+    }
+    f.size.width = targetW;
+
+    [UIView animateWithDuration:.2f
                           delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
-        if (self->_menuVisible) {
-            CGRect f = self.frame;
-            UIView *sv = self.superview;
-            CGFloat sw = sv.bounds.size.width - kSafeMargin.left - kSafeMargin.right;
-            f.size.width = MIN(sw, kMaxMenuWidth);
-            CGFloat maxX = sv.bounds.size.width - f.size.width - kSafeMargin.right;
-            f.origin.x = MAX(kSafeMargin.left, MIN(f.origin.x, maxX));
-            self.frame = f;
-            self->_itemsScroll.alpha = 1.f;
-        } else {
-            // схлопнуть до ширины таба
-            CGRect f = self.frame;
-            f.size.width = kToggleWidth;
-            self.frame   = f;
-            self->_itemsScroll.alpha = 0.f;
-        }
-        // перепозиционировать таб внутри
-        CGRect tf = self->_toggleTab.frame;
-        tf.origin.x = self.bounds.size.width - kToggleWidth;
-        self->_toggleTab.frame = tf;
+        self.frame = f;
+        self->_scroll.alpha = self->_expanded ? 1.f : 0.f;
     } completion:nil];
 }
 
-// при изменении bounds двигаем таб и scroll
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    CGFloat w = self.bounds.size.width;
-    CGFloat h = MenuHeight();
-    _itemsScroll.frame = CGRectMake(0, 0, w - kToggleWidth, h);
-    _toggleTab.frame   = CGRectMake(w - kToggleWidth, 0, kToggleWidth, h);
-}
-
 @end
 
-// ── window / controller ───────────────────────────────────────────────────────
-@implementation CrezMenuController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor clearColor];
-
-    CGSize screen = UIScreen.mainScreen.bounds.size;
-    CrezMenuBar *bar = [[CrezMenuBar alloc] initWithScreenSize:screen];
-    [self.view addSubview:bar];
-}
-
-@end
-
+// ── window ────────────────────────────────────────────────────────────────────
 @implementation CrezMenuWindow
 
 - (instancetype)init {
     self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (!self) return nil;
-    self.windowLevel              = UIWindowLevelAlert + 100;
-    self.backgroundColor          = [UIColor clearColor];
-    self.rootViewController       = [CrezMenuController new];
-    self.hidden                   = NO;
+    self.windowLevel        = UIWindowLevelAlert + 100;
+    self.backgroundColor    = [UIColor clearColor];
+    self.rootViewController = [UIViewController new];
+    self.rootViewController.view.backgroundColor = [UIColor clearColor];
+    self.hidden = NO;
+
+    _bar = [[CrezBar alloc] initWithBounds:UIScreen.mainScreen.bounds];
+    [self.rootViewController.view addSubview:_bar];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(_orientationChanged)
+               name:UIApplicationDidChangeStatusBarOrientationNotification
+             object:nil];
     return self;
 }
 
-// передаём тачи сквозь прозрачные зоны
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
+- (void)_orientationChanged {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(.15f * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CGRect wb = UIScreen.mainScreen.bounds;
+        self.frame = wb;
+        self.rootViewController.view.frame = wb;
+        [self->_bar relayoutForBounds:wb];
+    });
+}
+
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *hit = [super hitTest:p withEvent:e];
     return (hit == self || hit == self.rootViewController.view) ? nil : hit;
 }
 
 @end
 
-// ── inject ────────────────────────────────────────────────────────────────────
-static CrezMenuWindow *gMenuWindow;
+// ── init ──────────────────────────────────────────────────────────────────────
+static CrezMenuWindow *gWin;
 
-static void _spawnMenu() {
+__attribute__((constructor)) static void _init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        gMenuWindow = [[CrezMenuWindow alloc] init];
+        gWin = [[CrezMenuWindow alloc] init];
     });
-}
-
-__attribute__((constructor)) static void _init() {
-    _spawnMenu();
 }
