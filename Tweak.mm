@@ -1,97 +1,69 @@
 #import <UIKit/UIKit.h>
 
 // ── config ────────────────────────────────────────────────────────────────────
-static const CGFloat kToggleW   = 32.f;
-static const CGFloat kTabW      = 80.f;   // ширина одного таба каталога
-static const CGFloat kDividerW  = 1.f;    // вертикальная черта между табами и контентом
-static const CGFloat kBorder    = 1.5f;
-static const CGFloat kMargin    = 10.f;
-static const CGFloat kMaxW      = 480.f;
+static const CGFloat kMenuW      = 300.f;
+static const CGFloat kMenuH      = 340.f;
+static const CGFloat kSidebarW   = 110.f;
+static const CGFloat kHeaderH    = 44.f;
+static const CGFloat kMargin     = 12.f;
 
-static NSArray<NSString *> *kTabs(void) {
-    return @[@"Aim", @"Visuals"];
-}
-
-static CGFloat MenuH(void) {
-    CGFloat s = MIN(UIScreen.mainScreen.bounds.size.width,
-                    UIScreen.mainScreen.bounds.size.height);
-    return MAX(44.f, MIN(s * 0.055f, 54.f));
-}
-
-static UIColor *BG(void)       { return [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:.97f]; }
-static UIColor *Accent(void)   { return [UIColor colorWithRed:1.f  green:.45f blue:.0f  alpha:1.f ]; }
-static UIColor *TabBG(void)    { return [UIColor colorWithRed:.12f green:.12f blue:.12f alpha:1.f ]; }
-static UIColor *TextDim(void)  { return [UIColor colorWithWhite:1.f alpha:.4f]; }
-static UIColor *TextHot(void)  { return [UIColor whiteColor]; }
+static UIColor *BG(void)         { return [UIColor colorWithRed:.10f green:.10f blue:.10f alpha:.97f]; }
+static UIColor *Sidebar(void)    { return [UIColor colorWithRed:.07f green:.07f blue:.07f alpha:1.f ]; }
+static UIColor *Accent(void)     { return [UIColor colorWithRed:.90f green:.20f blue:.10f alpha:1.f ]; }
+static UIColor *ActiveItem(void) { return [UIColor colorWithRed:.15f green:.15f blue:.15f alpha:1.f ]; }
+static UIColor *TextMain(void)   { return [UIColor colorWithWhite:.92f alpha:1.f]; }
+static UIColor *TextDim(void)    { return [UIColor colorWithWhite:.45f alpha:1.f]; }
+static UIColor *Divider(void)    { return [UIColor colorWithWhite:.2f  alpha:1.f]; }
 // ─────────────────────────────────────────────────────────────────────────────
 
-@interface CrezBar : UIView
-- (void)relayoutForBounds:(CGRect)wb;
-@end
 @interface CrezMenuWindow : UIWindow
-@property (nonatomic, strong) CrezBar *bar;
+@property (nonatomic, strong) UIView *menuView;
 @end
 
-// ── ◀/▶ кнопка ───────────────────────────────────────────────────────────────
-@interface CrezToggleBtn : UIControl
-@property (nonatomic, assign) BOOL expanded;
-@property (nonatomic, copy)   void (^action)(void);
-@end
-@implementation CrezToggleBtn
-- (instancetype)initWithFrame:(CGRect)f {
-    self = [super initWithFrame:f];
-    self.backgroundColor = Accent();
-    self.expanded = YES;
-    [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
-    return self;
-}
-- (void)_tap { if (self.action) self.action(); }
-- (void)setExpanded:(BOOL)v { _expanded = v; [self setNeedsDisplay]; }
-- (void)drawRect:(CGRect)r {
-    CGFloat cx = r.size.width*.5f, cy = r.size.height*.5f, aw = 5.f, ah = 8.f;
-    UIBezierPath *p = [UIBezierPath new];
-    if (_expanded) {
-        [p moveToPoint:CGPointMake(cx+aw, cy-ah)];
-        [p addLineToPoint:CGPointMake(cx-aw, cy)];
-        [p addLineToPoint:CGPointMake(cx+aw, cy+ah)];
-    } else {
-        [p moveToPoint:CGPointMake(cx-aw, cy-ah)];
-        [p addLineToPoint:CGPointMake(cx+aw, cy)];
-        [p addLineToPoint:CGPointMake(cx-aw, cy+ah)];
-    }
-    [[UIColor whiteColor] setStroke];
-    p.lineWidth = 2.f; p.lineCapStyle = kCGLineCapSquare;
-    [p stroke];
-}
-@end
-
-// ── таб каталога ──────────────────────────────────────────────────────────────
-@interface CrezTabBtn : UIControl
-@property (nonatomic, assign) BOOL active;
+// ── строка каталога ───────────────────────────────────────────────────────────
+@interface CrezSideItem : UIControl
+@property (nonatomic, assign) BOOL   active;
 @property (nonatomic, copy)   NSString *title;
 @property (nonatomic, copy)   void (^action)(void);
 @end
-@implementation CrezTabBtn {
+
+@implementation CrezSideItem {
+    UIView  *_activeLine;
     UILabel *_lbl;
-    UIView  *_accent;   // нижняя/левая оранжевая черта
 }
-- (instancetype)initWithTitle:(NSString *)t {
+- (instancetype)initWithTitle:(NSString *)t icon:(NSString *)icon {
     self = [super initWithFrame:CGRectZero];
     self.title = t;
-    self.backgroundColor = [UIColor clearColor];
 
-    _lbl = [[UILabel alloc] initWithFrame:CGRectZero];
-    _lbl.text          = t;
-    _lbl.textAlignment = NSTextAlignmentCenter;
-    _lbl.font          = [UIFont systemFontOfSize:12.f weight:UIFontWeightSemibold];
-    _lbl.textColor     = TextDim();
+    // фон активного
+    _activeLine = [[UIView alloc] init];
+    _activeLine.backgroundColor = ActiveItem();
+    _activeLine.hidden = YES;
+    [self addSubview:_activeLine];
+
+    // иконка (SF Symbol или просто пустое место)
+    UIImageView *ico = [[UIImageView alloc] init];
+    if (@available(iOS 13, *)) {
+        UIImage *img = [UIImage systemImageNamed:icon];
+        ico.image = img;
+        ico.tintColor = TextDim();
+    }
+    ico.contentMode = UIViewContentModeScaleAspectFit;
+    ico.tag = 10;
+    [self addSubview:ico];
+
+    _lbl = [[UILabel alloc] init];
+    _lbl.text      = t;
+    _lbl.font      = [UIFont systemFontOfSize:13.f weight:UIFontWeightMedium];
+    _lbl.textColor = TextDim();
     [self addSubview:_lbl];
 
-    // левая оранжевая черта (активный таб)
-    _accent = [[UIView alloc] initWithFrame:CGRectZero];
-    _accent.backgroundColor = Accent();
-    _accent.hidden = YES;
-    [self addSubview:_accent];
+    // красная левая черта активного
+    UIView *bar = [[UIView alloc] init];
+    bar.backgroundColor = Accent();
+    bar.tag = 20;
+    bar.hidden = YES;
+    [self addSubview:bar];
 
     [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
     return self;
@@ -99,139 +71,147 @@ static UIColor *TextHot(void)  { return [UIColor whiteColor]; }
 - (void)_tap { if (self.action) self.action(); }
 - (void)setActive:(BOOL)v {
     _active = v;
-    _lbl.textColor  = v ? TextHot() : TextDim();
-    _accent.hidden  = !v;
+    _activeLine.hidden = !v;
+    _lbl.textColor     = v ? TextMain() : TextDim();
+    [self viewWithTag:10].tintColor = v ? Accent() : TextDim();
+    [self viewWithTag:20].hidden    = !v;
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
-    _lbl.frame    = self.bounds;
-    // левая вертикальная черта 3pt
-    _accent.frame = CGRectMake(0, 4.f, 3.f, self.bounds.size.height - 8.f);
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    _activeLine.frame          = CGRectMake(0, 0, w, h);
+    [self viewWithTag:20].frame = CGRectMake(0, 6.f, 3.f, h - 12.f);
+    [self viewWithTag:10].frame = CGRectMake(14.f, (h-16.f)*.5f, 16.f, 16.f);
+    _lbl.frame                 = CGRectMake(36.f, 0, w - 40.f, h);
 }
 @end
 
-// ── основная панель ───────────────────────────────────────────────────────────
-@implementation CrezBar {
-    CrezToggleBtn        *_toggle;
-    NSMutableArray       *_tabs;      // CrezTabBtn[]
-    UIView               *_divider;
-    UIView               *_content;  // правая часть — будущие опции
-    UILabel              *_empty;
-    NSInteger             _activeTab;
-    BOOL                  _expanded;
-    CGFloat               _fullWidth;
-    CGPoint               _dragStart;
-    CGPoint               _originStart;
+// ── основное меню ─────────────────────────────────────────────────────────────
+@interface CrezMenu : UIView
+- (instancetype)init;
+@end
+
+@implementation CrezMenu {
+    NSMutableArray *_sideItems;
+    NSInteger       _activeIdx;
+    UIView         *_contentArea;
+    UILabel        *_contentLabel;
+    // drag
+    CGPoint         _dragStart;
+    CGPoint         _originStart;
+    BOOL            _hidden;
+    UIButton        *_closeBtn;
+    UIButton        *_showBtn;  // маленькая кнопка когда скрыто
 }
 
-- (instancetype)initWithBounds:(CGRect)wb {
-    self = [super initWithFrame:CGRectZero];
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(kMargin, 80.f, kMenuW, kMenuH)];
     if (!self) return nil;
 
     self.backgroundColor    = BG();
-    self.layer.borderColor  = Accent().CGColor;
-    self.layer.borderWidth  = kBorder;
-    self.layer.cornerRadius = 0;
+    self.layer.cornerRadius = 4.f;
+    self.layer.borderColor  = [UIColor colorWithWhite:.18f alpha:1.f].CGColor;
+    self.layer.borderWidth  = 1.f;
     self.clipsToBounds      = YES;
-    _expanded  = YES;
-    _activeTab = 0;
 
-    // ── левая колонка табов ───────────────────────────────────────────────────
-    NSArray *names = kTabs();
-    _tabs = [NSMutableArray new];
-    for (NSString *n in names) {
-        CrezTabBtn *t = [[CrezTabBtn alloc] initWithTitle:n];
-        NSInteger idx = [names indexOfObject:n];
-        __weak CrezBar *ws = self;
-        t.action = ^{ [ws _selectTab:idx]; };
-        [self addSubview:t];
-        [_tabs addObject:t];
-    }
-    ((CrezTabBtn *)_tabs[0]).active = YES;
+    [self _buildHeader];
+    [self _buildSidebar];
+    [self _buildContent];
 
-    // ── разделитель ───────────────────────────────────────────────────────────
-    _divider = [[UIView alloc] initWithFrame:CGRectZero];
-    _divider.backgroundColor = [UIColor colorWithWhite:1.f alpha:.1f];
-    [self addSubview:_divider];
-
-    // ── контент (правая часть) ────────────────────────────────────────────────
-    _content = [[UIView alloc] initWithFrame:CGRectZero];
-    _content.backgroundColor = [UIColor clearColor];
-    [self addSubview:_content];
-
-    _empty = [[UILabel alloc] initWithFrame:CGRectZero];
-    _empty.text          = @"— пусто —";
-    _empty.textColor     = [UIColor colorWithWhite:1.f alpha:.18f];
-    _empty.font          = [UIFont monospacedSystemFontOfSize:11.f weight:UIFontWeightRegular];
-    _empty.textAlignment = NSTextAlignmentCenter;
-    [_content addSubview:_empty];
-
-    // ── кнопка скрыть ─────────────────────────────────────────────────────────
-    _toggle = [[CrezToggleBtn alloc] initWithFrame:CGRectZero];
-    __weak CrezBar *ws = self;
-    _toggle.action = ^{ [ws _toggleVisibility]; };
-    [self addSubview:_toggle];
-
-    // drag
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
-    pan.maximumNumberOfTouches = 1;
     [self addGestureRecognizer:pan];
 
-    [self relayoutForBounds:wb];
     return self;
 }
 
-- (void)_selectTab:(NSInteger)idx {
-    _activeTab = idx;
-    for (NSInteger i = 0; i < (NSInteger)_tabs.count; i++)
-        ((CrezTabBtn *)_tabs[i]).active = (i == idx);
-    // здесь будет переключение контента
+// ── header ────────────────────────────────────────────────────────────────────
+- (void)_buildHeader {
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kMenuW, kHeaderH)];
+    header.backgroundColor = [UIColor colorWithRed:.08f green:.08f blue:.08f alpha:1.f];
+    [self addSubview:header];
+
+    // логотип / название
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14.f, 0, 180.f, kHeaderH)];
+    title.text      = @"⬡  CHEAT";
+    title.font      = [UIFont systemFontOfSize:15.f weight:UIFontWeightBold];
+    title.textColor = TextMain();
+    [header addSubview:title];
+
+    // кнопка закрыть
+    _closeBtn = [[UIButton alloc] initWithFrame:CGRectMake(kMenuW - 36.f, 0, 36.f, kHeaderH)];
+    [_closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    [_closeBtn setTitleColor:TextDim() forState:UIControlStateNormal];
+    _closeBtn.titleLabel.font = [UIFont systemFontOfSize:14.f];
+    [_closeBtn addTarget:self action:@selector(_toggleHide)
+        forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:_closeBtn];
+
+    // разделитель под header
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0, kHeaderH - 1.f, kMenuW, 1.f)];
+    div.backgroundColor = Divider();
+    [header addSubview:div];
 }
 
-// ── layout ────────────────────────────────────────────────────────────────────
-- (void)relayoutForBounds:(CGRect)wb {
-    CGFloat h  = MenuH();
-    CGFloat sw = wb.size.width - kMargin * 2.f;
-    _fullWidth  = MIN(sw, kMaxW);
-    CGFloat x  = kMargin + (sw - _fullWidth) * .5f;
-    CGFloat y  = (self.frame.size.height > 0) ? self.frame.origin.y : kMargin;
-    y = MAX(kMargin, MIN(y, wb.size.height - h - kMargin));
-    CGFloat curW = _expanded ? _fullWidth : kToggleW;
-    self.frame = CGRectMake(x, y, curW, h);
-    [self _applyLayout];
+// ── sidebar ───────────────────────────────────────────────────────────────────
+static NSArray *kCats(void) {
+    // {title, sfSymbol}
+    return @[
+        @[@"Aim",     @"scope"],
+        @[@"Visuals", @"eye"],
+    ];
 }
 
-- (void)_applyLayout {
-    CGFloat w = self.bounds.size.width;
-    CGFloat h = self.bounds.size.height;
-    NSInteger n = (NSInteger)_tabs.count;
+- (void)_buildSidebar {
+    UIView *sidebar = [[UIView alloc] initWithFrame:
+                       CGRectMake(0, kHeaderH, kSidebarW, kMenuH - kHeaderH)];
+    sidebar.backgroundColor = Sidebar();
+    [self addSubview:sidebar];
 
-    // ширина левой колонки = n * kTabW, но не больше 40% панели
-    CGFloat tabsAreaW = MIN(n * kTabW, w * .4f);
-    CGFloat tabW      = (n > 0) ? tabsAreaW / n : kTabW;
+    // вертикальный разделитель
+    UIView *div = [[UIView alloc] initWithFrame:
+                   CGRectMake(kSidebarW - 1.f, kHeaderH, 1.f, kMenuH - kHeaderH)];
+    div.backgroundColor = Divider();
+    [self addSubview:div];
 
-    for (NSInteger i = 0; i < n; i++) {
-        UIView *t = _tabs[i];
-        t.frame = CGRectMake(i * tabW, 0, tabW, h);
-        t.hidden = !_expanded;
+    NSArray *cats = kCats();
+    CGFloat itemH = 44.f;
+    _sideItems = [NSMutableArray new];
+
+    for (NSInteger i = 0; i < (NSInteger)cats.count; i++) {
+        NSArray *cat = cats[i];
+        CrezSideItem *item = [[CrezSideItem alloc] initWithTitle:cat[0] icon:cat[1]];
+        item.frame = CGRectMake(0, i * itemH, kSidebarW, itemH);
+        NSInteger idx = i;
+        __weak CrezMenu *ws = self;
+        item.action = ^{ [ws _selectCat:idx]; };
+        [sidebar addSubview:item];
+        [_sideItems addObject:item];
     }
-
-    _divider.frame  = CGRectMake(tabsAreaW, 0, kDividerW, h);
-    _divider.hidden = !_expanded;
-
-    CGFloat contentX = tabsAreaW + kDividerW;
-    CGFloat contentW = MAX(0, w - contentX - kToggleW);
-    _content.frame   = CGRectMake(contentX, 0, contentW, h);
-    _content.hidden  = !_expanded;
-    _empty.frame     = _content.bounds;
-
-    _toggle.frame    = CGRectMake(w - kToggleW, 0, kToggleW, h);
+    ((CrezSideItem *)_sideItems[0]).active = YES;
+    _activeIdx = 0;
 }
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    [self _applyLayout];
+// ── content ───────────────────────────────────────────────────────────────────
+- (void)_buildContent {
+    CGFloat cx = kSidebarW, cw = kMenuW - kSidebarW, ch = kMenuH - kHeaderH;
+    _contentArea = [[UIView alloc] initWithFrame:CGRectMake(cx, kHeaderH, cw, ch)];
+    _contentArea.backgroundColor = [UIColor clearColor];
+    [self addSubview:_contentArea];
+
+    _contentLabel = [[UILabel alloc] initWithFrame:_contentArea.bounds];
+    _contentLabel.text          = @"— пусто —";
+    _contentLabel.textAlignment = NSTextAlignmentCenter;
+    _contentLabel.font          = [UIFont monospacedSystemFontOfSize:12.f weight:UIFontWeightRegular];
+    _contentLabel.textColor     = [UIColor colorWithWhite:1.f alpha:.15f];
+    [_contentArea addSubview:_contentLabel];
+}
+
+- (void)_selectCat:(NSInteger)idx {
+    _activeIdx = idx;
+    for (NSInteger i = 0; i < (NSInteger)_sideItems.count; i++)
+        ((CrezSideItem *)_sideItems[i]).active = (i == idx);
+    // здесь будет подгрузка контента под каталог
 }
 
 // ── drag ──────────────────────────────────────────────────────────────────────
@@ -259,26 +239,36 @@ static UIColor *TextHot(void)  { return [UIColor whiteColor]; }
     }
 }
 
-// ── toggle ────────────────────────────────────────────────────────────────────
-- (void)_toggleVisibility {
-    _expanded = !_expanded;
-    _toggle.expanded = _expanded;
-
-    UIView *sv = self.superview;
-    CGFloat targetW = _expanded ? _fullWidth : kToggleW;
-    CGRect f = self.frame;
-    if (_expanded) {
-        CGFloat maxX = sv.bounds.size.width - targetW - kMargin;
-        f.origin.x = MAX(kMargin, MIN(f.origin.x, maxX));
+// ── hide / show ───────────────────────────────────────────────────────────────
+- (void)_toggleHide {
+    _hidden = !_hidden;
+    [UIView animateWithDuration:.2f animations:^{
+        self.alpha  = self->_hidden ? 0.f : 1.f;
+        self.transform = self->_hidden
+            ? CGAffineTransformMakeScale(.85f, .85f)
+            : CGAffineTransformIdentity;
+    }];
+    if (self.superview) {
+        UIView *sv = self.superview;
+        if (_hidden) {
+            // показываем маленькую кнопку открыть
+            if (!_showBtn) {
+                _showBtn = [[UIButton alloc] initWithFrame:CGRectMake(kMargin, 80.f, 36.f, 36.f)];
+                _showBtn.backgroundColor = Accent();
+                _showBtn.layer.cornerRadius = 4.f;
+                [_showBtn setTitle:@"⬡" forState:UIControlStateNormal];
+                [_showBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                _showBtn.titleLabel.font = [UIFont systemFontOfSize:16.f];
+                __weak CrezMenu *ws = self;
+                [_showBtn addTarget:ws action:@selector(_toggleHide)
+                   forControlEvents:UIControlEventTouchUpInside];
+            }
+            _showBtn.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, 36.f, 36.f);
+            [sv addSubview:_showBtn];
+        } else {
+            [_showBtn removeFromSuperview];
+        }
     }
-    f.size.width = targetW;
-
-    [UIView animateWithDuration:.2f delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut
-                     animations:^{
-        self.frame = f;
-        [self _applyLayout];
-    } completion:nil];
 }
 
 @end
@@ -295,24 +285,28 @@ static UIColor *TextHot(void)  { return [UIColor whiteColor]; }
     self.rootViewController.view.backgroundColor = [UIColor clearColor];
     self.hidden = NO;
 
-    _bar = [[CrezBar alloc] initWithBounds:UIScreen.mainScreen.bounds];
-    [self.rootViewController.view addSubview:_bar];
+    _menuView = [[CrezMenu alloc] init];
+    [self.rootViewController.view addSubview:_menuView];
 
     [[NSNotificationCenter defaultCenter]
         addObserver:self
-           selector:@selector(_orientationChanged)
+           selector:@selector(_rotate)
                name:UIApplicationDidChangeStatusBarOrientationNotification
              object:nil];
     return self;
 }
 
-- (void)_orientationChanged {
+- (void)_rotate {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(.15f * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         CGRect wb = UIScreen.mainScreen.bounds;
         self.frame = wb;
         self.rootViewController.view.frame = wb;
-        [self->_bar relayoutForBounds:wb];
+        // clamp позицию
+        CGRect mf = self->_menuView.frame;
+        mf.origin.x = MAX(kMargin, MIN(mf.origin.x, wb.size.width  - mf.size.width  - kMargin));
+        mf.origin.y = MAX(kMargin, MIN(mf.origin.y, wb.size.height - mf.size.height - kMargin));
+        self->_menuView.frame = mf;
     });
 }
 
