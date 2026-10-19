@@ -242,6 +242,6 @@ static void _spawnMenu() {
     });
 }
 
-%ctor {
+__attribute__((constructor)) static void _init() {
     _spawnMenu();
 }
