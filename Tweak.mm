@@ -25,7 +25,7 @@
 //   0xB0 → _chestBone (Transform)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// IL2CPP API — через dlsym, без dobby
+// IL2CPP API — dlsym, без сторонних зависимостей
 // ═══════════════════════════════════════════════════════════════════════════════
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
@@ -94,10 +94,10 @@ static void InitClasses(void) {
         void *camC  = fp_class_from_name(g_imgUnity, "UnityEngine", "Camera");
         void *compC = fp_class_from_name(g_imgUnity, "UnityEngine", "Component");
         void *trnC  = fp_class_from_name(g_imgUnity, "UnityEngine", "Transform");
-        if (camC)  { g_getMainM = fp_class_method_from_name(camC,  "get_main",          0);
-                     g_w2sM     = fp_class_method_from_name(camC,  "WorldToScreenPoint", 1); }
-        if (compC)   g_getTransM = fp_class_method_from_name(compC, "get_transform",     0);
-        if (trnC)    g_getPosM   = fp_class_method_from_name(trnC,  "get_position",      0);
+        if (camC)  { g_getMainM  = fp_class_method_from_name(camC,  "get_main",          0);
+                     g_w2sM      = fp_class_method_from_name(camC,  "WorldToScreenPoint", 1); }
+        if (compC)   g_getTransM = fp_class_method_from_name(compC, "get_transform",      0);
+        if (trnC)    g_getPosM   = fp_class_method_from_name(trnC,  "get_position",       0);
     }
     g_initDone = YES;
 }
@@ -144,7 +144,6 @@ static void UpdateESP(void) {
     void *list = RdPtr(sd, 0x8); if (!IsPtr(list)) return;
     void *arr  = RdPtr(list, 0x10); int32_t sz = *(int32_t*)((uint8_t*)list+0x18);
     if (!IsPtr(arr)||sz<=0||sz>200) return;
-
     int n = sz < MAX_ESP ? sz : MAX_ESP;
     for (int i = 0; i < n; i++) {
         void *culling = RdPtr(arr, 0x20+(size_t)i*8); if (!IsPtr(culling)) continue;
@@ -152,62 +151,59 @@ static void UpdateESP(void) {
         if (RdBool(ctrl, 0xA8)) continue;
         void *view = RdPtr(ctrl, 0x80);
         if (IsPtr(view) && RdBool(view, 0x60)) continue;
-
         Vec3 foot = GetPos(culling);
         if (foot.x==0&&foot.y==0&&foot.z==0) continue;
         Vec3 head = {foot.x, foot.y+1.8f, foot.z};
         CGPoint fs = W2S(foot); if (fs.x < 0) continue;
         CGPoint hs = W2S(head); if (hs.x < 0) continue;
-        g_esp[g_espCount++] = (ESPEntry){fs.x, fs.y, hs.x, hs.y, YES};
+        g_esp[g_espCount++] = (ESPEntry){fs.x,fs.y,hs.x,hs.y,YES};
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UI constants & color helper
+// UI helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 static inline UIColor *C(CGFloat r,CGFloat g,CGFloat b,CGFloat a){
     return [UIColor colorWithRed:r green:g blue:b alpha:a];
 }
-
 static const CGFloat kMenuW = 260.f;
-static const CGFloat kMenuH = 158.f;
+static const CGFloat kMenuH = 158.f;  // 42 header + 14 gap + 88 card + 14 gap
 static const CGFloat kHdr   = 42.f;
 static const CGFloat kR     = 12.f;
 static const NSTimeInterval kDur = 0.22;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ESPView
+// ESPView — визуал из doc2: зелёный бокс + красная шапка
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface ESPView : UIView @end
 @implementation ESPView
-- (instancetype)init {
+-(instancetype)init {
     self = [super initWithFrame:[UIScreen mainScreen].bounds];
     self.backgroundColor = [UIColor clearColor];
     self.userInteractionEnabled = NO;
     return self;
 }
-- (void)drawRect:(CGRect)r {
+-(void)drawRect:(CGRect)r {
     if (!g_espOn || g_espCount == 0) return;
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGContextRef ctx = UIGraphicsGetCurrentContext(); if (!ctx) return;
+
     for (int i = 0; i < g_espCount; i++) {
         ESPEntry *e = &g_esp[i]; if (!e->valid) continue;
-        CGFloat bh = e->fy - e->hy; if (bh < 8.f) bh = 8.f;
-        CGFloat bw = bh * 0.55f;
-        CGFloat cx = (e->fx + e->hx) * 0.5f;
-        CGRect  box = CGRectMake(cx - bw*.5f, e->hy, bw, bh);
-        // тень
-        CGContextSetRGBStrokeColor(ctx, 0,0,0, 0.70f);
-        CGContextSetLineWidth(ctx, 2.5f);
-        CGContextStrokeRect(ctx, CGRectInset(box,-0.5f,-0.5f));
+        CGFloat bh = e->fy - e->hy; if (bh < 4.f) continue;
+        CGFloat bw = bh * 0.45f;
+        CGFloat bx = ((e->fx + e->hx) * 0.5f) - bw * 0.5f;
+
         // зелёный бокс
-        CGContextSetRGBStrokeColor(ctx, 0.12f,0.95f,0.32f, 0.95f);
         CGContextSetLineWidth(ctx, 1.5f);
-        CGContextStrokeRect(ctx, box);
-        // синяя верхняя линия — акцент меню
-        CGContextSetRGBStrokeColor(ctx, 0.27f,0.52f,1.0f, 0.90f);
-        CGContextSetLineWidth(ctx, 2.0f);
-        CGContextMoveToPoint(ctx, cx - bw*.5f, e->hy);
-        CGContextAddLineToPoint(ctx, cx + bw*.5f, e->hy);
+        CGContextSetStrokeColorWithColor(ctx,
+            [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
+        CGContextStrokeRect(ctx, CGRectMake(bx, e->hy, bw, bh));
+
+        // красная линия — верх (шапка)
+        CGContextSetStrokeColorWithColor(ctx,
+            [UIColor colorWithRed:.9f green:.2f blue:.1f alpha:.9f].CGColor);
+        CGContextMoveToPoint(ctx, bx, e->hy);
+        CGContextAddLineToPoint(ctx, bx + bw, e->hy);
         CGContextStrokePath(ctx);
     }
 }
@@ -220,7 +216,7 @@ static const NSTimeInterval kDur = 0.22;
 @property (copy) dispatch_block_t action;
 @end
 @implementation PillButton { CGPoint _off; BOOL _moved; }
-- (instancetype)init {
+-(instancetype)init {
     self = [super initWithFrame:CGRectMake(20,120,44,28)];
     self.backgroundColor    = C(0.10f,0.10f,0.13f,0.92f);
     self.layer.cornerRadius = 14;
@@ -230,77 +226,57 @@ static const NSTimeInterval kDur = 0.22;
     l.text = @"☰"; l.textAlignment = NSTextAlignmentCenter;
     l.font = [UIFont systemFontOfSize:13]; l.textColor = C(0.75f,0.75f,0.80f,1);
     [self addSubview:l];
-    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
+    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(pan:)]];
     return self;
 }
-- (void)pan:(UIPanGestureRecognizer*)g {
-    CGPoint loc = [g locationInView:self.superview];
-    if (g.state==UIGestureRecognizerStateBegan){_moved=NO;_off=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);}
-    else if (g.state==UIGestureRecognizerStateChanged){_moved=YES;CGRect f=self.frame;f.origin=CGPointMake(loc.x-_off.x,loc.y-_off.y);self.frame=f;}
+-(void)pan:(UIPanGestureRecognizer*)g {
+    CGPoint loc=[g locationInView:self.superview];
+    if (g.state==UIGestureRecognizerStateBegan){
+        _moved=NO;
+        _off=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);
+    } else if (g.state==UIGestureRecognizerStateChanged){
+        _moved=YES;
+        CGRect f=self.frame; f.origin=CGPointMake(loc.x-_off.x,loc.y-_off.y); self.frame=f;
+    }
 }
-- (void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e { if (!_moved&&_action) _action(); }
-@end
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CrezToggle
-// ═══════════════════════════════════════════════════════════════════════════════
-@interface CrezToggle : UIControl
-@property (nonatomic,assign) BOOL on;
-@property (nonatomic,copy)   void (^onChange)(BOOL);
-@end
-@implementation CrezToggle { UIView *_track,*_thumb; }
-- (instancetype)init {
-    self = [super initWithFrame:CGRectMake(0,0,44,24)];
-    _track = [[UIView alloc] initWithFrame:self.bounds];
-    _track.layer.cornerRadius = 12.f;
-    _track.backgroundColor = C(0.25f,0.25f,0.30f,1);
-    [self addSubview:_track];
-    _thumb = [[UIView alloc] initWithFrame:CGRectMake(2,2,20,20)];
-    _thumb.layer.cornerRadius = 10.f;
-    _thumb.backgroundColor = [UIColor whiteColor];
-    [self addSubview:_thumb];
-    [self addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
-    return self;
-}
-- (void)_tap {
-    self.on = !self.on;
-    [UIView animateWithDuration:.18f animations:^{
-        self->_thumb.frame = self.on ? CGRectMake(22,2,20,20) : CGRectMake(2,2,20,20);
-        self->_track.backgroundColor = self.on ? C(0.27f,0.52f,1.00f,1) : C(0.25f,0.25f,0.30f,1);
-    }];
-    if (self.onChange) self.onChange(self.on);
-}
+-(void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e { if (!_moved&&_action) _action(); }
 @end
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MenuView
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface MenuView : UIView
-@property (strong) UIButton   *hideBtn;
-@property (strong) CrezToggle *espToggle;
-@property (strong) UILabel    *espStatus;
+@property (strong) UIButton *hideBtn;
+@property (strong) UISwitch *espSwitch;
+@property (strong) UILabel  *espStatus;
 @end
 @implementation MenuView { CGPoint _drag; }
-- (instancetype)initWithFrame:(CGRect)f {
+
+-(instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     self.backgroundColor    = C(0.07f,0.07f,0.09f,0.93f);
     self.layer.cornerRadius = kR;
     self.layer.masksToBounds = YES;
 
-    // header
+    // ── header ────────────────────────────────────────────────────────────────
     UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,kMenuW,kHdr)];
     hdr.backgroundColor = C(0.10f,0.10f,0.13f,1);
     [self addSubview:hdr];
+
     UIView *acc = [[UIView alloc] initWithFrame:CGRectMake(0,kHdr-1,kMenuW,1)];
     acc.backgroundColor = C(0.27f,0.52f,1.00f,0.55f);
     [self addSubview:acc];
+
     UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(0,(kHdr-17)*.5f,kMenuW,17)];
     ttl.text = @"☰  Cheat Menu";
     ttl.textAlignment = NSTextAlignmentCenter;
     ttl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     ttl.textColor = C(0.92f,0.92f,0.95f,1);
     [self addSubview:ttl];
-    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
+
+    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(pan:)]];
 
     self.hideBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.hideBtn.frame = CGRectMake(kMenuW-30,(kHdr-24)*.5f,24,24);
@@ -312,7 +288,7 @@ static const NSTimeInterval kDur = 0.22;
     [self.hideBtn setTitleColor:C(0.55f,0.55f,0.60f,1) forState:UIControlStateNormal];
     [self addSubview:self.hideBtn];
 
-    // card
+    // ── card ──────────────────────────────────────────────────────────────────
     CGFloat cw = kMenuW-24;
     UIView *card = [[UIView alloc] initWithFrame:CGRectMake(12,kHdr+14,cw,88)];
     card.backgroundColor = C(0.10f,0.10f,0.13f,1);
@@ -325,15 +301,17 @@ static const NSTimeInterval kDur = 0.22;
     sl.textColor = C(0.27f,0.52f,1.00f,1);
     [card addSubview:sl];
 
-    UILabel *espLbl = [[UILabel alloc] initWithFrame:CGRectMake(10,34,80,20)];
+    UILabel *espLbl = [[UILabel alloc] initWithFrame:CGRectMake(10,30,100,24)];
     espLbl.text = @"ESP";
-    espLbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    espLbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     espLbl.textColor = C(0.80f,0.80f,0.90f,1);
     [card addSubview:espLbl];
 
-    self.espToggle = [[CrezToggle alloc] init];
-    self.espToggle.frame = CGRectMake(cw-20-44,33,44,24);
-    [card addSubview:self.espToggle];
+    self.espSwitch = [[UISwitch alloc] init];
+    self.espSwitch.onTintColor = C(0.27f,0.52f,1.00f,1);
+    CGSize ssz = self.espSwitch.frame.size;
+    self.espSwitch.frame = CGRectMake(cw-10-ssz.width, (88-ssz.height)*.5f, ssz.width, ssz.height);
+    [card addSubview:self.espSwitch];
 
     self.espStatus = [[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
     self.espStatus.text = @"выключен";
@@ -341,17 +319,25 @@ static const NSTimeInterval kDur = 0.22;
     self.espStatus.textColor = C(0.35f,0.35f,0.40f,1);
     [card addSubview:self.espStatus];
 
+    // внешняя рамка
     CALayer *bdr = [CALayer layer];
     bdr.frame = CGRectMake(0,0,kMenuW,kMenuH);
     bdr.borderColor = C(0.22f,0.22f,0.28f,0.65f).CGColor;
     bdr.borderWidth = 1; bdr.cornerRadius = kR;
     [self.layer addSublayer:bdr];
+
     return self;
 }
-- (void)pan:(UIPanGestureRecognizer*)g {
+
+-(void)pan:(UIPanGestureRecognizer*)g {
     CGPoint loc=[g locationInView:self.superview];
-    if (g.state==UIGestureRecognizerStateBegan) _drag=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);
-    else if (g.state==UIGestureRecognizerStateChanged){CGRect r=self.frame;r.origin=CGPointMake(loc.x-_drag.x,loc.y-_drag.y);self.frame=r;}
+    if (g.state==UIGestureRecognizerStateBegan)
+        _drag=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);
+    else if (g.state==UIGestureRecognizerStateChanged){
+        CGRect r=self.frame;
+        r.origin=CGPointMake(loc.x-_drag.x,loc.y-_drag.y);
+        self.frame=r;
+    }
 }
 @end
 
@@ -360,7 +346,7 @@ static const NSTimeInterval kDur = 0.22;
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface PassthroughWindow : UIWindow @end
 @implementation PassthroughWindow
-- (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
+-(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
     UIView *v=[super hitTest:p withEvent:e];
     if (!v||v==self||v==self.rootViewController.view) return nil;
     if (!v.userInteractionEnabled) return nil;
@@ -370,7 +356,7 @@ static const NSTimeInterval kDur = 0.22;
 
 @interface PassthroughView : UIView @end
 @implementation PassthroughView
-- (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
+-(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
     UIView *v=[super hitTest:p withEvent:e]; return v==self?nil:v;
 }
 @end
@@ -402,15 +388,16 @@ static const NSTimeInterval kDur = 0.22;
                  : [[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     _win.windowLevel = UIWindowLevelAlert+200;
     _win.backgroundColor = [UIColor clearColor];
-    PassthroughView *pv = [[PassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    pv.backgroundColor = [UIColor clearColor];
+
+    PassthroughView *pv=[[PassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    pv.backgroundColor=[UIColor clearColor];
     UIViewController *vc=[UIViewController new]; vc.view=pv;
     _win.rootViewController=vc; _win.hidden=NO;
 
-    _espView = [ESPView new]; [pv addSubview:_espView];
+    _espView=[ESPView new]; [pv addSubview:_espView];
 
     CGSize sz=[UIScreen mainScreen].bounds.size;
-    _menu = [[MenuView alloc] initWithFrame:
+    _menu=[[MenuView alloc] initWithFrame:
         CGRectMake((sz.width-kMenuW)*.5f,(sz.height-kMenuH)*.5f,kMenuW,kMenuH)];
     [pv addSubview:_menu];
 
@@ -418,21 +405,23 @@ static const NSTimeInterval kDur = 0.22;
     _pill=[PillButton new]; _pill.action=^{[ws doShow];}; _pill.hidden=YES;
     [pv addSubview:_pill];
 
-    [_menu.hideBtn addTarget:self action:@selector(doHide) forControlEvents:UIControlEventTouchUpInside];
-
-    _menu.espToggle.onChange = ^(BOOL on) {
-        g_espOn = on;
-        if (on && !g_initDone) InitClasses();
-        __strong CheatController *ss = ws;
-        if (!ss) return;
-        ss->_menu.espStatus.text      = on ? @"активен"  : @"выключен";
-        ss->_menu.espStatus.textColor = on ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
-        if (!on) { g_espCount=0; [ss->_espView setNeedsDisplay]; }
-    };
+    [_menu.hideBtn addTarget:self action:@selector(doHide)
+          forControlEvents:UIControlEventTouchUpInside];
+    [_menu.espSwitch addTarget:self action:@selector(espChanged:)
+           forControlEvents:UIControlEventValueChanged];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     _dl.preferredFramesPerSecond=30;
     [_dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+-(void)espChanged:(UISwitch*)sw {
+    g_espOn = sw.isOn;
+    if (g_espOn && !g_initDone) InitClasses();
+    _menu.espStatus.text      = g_espOn ? @"активен"  : @"выключен";
+    _menu.espStatus.textColor = g_espOn
+        ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
+    if (!g_espOn) { g_espCount=0; [_espView setNeedsDisplay]; }
 }
 
 -(void)tick {
@@ -445,13 +434,15 @@ static const NSTimeInterval kDur = 0.22;
 -(void)doShow {
     _pill.hidden=YES; _menu.hidden=NO; _menu.alpha=0;
     _menu.transform=CGAffineTransformMakeScale(0.88f,0.88f);
-    [UIView animateWithDuration:kDur delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+    [UIView animateWithDuration:kDur delay:0
+          options:UIViewAnimationOptionCurveEaseOut animations:^{
         self->_menu.alpha=1; self->_menu.transform=CGAffineTransformIdentity;
     } completion:nil];
 }
 
 -(void)doHide {
-    [UIView animateWithDuration:kDur delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+    [UIView animateWithDuration:kDur delay:0
+          options:UIViewAnimationOptionCurveEaseIn animations:^{
         self->_menu.alpha=0; self->_menu.transform=CGAffineTransformMakeScale(0.94f,0.94f);
     } completion:^(BOOL _){
         self->_menu.hidden=YES; self->_menu.transform=CGAffineTransformIdentity;
