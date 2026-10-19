@@ -423,9 +423,11 @@ static const NSTimeInterval kDur = 0.22;
     _menu.espToggle.onChange = ^(BOOL on) {
         g_espOn = on;
         if (on && !g_initDone) InitClasses();
-        ws->_menu.espStatus.text      = on ? @"активен"  : @"выключен";
-        ws->_menu.espStatus.textColor = on ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
-        if (!on) { g_espCount=0; [ws->_espView setNeedsDisplay]; }
+        __strong CheatController *ss = ws;
+        if (!ss) return;
+        ss->_menu.espStatus.text      = on ? @"активен"  : @"выключен";
+        ss->_menu.espStatus.textColor = on ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
+        if (!on) { g_espCount=0; [ss->_espView setNeedsDisplay]; }
     };
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
