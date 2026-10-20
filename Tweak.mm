@@ -7,6 +7,7 @@
 #import <mach/mach.h>
 #import <stdint.h>
 #import <string.h>
+#import <libkern/OSCacheControl.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // OFFSETS — проверено по дампу CounterFlame
@@ -141,7 +142,7 @@ static BOOL WriteHook(void *dst, void *replacement, HookCtx *ctx) {
     memcpy(dst, patch, HOOK_SIZE);
 
     // сбрасываем i-cache
-    __builtin___clear_cache((char *)dst, (char *)dst + HOOK_SIZE);
+    sys_icache_invalidate(dst, HOOK_SIZE);
     mprotect((void *)page, 4096, PROT_READ|PROT_EXEC);
     return YES;
 }
@@ -363,7 +364,7 @@ static void InstallHook(void) {
     memcpy(t + HOOK_SIZE + 4, &br,  4);
     uintptr_t retAddr = (uintptr_t)shootAddr + HOOK_SIZE;
     memcpy(t + HOOK_SIZE + 8, &retAddr, 8);
-    __builtin___clear_cache((char *)tram, (char *)tram + HOOK_SIZE + 16);
+    sys_icache_invalidate(tram, HOOK_SIZE + 16);
     g_origShoot = (Shoot_t)tram;
 
     // патчим оригинал
@@ -376,7 +377,7 @@ static void InstallHook(void) {
     memcpy(patch + 4, &br,  4);
     memcpy(patch + 8, &repAddr, 8);
     memcpy(shootAddr, patch, HOOK_SIZE);
-    __builtin___clear_cache((char *)shootAddr, (char *)shootAddr + HOOK_SIZE);
+    sys_icache_invalidate(shootAddr, HOOK_SIZE);
     mprotect((void *)page, 4096, PROT_READ|PROT_EXEC);
 
     g_hookInstalled = YES;
