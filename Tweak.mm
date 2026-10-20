@@ -2,8 +2,11 @@
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <substrate.h>
 #import <math.h>
+#import <sys/mman.h>
+#import <mach/mach.h>
+#import <stdint.h>
+#import <string.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // OFFSETS — проверено по дампу CounterFlame
@@ -27,7 +30,7 @@
 //   0xB0 → _chestBone           (Transform)
 //
 // ArmsController (для silent aim):
-//   0x100 → _cameraTransform    (Transform) — источник направления луча
+//   0x100 → _cameraTransform    (Transform)
 //
 // ArmsController.Shoot  RVA 0x1277208
 // base: 0x112a70000  (из дампа)
@@ -72,7 +75,7 @@ typedef struct { float x,y,z,w; } Quat;
 // ═══════════════════════════════════════════════════════════════════════════════
 // memory helpers
 // ═══════════════════════════════════════════════════════════════════════════════
-static BOOL  IsPtr(const void *p) {
+static BOOL IsPtr(const void *p) {
     uintptr_t v = (uintptr_t)p;
     return v > 0x10000UL && v < 0x00FFFFFFFFFFFFFFULL;
 }
@@ -88,6 +91,62 @@ static BOOL RdBool(const void *b, size_t o) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// inline hook без Substrate — arm64 trampoline
+// ═══════════════════════════════════════════════════════════════════════════════
+// пишем абсолютный прыжок: LDR X16, #8 / BR X16 / <64-bit addr>  (16 байт)
+#define HOOK_SIZE 16
+
+typedef struct {
+    uint8_t  orig[HOOK_SIZE];
+    void    *target;        // адрес оригинальной функции
+    void    *trampoline;    // выделенная страница с оригинальными байтами + прыжком обратно
+} HookCtx;
+
+static BOOL WriteHook(void *dst, void *replacement, HookCtx *ctx) {
+    // сохраняем оригинал
+    memcpy(ctx->orig, dst, HOOK_SIZE);
+    ctx->target = dst;
+
+    // trampoline: скопируем первые HOOK_SIZE байт оригинала, потом прыжок на dst+HOOK_SIZE
+    // выделяем RWX страницу
+    void *tram = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (tram == MAP_FAILED) return NO;
+
+    uint8_t *t = (uint8_t *)tram;
+    memcpy(t, ctx->orig, HOOK_SIZE);
+    // LDR X16, #8
+    uint32_t ldr = 0x58000050; // LDR X16, pc+8
+    memcpy(t + HOOK_SIZE, &ldr, 4);
+    // BR X16
+    uint32_t br  = 0xD61F0200;
+    memcpy(t + HOOK_SIZE + 4, &br, 4);
+    // абсолютный адрес возврата
+    uintptr_t retAddr = (uintptr_t)dst + HOOK_SIZE;
+    memcpy(t + HOOK_SIZE + 8, &retAddr, 8);
+    ctx->trampoline = tram;
+
+    // патчим оригинал: снимаем защиту через mprotect
+    uintptr_t page   = (uintptr_t)dst & ~(uintptr_t)(4096-1);
+    mprotect((void *)page, 4096, PROT_READ|PROT_WRITE|PROT_EXEC);
+
+    uint8_t patch[HOOK_SIZE];
+    // LDR X16, #8
+    memcpy(patch, &ldr, 4);
+    // BR X16
+    memcpy(patch + 4, &br, 4);
+    // адрес replacement
+    uintptr_t repAddr = (uintptr_t)replacement;
+    memcpy(patch + 8, &repAddr, 8);
+    memcpy(dst, patch, HOOK_SIZE);
+
+    // сбрасываем i-cache
+    __builtin___clear_cache((char *)dst, (char *)dst + HOOK_SIZE);
+    mprotect((void *)page, 4096, PROT_READ|PROT_EXEC);
+    return YES;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Unity / IL2CPP инит
 // ═══════════════════════════════════════════════════════════════════════════════
 static void* g_imgCSharp  = NULL;
@@ -95,8 +154,8 @@ static void* g_imgUnity   = NULL;
 static void* g_pcullClass = NULL;
 static void* g_getTransM  = NULL;
 static void* g_getPosM    = NULL;
-static void* g_getForwM   = NULL;  // Transform.get_forward
-static void* g_setForwM   = NULL;  // Transform.set_forward
+static void* g_getForwM   = NULL;
+static void* g_setForwM   = NULL;
 static void* g_getMainM   = NULL;
 static void* g_w2sM       = NULL;
 static BOOL  g_initDone   = NO;
@@ -131,9 +190,9 @@ static void InitClasses(void) {
         if (compC)
             g_getTransM = fp_class_method_from_name(compC, "get_transform", 0);
         if (trnC) {
-            g_getPosM   = fp_class_method_from_name(trnC, "get_position", 0);
-            g_getForwM  = fp_class_method_from_name(trnC, "get_forward",  0);
-            g_setForwM  = fp_class_method_from_name(trnC, "set_forward",  1);
+            g_getPosM  = fp_class_method_from_name(trnC, "get_position", 0);
+            g_getForwM = fp_class_method_from_name(trnC, "get_forward",  0);
+            g_setForwM = fp_class_method_from_name(trnC, "set_forward",  1);
         }
     }
     g_initDone = (g_pcullClass != NULL && g_getTransM != NULL && g_getPosM != NULL);
@@ -150,8 +209,7 @@ static Vec3 GetPosFromTransform(void *tr) {
     if (!IsPtr(bp) || exc) return z;
     Vec3 *p = (Vec3 *)fp_object_unbox(bp);
     if (!p) return z;
-    Vec3 copy = *p;   // копируем до следующего GC
-    return copy;
+    return *p;
 }
 
 static CGPoint W2S(Vec3 wp) {
@@ -184,20 +242,12 @@ static inline Vec3  v3norm(Vec3 v) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SILENT AIM — состояние
+// SILENT AIM
 // ═══════════════════════════════════════════════════════════════════════════════
 static BOOL  g_aimOn   = NO;
-static int   g_aimBone = 0;     // 0=голова, 1=грудь
+static int   g_aimBone = 0;
 static float g_aimFov  = 60.f;
 
-// Целевой forward вектор для текущего кадра выстрела.
-// ArmsController.Shoot читает _cameraTransform.forward — мы его временно подменяем.
-static BOOL g_shootPatched    = NO;
-static Vec3 g_silentForward   = {0, 0, 1};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Выбор цели (FOV + ближайший к центру экрана)
-// ═══════════════════════════════════════════════════════════════════════════════
 static BOOL FindBestTarget(Vec3 *outWorld) {
     if (!IsPtr(g_pcullClass) || !fp_class_static_data) return NO;
 
@@ -207,9 +257,9 @@ static BOOL FindBestTarget(Vec3 *outWorld) {
     int32_t sz = *(int32_t *)((uint8_t *)list + 0x18);
     if (!IsPtr(arr) || sz <= 0 || sz > 200) return NO;
 
-    CGSize  scr  = [UIScreen mainScreen].bounds.size;
-    CGFloat cx   = scr.width  * 0.5f;
-    CGFloat cy   = scr.height * 0.5f;
+    CGSize  scr   = [UIScreen mainScreen].bounds.size;
+    CGFloat cx    = scr.width  * 0.5f;
+    CGFloat cy    = scr.height * 0.5f;
     CGFloat fovPx = (g_aimFov / 90.f) * (scr.height * 0.5f);
 
     Vec3    bestWorld = {0,0,0};
@@ -219,12 +269,9 @@ static BOOL FindBestTarget(Vec3 *outWorld) {
     for (int i = 0; i < sz && i < 200; i++) {
         void *culling = RdPtr(arr, 0x20 + (size_t)i * 8); if (!IsPtr(culling)) continue;
         void *ctrl    = RdPtr(culling, 0x18);              if (!IsPtr(ctrl))    continue;
-
-        if (RdBool(ctrl, 0xA8)) continue;   // _isDeath
-
+        if (RdBool(ctrl, 0xA8)) continue;
         void *view = RdPtr(ctrl, 0x80);
-        if (IsPtr(view) && RdBool(view, 0x60)) continue;   // IsMine
-
+        if (IsPtr(view) && RdBool(view, 0x60)) continue;
         void *animCtrl = RdPtr(culling, 0x28); if (!IsPtr(animCtrl)) continue;
         void *skel     = RdPtr(animCtrl, 0x68); if (!IsPtr(skel))    continue;
         void *bone     = RdPtr(skel, g_aimBone == 0 ? 0xA8 : 0xB0);
@@ -238,38 +285,33 @@ static BOOL FindBestTarget(Vec3 *outWorld) {
 
         CGFloat dx = sp.x - cx, dy = sp.y - cy;
         CGFloat d  = sqrtf(dx*dx + dy*dy);
-        if (d > fovPx) continue;
+        if (d > fovPx || d >= bestDist) continue;
 
-        if (d < bestDist) { bestDist = d; bestWorld = bonePos; found = YES; }
+        bestDist = d; bestWorld = bonePos; found = YES;
     }
-
     if (found) *outWorld = bestWorld;
     return found;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Silent aim hook — ArmsController.Shoot   RVA 0x1277208
-// Подменяем _cameraTransform.forward на вектор к цели перед оригиналом,
-// восстанавливаем сразу после. Камера визуально не двигается.
+// hook Shoot
 // ═══════════════════════════════════════════════════════════════════════════════
 typedef void (*Shoot_t)(void *self, void *methodInfo);
-static Shoot_t orig_Shoot = NULL;
+static Shoot_t  g_origShoot   = NULL;
+static HookCtx  g_shootCtx;
+static BOOL     g_hookInstalled = NO;
 
 static void hook_Shoot(void *self, void *methodInfo) {
     if (!g_aimOn || !g_initDone || !IsPtr(self)) {
-        orig_Shoot(self, methodInfo);
+        g_origShoot(self, methodInfo);
         return;
     }
-
-    // self = ArmsController instance
-    // _cameraTransform @ 0x100
     void *camTr = RdPtr(self, 0x100);
-    if (!IsPtr(camTr) || !g_getForwM || !g_setForwM || !fp_runtime_invoke || !fp_object_unbox) {
-        orig_Shoot(self, methodInfo);
+    if (!IsPtr(camTr) || !g_getForwM || !g_setForwM) {
+        g_origShoot(self, methodInfo);
         return;
     }
 
-    // сохраняем оригинальный forward
     void *exc = NULL;
     void *forwBox = fp_runtime_invoke(g_getForwM, camTr, NULL, &exc);
     Vec3 origForw = {0, 0, 1};
@@ -278,42 +320,29 @@ static void hook_Shoot(void *self, void *methodInfo) {
         if (fp_) origForw = *fp_;
     }
 
-    // получаем позицию камеры для вектора направления
     Vec3 camPos = GetPosFromTransform(camTr);
-
     Vec3 target;
-    BOOL found = FindBestTarget(&target);
-
-    if (found && (camPos.x != 0 || camPos.y != 0 || camPos.z != 0)) {
+    if (FindBestTarget(&target) && (camPos.x || camPos.y || camPos.z)) {
         Vec3 dir = v3norm(v3sub(target, camPos));
         exc = NULL;
-        void *setParams[1] = {&dir};
-        fp_runtime_invoke(g_setForwM, camTr, setParams, &exc);
+        void *sp[1] = {&dir};
+        fp_runtime_invoke(g_setForwM, camTr, sp, &exc);
     }
 
-    orig_Shoot(self, methodInfo);
+    g_origShoot(self, methodInfo);
 
-    // восстанавливаем forward
     exc = NULL;
-    void *restParams[1] = {&origForw};
-    fp_runtime_invoke(g_setForwM, camTr, restParams, &exc);
+    void *rp[1] = {&origForw};
+    fp_runtime_invoke(g_setForwM, camTr, rp, &exc);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Установка хука
-// ═══════════════════════════════════════════════════════════════════════════════
-static BOOL g_hookInstalled = NO;
 
 static void InstallHook(void) {
     if (g_hookInstalled) return;
-
-    // base = 0x112a70000 — из дампа
-    // RVA Shoot = 0x1277208
-    // FILL: если игра обновится — пересчитай RVA через strings/nm на новом бинарнике
+    // FILL: пересчитай RVA если игра обновилась — nm/otool на новом бинарнике
     uintptr_t base = 0;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "CounterFlame")) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "CounterFlame")) {
             base = (uintptr_t)_dyld_get_image_vmaddr_slide(i) + 0x100000000ULL;
             break;
         }
@@ -321,12 +350,40 @@ static void InstallHook(void) {
     if (!base) return;
 
     void *shootAddr = (void *)(base + 0x1277208);
-    MSHookFunction(shootAddr, (void *)hook_Shoot, (void **)&orig_Shoot);
+
+    // trampoline для orig_Shoot — вызывается из hook_Shoot
+    void *tram = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (tram == MAP_FAILED) return;
+
+    uint8_t *t = (uint8_t *)tram;
+    memcpy(t, shootAddr, HOOK_SIZE);
+    uint32_t ldr = 0x58000050, br = 0xD61F0200;
+    memcpy(t + HOOK_SIZE,     &ldr, 4);
+    memcpy(t + HOOK_SIZE + 4, &br,  4);
+    uintptr_t retAddr = (uintptr_t)shootAddr + HOOK_SIZE;
+    memcpy(t + HOOK_SIZE + 8, &retAddr, 8);
+    __builtin___clear_cache((char *)tram, (char *)tram + HOOK_SIZE + 16);
+    g_origShoot = (Shoot_t)tram;
+
+    // патчим оригинал
+    uintptr_t page = (uintptr_t)shootAddr & ~(uintptr_t)(4095);
+    mprotect((void *)page, 4096, PROT_READ|PROT_WRITE|PROT_EXEC);
+
+    uint8_t patch[HOOK_SIZE];
+    uintptr_t repAddr = (uintptr_t)hook_Shoot;
+    memcpy(patch,     &ldr, 4);
+    memcpy(patch + 4, &br,  4);
+    memcpy(patch + 8, &repAddr, 8);
+    memcpy(shootAddr, patch, HOOK_SIZE);
+    __builtin___clear_cache((char *)shootAddr, (char *)shootAddr + HOOK_SIZE);
+    mprotect((void *)page, 4096, PROT_READ|PROT_EXEC);
+
     g_hookInstalled = YES;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ESP state
+// ESP
 // ═══════════════════════════════════════════════════════════════════════════════
 #define MAX_ESP 64
 typedef struct { CGFloat fx, fy, hx, hy; BOOL valid; } ESPEntry;
@@ -348,13 +405,9 @@ static void UpdateESP(void) {
     for (int i = 0; i < n; i++) {
         void *culling = RdPtr(arr, 0x20 + (size_t)i * 8); if (!IsPtr(culling)) continue;
         void *ctrl    = RdPtr(culling, 0x18);              if (!IsPtr(ctrl))    continue;
-
         if (RdBool(ctrl, 0xA8)) continue;
-
         void *view = RdPtr(ctrl, 0x80);
         if (IsPtr(view) && RdBool(view, 0x60)) continue;
-
-        // берём transform самого компонента culling (позиция ног / корня)
         if (!fp_runtime_invoke || !g_getTransM || !fp_object_unbox) continue;
         void *exc = NULL;
         void *tr = fp_runtime_invoke(g_getTransM, culling, NULL, &exc);
@@ -401,7 +454,7 @@ static const NSTimeInterval kDur = 0.22;
     CGFloat radius = (g_aimFov / 90.f) * (scr.height * 0.5f);
     CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:1 green:1 blue:1 alpha:.25f].CGColor);
     CGContextSetLineWidth(ctx, 1.f);
-    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - radius, cy - radius, radius*2, radius*2));
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cx-radius, cy-radius, radius*2, radius*2));
 }
 @end
 
@@ -427,7 +480,6 @@ static const NSTimeInterval kDur = 0.22;
         CGContextSetLineWidth(ctx, 1.5f);
         CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
         CGContextStrokeRect(ctx, CGRectMake(bx, e->hy, bw, bh));
-        // красная линия по верху (голова)
         CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:.9f green:.2f blue:.1f alpha:.9f].CGColor);
         CGContextMoveToPoint(ctx, bx, e->hy);
         CGContextAddLineToPoint(ctx, bx + bw, e->hy);
@@ -437,7 +489,7 @@ static const NSTimeInterval kDur = 0.22;
 @end
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PillButton — перетаскиваемая кнопка открытия меню
+// PillButton
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface PillButton : UIView
 @property (copy) dispatch_block_t action;
@@ -495,7 +547,6 @@ static const NSTimeInterval kDur = 0.22;
     self.layer.cornerRadius = kR;
     self.layer.masksToBounds = YES;
 
-    // header
     UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kMenuW, kHdr)];
     hdr.backgroundColor = C(0.10f, 0.10f, 0.13f, 1);
     [self addSubview:hdr];
@@ -514,7 +565,7 @@ static const NSTimeInterval kDur = 0.22;
         initWithTarget:self action:@selector(pan:)]];
 
     self.hideBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.hideBtn.frame = CGRectMake(kMenuW - 30, (kHdr-24)*.5f, 24, 24);
+    self.hideBtn.frame = CGRectMake(kMenuW-30, (kHdr-24)*.5f, 24, 24);
     self.hideBtn.layer.cornerRadius = 12;
     self.hideBtn.layer.masksToBounds = YES;
     self.hideBtn.backgroundColor = C(0.17f, 0.17f, 0.21f, 1);
@@ -525,7 +576,6 @@ static const NSTimeInterval kDur = 0.22;
 
     CGFloat cw = kMenuW - 24;
 
-    // ── VISUALS card
     UIView *card1 = [[UIView alloc] initWithFrame:CGRectMake(12, kHdr+14, cw, 80)];
     card1.backgroundColor = C(0.10f, 0.10f, 0.13f, 1);
     card1.layer.cornerRadius = 8;
@@ -551,7 +601,6 @@ static const NSTimeInterval kDur = 0.22;
     self.espStatus.textColor = C(0.35f, 0.35f, 0.40f, 1);
     [card1 addSubview:self.espStatus];
 
-    // ── SILENT AIM card
     CGFloat aimY = kHdr + 14 + 80 + 10;
     UIView *card2 = [[UIView alloc] initWithFrame:CGRectMake(12, aimY, cw, 172)];
     card2.backgroundColor = C(0.10f, 0.10f, 0.13f, 1);
@@ -610,9 +659,8 @@ static const NSTimeInterval kDur = 0.22;
     self.fovSlider.maximumTrackTintColor = C(0.25f, 0.25f, 0.30f, 1);
     [card2 addSubview:self.fovSlider];
 
-    // рамка
     CALayer *bdr = [CALayer layer];
-    bdr.frame       = CGRectMake(0, 0, kMenuW, kMenuH);
+    bdr.frame = CGRectMake(0, 0, kMenuW, kMenuH);
     bdr.borderColor = C(0.22f, 0.22f, 0.28f, 0.65f).CGColor;
     bdr.borderWidth = 1; bdr.cornerRadius = kR;
     [self.layer addSublayer:bdr];
@@ -633,21 +681,12 @@ static const NSTimeInterval kDur = 0.22;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PassthroughWindow / PassthroughView
-//
-// Баг тача был здесь: hitTest возвращал nil только для самого окна/вью,
-// но не для промежуточных прозрачных вью — из-за этого тачи поглощались
-// на весь экран и игра их теряла.
-//
-// Фикс: рекурсивно проверяем субвью — nil только если ни одно
-// интерактивное субвью не попало в точку.
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface PassthroughWindow : UIWindow @end
 @implementation PassthroughWindow
 -(UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     UIView *v = [super hitTest:p withEvent:e];
-    // пропускаем если попали в само окно или в корневой вью — игра забирает тач
     if (!v || v == self || v == self.rootViewController.view) return nil;
-    // пропускаем non-interactive вью (ESPView, FOVCircleView)
     if (!v.userInteractionEnabled) return nil;
     return v;
 }
@@ -656,14 +695,12 @@ static const NSTimeInterval kDur = 0.22;
 @interface PassthroughView : UIView @end
 @implementation PassthroughView
 -(UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    // итерируем субвью от верхнего к нижнему
     for (UIView *sub in [[self subviews] reverseObjectEnumerator]) {
         if (sub.hidden || !sub.userInteractionEnabled || sub.alpha < 0.01f) continue;
-        CGPoint converted = [self convertPoint:p toView:sub];
-        UIView *hit = [sub hitTest:converted withEvent:e];
+        CGPoint cv = [self convertPoint:p toView:sub];
+        UIView *hit = [sub hitTest:cv withEvent:e];
         if (hit) return hit;
     }
-    // сам PassthroughView тач не берёт — проваливается в игру
     return nil;
 }
 @end
@@ -691,7 +728,6 @@ static const NSTimeInterval kDur = 0.22;
     dispatch_once(&once, ^{ inst = [CheatController new]; });
     return inst;
 }
-
 -(instancetype)init { self = [super init]; [self build]; return self; }
 
 -(void)build {
@@ -716,7 +752,7 @@ static const NSTimeInterval kDur = 0.22;
 
     CGSize sz = [UIScreen mainScreen].bounds.size;
     _menu = [[MenuView alloc] initWithFrame:
-        CGRectMake((sz.width - kMenuW) * 0.5f, (sz.height - kMenuH) * 0.5f, kMenuW, kMenuH)];
+        CGRectMake((sz.width-kMenuW)*.5f, (sz.height-kMenuH)*.5f, kMenuW, kMenuH)];
     [pv addSubview:_menu];
 
     __weak CheatController *ws = self;
@@ -725,11 +761,11 @@ static const NSTimeInterval kDur = 0.22;
     _pill.hidden = YES;
     [pv addSubview:_pill];
 
-    [_menu.hideBtn     addTarget:self action:@selector(doHide)        forControlEvents:UIControlEventTouchUpInside];
-    [_menu.espSwitch   addTarget:self action:@selector(espChanged:)   forControlEvents:UIControlEventValueChanged];
-    [_menu.aimSwitch   addTarget:self action:@selector(aimChanged:)   forControlEvents:UIControlEventValueChanged];
-    [_menu.fovSlider   addTarget:self action:@selector(fovChanged:)   forControlEvents:UIControlEventValueChanged];
-    [_menu.boneSegment addTarget:self action:@selector(boneChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.hideBtn     addTarget:self action:@selector(doHide)       forControlEvents:UIControlEventTouchUpInside];
+    [_menu.espSwitch   addTarget:self action:@selector(espChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.aimSwitch   addTarget:self action:@selector(aimChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.fovSlider   addTarget:self action:@selector(fovChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.boneSegment addTarget:self action:@selector(boneChanged:) forControlEvents:UIControlEventValueChanged];
 
     _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     _dl.preferredFramesPerSecond = 30;
@@ -740,51 +776,44 @@ static const NSTimeInterval kDur = 0.22;
     g_espOn = sw.isOn;
     if (g_espOn && !g_initDone) InitClasses();
     _menu.espStatus.text      = g_espOn ? @"активен"  : @"выключен";
-    _menu.espStatus.textColor = g_espOn ? C(0.35f, 0.70f, 0.40f, 1) : C(0.35f, 0.35f, 0.40f, 1);
+    _menu.espStatus.textColor = g_espOn ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
     if (!g_espOn) { g_espCount = 0; [_espView setNeedsDisplay]; }
 }
-
 -(void)aimChanged:(UISwitch *)sw {
     g_aimOn = sw.isOn;
     if (g_aimOn) {
-        if (!g_initDone) InitClasses();
+        if (!g_initDone)    InitClasses();
         if (!g_hookInstalled) InstallHook();
     }
     _menu.aimStatus.text      = g_aimOn ? @"активен"  : @"выключен";
-    _menu.aimStatus.textColor = g_aimOn ? C(0.70f, 0.40f, 0.20f, 1) : C(0.35f, 0.35f, 0.40f, 1);
+    _menu.aimStatus.textColor = g_aimOn ? C(0.70f,0.40f,0.20f,1) : C(0.35f,0.35f,0.40f,1);
     [_fovView setNeedsDisplay];
 }
-
 -(void)fovChanged:(UISlider *)sl {
     g_aimFov = sl.value;
     _menu.fovLabel.text = [NSString stringWithFormat:@"%.0f°", g_aimFov];
     if (g_aimOn) [_fovView setNeedsDisplay];
 }
-
 -(void)boneChanged:(UISegmentedControl *)seg {
     g_aimBone = (int)seg.selectedSegmentIndex;
 }
-
 -(void)tick {
     if (!g_initDone && (g_espOn || g_aimOn)) InitClasses();
     if (g_espOn) { UpdateESP(); [_espView setNeedsDisplay]; }
-    // silent aim работает через хук, tick ничего не крутит для аима
 }
-
 -(void)doShow {
     _pill.hidden = YES; _menu.hidden = NO; _menu.alpha = 0;
     _menu.transform = CGAffineTransformMakeScale(0.88f, 0.88f);
     [UIView animateWithDuration:kDur delay:0
-          options:UIViewAnimationOptionCurveEaseOut
+        options:UIViewAnimationOptionCurveEaseOut
         animations:^{
             self->_menu.alpha = 1;
             self->_menu.transform = CGAffineTransformIdentity;
         } completion:nil];
 }
-
 -(void)doHide {
     [UIView animateWithDuration:kDur delay:0
-          options:UIViewAnimationOptionCurveEaseIn
+        options:UIViewAnimationOptionCurveEaseIn
         animations:^{
             self->_menu.alpha = 0;
             self->_menu.transform = CGAffineTransformMakeScale(0.94f, 0.94f);
@@ -794,9 +823,7 @@ static const NSTimeInterval kDur = 0.22;
             self->_pill.hidden = NO;
         }];
 }
-
 -(void)show { [self doShow]; }
-
 @end
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -805,7 +832,7 @@ static const NSTimeInterval kDur = 0.22;
 __attribute__((constructor))
 static void Init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [[CheatController shared] show];
         });
