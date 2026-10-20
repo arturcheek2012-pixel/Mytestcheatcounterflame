@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 
@@ -9,19 +10,18 @@ static void*   (*fp_domain_get)(void);
 static void**  (*fp_domain_assemblies)(void*,size_t*);
 static void*   (*fp_assembly_image)(void*);
 static char*   (*fp_image_name)(void*);
-static void**  (*fp_image_classes)(void*,size_t*);
+static void*   (*fp_image_classes)(void*,size_t*);
 static char*   (*fp_class_name)(void*);
 static char*   (*fp_class_namespace)(void*);
-static void**  (*fp_class_methods)(void*,void**);
+static void*   (*fp_class_get_methods)(void*,void**);
 static char*   (*fp_method_name)(void*);
 static int     (*fp_method_param_count)(void*);
 static void*   (*fp_method_return_type)(void*);
 static char*   (*fp_type_name)(void*);
-static void**  (*fp_class_fields)(void*,void**);
+static void*   (*fp_class_get_fields)(void*,void**);
 static char*   (*fp_field_name)(void*);
 static int     (*fp_field_offset)(void*);
 static void*   (*fp_field_type)(void*);
-static void*   (*fp_class_static_data)(void*);
 
 static BOOL LoadDumpAPI(void) {
 #define R(p,s) p=(__typeof__(p))dlsym(RTLD_DEFAULT,s)
@@ -32,16 +32,15 @@ static BOOL LoadDumpAPI(void) {
     R(fp_image_classes,       "il2cpp_image_get_classes");
     R(fp_class_name,          "il2cpp_class_get_name");
     R(fp_class_namespace,     "il2cpp_class_get_namespace");
-    R(fp_class_methods,       "il2cpp_class_get_methods");
+    R(fp_class_get_methods,   "il2cpp_class_get_methods");
     R(fp_method_name,         "il2cpp_method_get_name");
     R(fp_method_param_count,  "il2cpp_method_get_param_count");
     R(fp_method_return_type,  "il2cpp_method_get_return_type");
     R(fp_type_name,           "il2cpp_type_get_name");
-    R(fp_class_fields,        "il2cpp_class_get_fields");
+    R(fp_class_get_fields,    "il2cpp_class_get_fields");
     R(fp_field_name,          "il2cpp_field_get_name");
     R(fp_field_offset,        "il2cpp_field_get_offset");
     R(fp_field_type,          "il2cpp_field_get_type");
-    R(fp_class_static_data,   "il2cpp_class_get_static_field_data");
 #undef R
     return fp_domain_get != NULL && fp_image_classes != NULL;
 }
@@ -49,13 +48,32 @@ static BOOL LoadDumpAPI(void) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // дампер
 // ═══════════════════════════════════════════════════════════════════════════════
+static void FlushToFile(NSString *path, NSMutableString *buf) {
+    if (!buf.length) return;
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[buf dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+    [buf setString:@""];
+}
+
 static void RunDump(void) {
     if (!LoadDumpAPI()) {
         NSLog(@"[DUMP] API not loaded");
         return;
     }
 
-    NSMutableString *out = [NSMutableString stringWithCapacity:1024*1024*4];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *path = [docs stringByAppendingPathComponent:@"dump.cs"];
+    // очищаем старый файл
+    [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+
+    NSMutableString *out = [NSMutableString stringWithCapacity:1024*512];
 
     void *domain = fp_domain_get();
     size_t asmCount = 0;
@@ -70,7 +88,7 @@ static void RunDump(void) {
         [out appendFormat:@"\n// Image: %s\n", imgName];
 
         size_t classCount = 0;
-        void **classes = fp_image_classes(img, &classCount);
+        void **classes = (void**)fp_image_classes(img, &classCount);
         if (!classes) continue;
 
         for (size_t ci = 0; ci < classCount; ci++) {
@@ -87,108 +105,69 @@ static void RunDump(void) {
                 [out appendFormat:@"\nclass %s {\n", name];
 
             // поля
-            if (fp_class_fields && fp_field_name && fp_field_offset && fp_field_type && fp_type_name) {
-                void *iter = NULL;
-                void *field = NULL;
-                // il2cpp_class_get_fields итерируется через void** iter
-                // используем fp_class_fields как итератор
-                void** (*iter_fields)(void*,void**) = (void**)fp_class_fields;
+            if (fp_class_get_fields && fp_field_name && fp_field_offset && fp_field_type && fp_type_name) {
                 void *it = NULL;
-                typedef void* (*FieldIter)(void*, void**);
-                FieldIter fi = (FieldIter)dlsym(RTLD_DEFAULT, "il2cpp_class_get_fields");
-                if (fi) {
-                    void *it2 = NULL;
-                    void *f;
-                    while ((f = fi(klass, &it2)) != NULL) {
-                        const char *fn = fp_field_name(f);
-                        int offset     = fp_field_offset(f);
-                        void *ft       = fp_field_type(f);
-                        const char *tn = ft ? fp_type_name(ft) : "?";
-                        if (fn)
-                            [out appendFormat:@"    // 0x%X\n    %s %s;\n",
-                                offset, tn ? tn : "?", fn];
-                    }
+                void *f;
+                while ((f = fp_class_get_fields(klass, &it)) != NULL) {
+                    const char *fn = fp_field_name(f);
+                    int offset     = fp_field_offset(f);
+                    void *ft       = fp_field_type(f);
+                    const char *tn = (ft && fp_type_name) ? fp_type_name(ft) : "?";
+                    if (fn)
+                        [out appendFormat:@"    // 0x%X\n    %s %s;\n",
+                            offset, tn ? tn : "?", fn];
                 }
             }
 
             // методы
-            if (fp_class_methods && fp_method_name) {
-                typedef void* (*MethodIter)(void*, void**);
-                MethodIter mi = (MethodIter)dlsym(RTLD_DEFAULT, "il2cpp_class_get_methods");
-                if (mi) {
-                    void *it2 = NULL;
-                    void *m;
-                    while ((m = mi(klass, &it2)) != NULL) {
-                        const char *mn = fp_method_name(m);
-                        int pc = fp_method_param_count ? fp_method_param_count(m) : -1;
-                        const char *rt = "void";
-                        if (fp_method_return_type && fp_type_name) {
-                            void *rtype = fp_method_return_type(m);
-                            if (rtype) rt = fp_type_name(rtype) ?: "void";
-                        }
-                        if (mn)
-                            [out appendFormat:@"    %s %s(); // params: %d\n", rt, mn, pc];
+            if (fp_class_get_methods && fp_method_name) {
+                void *it = NULL;
+                void *m;
+                while ((m = fp_class_get_methods(klass, &it)) != NULL) {
+                    const char *mn = fp_method_name(m);
+                    int pc = fp_method_param_count ? fp_method_param_count(m) : -1;
+                    const char *rt = "void";
+                    if (fp_method_return_type && fp_type_name) {
+                        void *rtype = fp_method_return_type(m);
+                        if (rtype) rt = fp_type_name(rtype) ?: "void";
                     }
+                    if (mn)
+                        [out appendFormat:@"    %s %s(); // params: %d\n", rt, mn, pc];
                 }
             }
 
             [out appendString:@"}\n"];
 
-            // сбрасываем каждые 500 классов чтобы не жрать память
-            if (ci % 500 == 0 && ci > 0) {
-                NSString *docs = NSSearchPathForDirectoriesInDomains(
-                    NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                NSString *path = [docs stringByAppendingPathComponent:@"dump.cs"];
-                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-                if (!fh) {
-                    [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
-                    fh = [NSFileHandle fileHandleForWritingAtPath:path];
-                }
-                [fh seekToEndOfFile];
-                [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
-                [fh closeFile];
-                [out setString:@""];
-            }
+            if (ci % 300 == 0 && ci > 0)
+                FlushToFile(path, out);
         }
     }
 
-    // финальный сброс
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *path = [docs stringByAppendingPathComponent:@"dump.cs"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    }
-    [fh seekToEndOfFile];
-    [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh closeFile];
-
+    FlushToFile(path, out);
     NSLog(@"[DUMP] saved to %@", path);
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"Dump done"
-            message:[NSString stringWithFormat:@"Сохранено:\n%@", path]
-            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *root = [UIApplication sharedApplication]
-            .connectedScenes.allObjects.firstObject;
-        // ищем topVC
         UIWindowScene *ws = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
             if ([s isKindOfClass:[UIWindowScene class]]) { ws=(UIWindowScene*)s; break; }
         UIViewController *vc = ws.windows.firstObject.rootViewController;
         while (vc.presentedViewController) vc = vc.presentedViewController;
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"Dump готов"
+            message:[NSString stringWithFormat:@"%@", path]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK"
+            style:UIAlertActionStyleDefault handler:nil]];
         [vc presentViewController:a animated:YES completion:nil];
     });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// кнопка дампа — висит поверх всего
+// кнопка дампа
 // ═══════════════════════════════════════════════════════════════════════════════
-@interface DumpButton : UIView @end
+@interface DumpButton : UIView
+@property (strong) UIWindow *keepWin;
+@end
 @implementation DumpButton { CGPoint _off; BOOL _moved; BOOL _dumping; }
 -(instancetype)init {
     self=[super initWithFrame:CGRectMake(20,200,80,36)];
@@ -265,9 +244,8 @@ static void Init(void) {
             win.rootViewController=vc;
             win.hidden=NO;
             DumpButton *btn=[DumpButton new];
+            btn.keepWin=win;
             [vc.view addSubview:btn];
-            // держим win живым
-            objc_setAssociatedObject(btn, "win", win, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         });
     });
 }
