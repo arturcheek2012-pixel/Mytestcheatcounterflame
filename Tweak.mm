@@ -46,32 +46,44 @@ static BOOL LoadDumpAPI(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// дампер
+// дампер — пишет в tmp, потом share sheet
 // ═══════════════════════════════════════════════════════════════════════════════
 static void FlushToFile(NSString *path, NSMutableString *buf) {
     if (!buf.length) return;
+    NSData *data = [buf dataUsingEncoding:NSUTF8StringEncoding];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) {
-        [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
         fh = [NSFileHandle fileHandleForWritingAtPath:path];
     }
     [fh seekToEndOfFile];
-    [fh writeData:[buf dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh writeData:data];
     [fh closeFile];
     [buf setString:@""];
 }
 
 static void RunDump(void) {
     if (!LoadDumpAPI()) {
-        NSLog(@"[DUMP] API not loaded");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindowScene *ws=nil;
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
+                if ([s isKindOfClass:[UIWindowScene class]]){ws=(UIWindowScene*)s;break;}
+            UIViewController *vc=ws.windows.firstObject.rootViewController;
+            while (vc.presentedViewController) vc=vc.presentedViewController;
+            UIAlertController *a=[UIAlertController
+                alertControllerWithTitle:@"Ошибка"
+                message:@"il2cpp API не найден"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [vc presentViewController:a animated:YES completion:nil];
+        });
         return;
     }
 
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *path = [docs stringByAppendingPathComponent:@"dump.cs"];
-    // очищаем старый файл
-    [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    // пишем в tmp — доступно в любом sandbox включая LiveContainer
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"dump.cs"];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
 
     NSMutableString *out = [NSMutableString stringWithCapacity:1024*512];
 
@@ -105,13 +117,13 @@ static void RunDump(void) {
                 [out appendFormat:@"\nclass %s {\n", name];
 
             // поля
-            if (fp_class_get_fields && fp_field_name && fp_field_offset && fp_field_type && fp_type_name) {
+            if (fp_class_get_fields) {
                 void *it = NULL;
                 void *f;
                 while ((f = fp_class_get_fields(klass, &it)) != NULL) {
-                    const char *fn = fp_field_name(f);
-                    int offset     = fp_field_offset(f);
-                    void *ft       = fp_field_type(f);
+                    const char *fn = fp_field_name ? fp_field_name(f) : NULL;
+                    int offset     = fp_field_offset ? fp_field_offset(f) : 0;
+                    void *ft       = fp_field_type ? fp_field_type(f) : NULL;
                     const char *tn = (ft && fp_type_name) ? fp_type_name(ft) : "?";
                     if (fn)
                         [out appendFormat:@"    // 0x%X\n    %s %s;\n",
@@ -120,11 +132,11 @@ static void RunDump(void) {
             }
 
             // методы
-            if (fp_class_get_methods && fp_method_name) {
+            if (fp_class_get_methods) {
                 void *it = NULL;
                 void *m;
                 while ((m = fp_class_get_methods(klass, &it)) != NULL) {
-                    const char *mn = fp_method_name(m);
+                    const char *mn = fp_method_name ? fp_method_name(m) : NULL;
                     int pc = fp_method_param_count ? fp_method_param_count(m) : -1;
                     const char *rt = "void";
                     if (fp_method_return_type && fp_type_name) {
@@ -146,19 +158,24 @@ static void RunDump(void) {
     FlushToFile(path, out);
     NSLog(@"[DUMP] saved to %@", path);
 
+    // share sheet — работает в LiveContainer, сохраняем в Files
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindowScene *ws = nil;
+        NSURL *url = [NSURL fileURLWithPath:path];
+        UIActivityViewController *av = [[UIActivityViewController alloc]
+            initWithActivityItems:@[url] applicationActivities:nil];
+
+        UIWindowScene *ws=nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
-            if ([s isKindOfClass:[UIWindowScene class]]) { ws=(UIWindowScene*)s; break; }
-        UIViewController *vc = ws.windows.firstObject.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"Dump готов"
-            message:[NSString stringWithFormat:@"%@", path]
-            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK"
-            style:UIAlertActionStyleDefault handler:nil]];
-        [vc presentViewController:a animated:YES completion:nil];
+            if ([s isKindOfClass:[UIWindowScene class]]){ws=(UIWindowScene*)s;break;}
+        UIViewController *vc=ws.windows.firstObject.rootViewController;
+        while (vc.presentedViewController) vc=vc.presentedViewController;
+
+        // iPad popover
+        av.popoverPresentationController.sourceView = vc.view;
+        av.popoverPresentationController.sourceRect =
+            CGRectMake(vc.view.bounds.size.width/2, vc.view.bounds.size.height/2, 1, 1);
+
+        [vc presentViewController:av animated:YES completion:nil];
     });
 }
 
