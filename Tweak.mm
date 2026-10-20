@@ -25,7 +25,7 @@
 //   0xB0 → _chestBone (Transform)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// IL2CPP API — dlsym, без сторонних зависимостей
+// IL2CPP API
 // ═══════════════════════════════════════════════════════════════════════════════
 static void*    (*fp_domain_get)(void);
 static void**   (*fp_domain_assemblies)(void*,size_t*);
@@ -56,10 +56,14 @@ static BOOL LoadAPI(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// types
+// ═══════════════════════════════════════════════════════════════════════════════
+typedef struct { float x,y,z;   } Vec3;
+typedef struct { float x,y,z,w; } Quat;
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // memory helpers
 // ═══════════════════════════════════════════════════════════════════════════════
-typedef struct { float x,y,z; } Vec3;
-
 static BOOL  IsPtr(const void*p){ uintptr_t v=(uintptr_t)p; return v>0x10000UL&&v<0x00FFFFFFFFFFFFFFULL; }
 static void* RdPtr(const void*b,size_t o){ if(!IsPtr(b))return NULL; void**a=(void**)((const uint8_t*)b+o); if(!IsPtr(a))return NULL; return *a; }
 static BOOL  RdBool(const void*b,size_t o){ if(!IsPtr(b))return NO; return *(bool*)((const uint8_t*)b+o); }
@@ -74,6 +78,8 @@ static void* g_getTransM  = NULL;
 static void* g_getPosM    = NULL;
 static void* g_getMainM   = NULL;
 static void* g_w2sM       = NULL;
+static void* g_setRotM    = NULL;
+static void* g_lookRotM   = NULL;
 static BOOL  g_initDone   = NO;
 
 static void InitClasses(void) {
@@ -94,38 +100,149 @@ static void InitClasses(void) {
         void *camC  = fp_class_from_name(g_imgUnity, "UnityEngine", "Camera");
         void *compC = fp_class_from_name(g_imgUnity, "UnityEngine", "Component");
         void *trnC  = fp_class_from_name(g_imgUnity, "UnityEngine", "Transform");
-        if (camC)  { g_getMainM  = fp_class_method_from_name(camC,  "get_main",          0);
-                     g_w2sM      = fp_class_method_from_name(camC,  "WorldToScreenPoint", 1); }
-        if (compC)   g_getTransM = fp_class_method_from_name(compC, "get_transform",      0);
-        if (trnC)    g_getPosM   = fp_class_method_from_name(trnC,  "get_position",       0);
+        void *quatC = fp_class_from_name(g_imgUnity, "UnityEngine", "Quaternion");
+        if (camC) {
+            g_getMainM = fp_class_method_from_name(camC, "get_main",           0);
+            g_w2sM     = fp_class_method_from_name(camC, "WorldToScreenPoint", 1);
+        }
+        if (compC)
+            g_getTransM = fp_class_method_from_name(compC, "get_transform", 0);
+        if (trnC) {
+            g_getPosM = fp_class_method_from_name(trnC, "get_position", 0);
+            g_setRotM = fp_class_method_from_name(trnC, "set_rotation", 1);
+        }
+        // LookRotation(Vector3 forward, Vector3 upwards) — 2 параметра, всегда есть
+        if (quatC)
+            g_lookRotM = fp_class_method_from_name(quatC, "LookRotation", 2);
     }
     g_initDone = YES;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GetPos / W2S
+// GetPos / GetPosFromTransform / W2S
 // ═══════════════════════════════════════════════════════════════════════════════
 static Vec3 GetPos(void *obj) {
-    Vec3 z = {0,0,0};
+    Vec3 z={0,0,0};
     if (!IsPtr(obj)||!fp_runtime_invoke||!g_getTransM||!g_getPosM) return z;
-    void *exc = NULL;
-    void *tr = fp_runtime_invoke(g_getTransM, obj, NULL, &exc); if (!IsPtr(tr)||exc) return z;
-    exc = NULL;
-    void *bp = fp_runtime_invoke(g_getPosM, tr, NULL, &exc); if (!IsPtr(bp)||exc||!fp_object_unbox) return z;
-    Vec3 *p = (Vec3*)fp_object_unbox(bp); return p ? *p : z;
+    void *exc=NULL;
+    void *tr=fp_runtime_invoke(g_getTransM,obj,NULL,&exc); if (!IsPtr(tr)||exc) return z;
+    exc=NULL;
+    void *bp=fp_runtime_invoke(g_getPosM,tr,NULL,&exc); if (!IsPtr(bp)||exc||!fp_object_unbox) return z;
+    Vec3 *p=(Vec3*)fp_object_unbox(bp); return p?*p:z;
+}
+
+static Vec3 GetPosFromTransform(void *tr) {
+    Vec3 z={0,0,0};
+    if (!IsPtr(tr)||!fp_runtime_invoke||!g_getPosM||!fp_object_unbox) return z;
+    void *exc=NULL;
+    void *bp=fp_runtime_invoke(g_getPosM,tr,NULL,&exc);
+    if (!IsPtr(bp)||exc) return z;
+    Vec3 *p=(Vec3*)fp_object_unbox(bp); return p?*p:z;
 }
 
 static CGPoint W2S(Vec3 wp) {
-    const CGPoint bad = {-1,-1};
+    const CGPoint bad={-1,-1};
     if (!fp_runtime_invoke||!g_getMainM||!g_w2sM||!fp_object_unbox) return bad;
-    void *exc = NULL;
-    void *cam = fp_runtime_invoke(g_getMainM, NULL, NULL, &exc); if (!IsPtr(cam)||exc) return bad;
-    void *params[1] = {&wp}; exc = NULL;
-    void *br = fp_runtime_invoke(g_w2sM, cam, params, &exc); if (!IsPtr(br)||exc) return bad;
-    Vec3 *sv = (Vec3*)fp_object_unbox(br); if (!sv||sv->z<=0.0f) return bad;
-    CGFloat sc = [UIScreen mainScreen].scale;
-    CGFloat uH = [UIScreen mainScreen].bounds.size.height;
-    return CGPointMake(sv->x/sc, uH - sv->y/sc);
+    void *exc=NULL;
+    void *cam=fp_runtime_invoke(g_getMainM,NULL,NULL,&exc); if (!IsPtr(cam)||exc) return bad;
+    void *params[1]={&wp}; exc=NULL;
+    void *br=fp_runtime_invoke(g_w2sM,cam,params,&exc); if (!IsPtr(br)||exc) return bad;
+    Vec3 *sv=(Vec3*)fp_object_unbox(br); if (!sv||sv->z<=0.0f) return bad;
+    CGFloat sc=[UIScreen mainScreen].scale;
+    CGFloat uH=[UIScreen mainScreen].bounds.size.height;
+    return CGPointMake(sv->x/sc, uH-sv->y/sc);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AIM
+// ═══════════════════════════════════════════════════════════════════════════════
+static BOOL  g_aimOn   = NO;
+static int   g_aimBone = 0;
+static float g_aimFov  = 60.f;
+
+static inline Vec3  v3sub(Vec3 a,Vec3 b){ return (Vec3){a.x-b.x,a.y-b.y,a.z-b.z}; }
+static inline float v3dot(Vec3 a,Vec3 b){ return a.x*b.x+a.y*b.y+a.z*b.z; }
+static inline float v3len(Vec3 v){ return sqrtf(v3dot(v,v)); }
+static inline Vec3  v3norm(Vec3 v){ float l=v3len(v); return l>1e-6f?(Vec3){v.x/l,v.y/l,v.z/l}:(Vec3){0,0,1}; }
+
+static void AimTick(void) {
+    if (!g_aimOn||!g_initDone) return;
+    if (!fp_runtime_invoke||!g_getMainM||!g_getTransM||!g_getPosM||!g_setRotM||!g_lookRotM) return;
+    if (!IsPtr(g_pcullClass)||!fp_class_static_data) return;
+
+    void *exc=NULL;
+    void *cam=fp_runtime_invoke(g_getMainM,NULL,NULL,&exc);
+    if (!IsPtr(cam)||exc) return;
+    exc=NULL;
+    void *camTr=fp_runtime_invoke(g_getTransM,cam,NULL,&exc);
+    if (!IsPtr(camTr)||exc) return;
+    exc=NULL;
+    void *camPosBox=fp_runtime_invoke(g_getPosM,camTr,NULL,&exc);
+    if (!IsPtr(camPosBox)||exc||!fp_object_unbox) return;
+    Vec3 *cp=(Vec3*)fp_object_unbox(camPosBox);
+    if (!cp) return;
+    Vec3 camPos=*cp;
+
+    CGSize  scr =[UIScreen mainScreen].bounds.size;
+    CGFloat cx  =scr.width*.5f, cy=scr.height*.5f;
+    CGFloat fovPx=(g_aimFov/90.f)*(scr.height*.5f);
+
+    void *sd  =fp_class_static_data(g_pcullClass); if (!IsPtr(sd))   return;
+    void *list=RdPtr(sd,0x8);                       if (!IsPtr(list)) return;
+    void *arr =RdPtr(list,0x10);
+    int32_t sz=*(int32_t*)((uint8_t*)list+0x18);
+    if (!IsPtr(arr)||sz<=0||sz>200) return;
+
+    Vec3    bestWorld={0,0,0};
+    CGFloat bestDist =1e9f;
+    BOOL    found    =NO;
+
+    for (int i=0;i<sz&&i<200;i++) {
+        void *culling=RdPtr(arr,0x20+(size_t)i*8); if (!IsPtr(culling)) continue;
+        void *ctrl   =RdPtr(culling,0x18);          if (!IsPtr(ctrl))    continue;
+        if (RdBool(ctrl,0xA8)) continue;
+        void *view=RdPtr(ctrl,0x80);
+        if (IsPtr(view)&&RdBool(view,0x60)) continue;
+
+        void *animCtrl=RdPtr(culling,0x28); if (!IsPtr(animCtrl)) continue;
+        void *skel    =RdPtr(animCtrl,0x68); if (!IsPtr(skel))    continue;
+        void *bone    =RdPtr(skel, g_aimBone==0 ? 0xA8 : 0xB0);
+        if (!IsPtr(bone)) continue;
+
+        Vec3 bonePos=GetPosFromTransform(bone);
+        if (bonePos.x==0&&bonePos.y==0&&bonePos.z==0) continue;
+
+        CGPoint sp=W2S(bonePos);
+        if (sp.x<0) continue;
+
+        CGFloat dx=sp.x-cx, dy=sp.y-cy;
+        CGFloat screenDist=sqrtf(dx*dx+dy*dy);
+        if (screenDist>fovPx) continue;
+
+        if (screenDist<bestDist) {
+            bestDist =screenDist;
+            bestWorld=bonePos;
+            found    =YES;
+        }
+    }
+
+    if (!found) return;
+
+    Vec3 dir={(Vec3)v3norm(v3sub(bestWorld,camPos))};
+    dir = v3norm(v3sub(bestWorld, camPos));
+
+    // LookRotation(forward, up) — 2 параметра
+    Vec3 up={0,1,0};
+    void *rotParams[2]={&dir,&up};
+    exc=NULL;
+    void *qBox=fp_runtime_invoke(g_lookRotM,NULL,rotParams,&exc);
+    if (!IsPtr(qBox)||exc||!fp_object_unbox) return;
+    Quat *q=(Quat*)fp_object_unbox(qBox);
+    if (!q) return;
+
+    void *setParams[1]={q};
+    exc=NULL;
+    fp_runtime_invoke(g_setRotM,camTr,setParams,&exc);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -134,29 +251,30 @@ static CGPoint W2S(Vec3 wp) {
 #define MAX_ESP 64
 typedef struct { CGFloat fx,fy,hx,hy; BOOL valid; } ESPEntry;
 static ESPEntry g_esp[MAX_ESP];
-static int      g_espCount = 0;
-static BOOL     g_espOn    = NO;
+static int      g_espCount=0;
+static BOOL     g_espOn   =NO;
 
 static void UpdateESP(void) {
-    g_espCount = 0;
+    g_espCount=0;
     if (!g_espOn||!IsPtr(g_pcullClass)||!fp_class_static_data) return;
-    void *sd   = fp_class_static_data(g_pcullClass); if (!IsPtr(sd)) return;
-    void *list = RdPtr(sd, 0x8); if (!IsPtr(list)) return;
-    void *arr  = RdPtr(list, 0x10); int32_t sz = *(int32_t*)((uint8_t*)list+0x18);
+    void *sd  =fp_class_static_data(g_pcullClass); if (!IsPtr(sd))   return;
+    void *list=RdPtr(sd,0x8);                       if (!IsPtr(list)) return;
+    void *arr =RdPtr(list,0x10);
+    int32_t sz=*(int32_t*)((uint8_t*)list+0x18);
     if (!IsPtr(arr)||sz<=0||sz>200) return;
-    int n = sz < MAX_ESP ? sz : MAX_ESP;
-    for (int i = 0; i < n; i++) {
-        void *culling = RdPtr(arr, 0x20+(size_t)i*8); if (!IsPtr(culling)) continue;
-        void *ctrl    = RdPtr(culling, 0x18);          if (!IsPtr(ctrl))    continue;
-        if (RdBool(ctrl, 0xA8)) continue;
-        void *view = RdPtr(ctrl, 0x80);
-        if (IsPtr(view) && RdBool(view, 0x60)) continue;
-        Vec3 foot = GetPos(culling);
+    int n=sz<MAX_ESP?sz:MAX_ESP;
+    for (int i=0;i<n;i++) {
+        void *culling=RdPtr(arr,0x20+(size_t)i*8); if (!IsPtr(culling)) continue;
+        void *ctrl   =RdPtr(culling,0x18);          if (!IsPtr(ctrl))    continue;
+        if (RdBool(ctrl,0xA8)) continue;
+        void *view=RdPtr(ctrl,0x80);
+        if (IsPtr(view)&&RdBool(view,0x60)) continue;
+        Vec3 foot=GetPos(culling);
         if (foot.x==0&&foot.y==0&&foot.z==0) continue;
-        Vec3 head = {foot.x, foot.y+1.8f, foot.z};
-        CGPoint fs = W2S(foot); if (fs.x < 0) continue;
-        CGPoint hs = W2S(head); if (hs.x < 0) continue;
-        g_esp[g_espCount++] = (ESPEntry){fs.x,fs.y,hs.x,hs.y,YES};
+        Vec3 head={foot.x,foot.y+1.8f,foot.z};
+        CGPoint fs=W2S(foot); if (fs.x<0) continue;
+        CGPoint hs=W2S(head); if (hs.x<0) continue;
+        g_esp[g_espCount++]=(ESPEntry){fs.x,fs.y,hs.x,hs.y,YES};
     }
 }
 
@@ -166,44 +284,60 @@ static void UpdateESP(void) {
 static inline UIColor *C(CGFloat r,CGFloat g,CGFloat b,CGFloat a){
     return [UIColor colorWithRed:r green:g blue:b alpha:a];
 }
-static const CGFloat kMenuW = 260.f;
-static const CGFloat kMenuH = 158.f;  // 42 header + 14 gap + 88 card + 14 gap
-static const CGFloat kHdr   = 42.f;
-static const CGFloat kR     = 12.f;
-static const NSTimeInterval kDur = 0.22;
+static const CGFloat kMenuW=280.f;
+static const CGFloat kMenuH=360.f;
+static const CGFloat kHdr  =42.f;
+static const CGFloat kR    =12.f;
+static const NSTimeInterval kDur=0.22;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ESPView — визуал из doc2: зелёный бокс + красная шапка
+// FOVCircleView
+// ═══════════════════════════════════════════════════════════════════════════════
+@interface FOVCircleView : UIView @end
+@implementation FOVCircleView
+-(instancetype)init {
+    self=[super initWithFrame:[UIScreen mainScreen].bounds];
+    self.backgroundColor=[UIColor clearColor];
+    self.userInteractionEnabled=NO;
+    return self;
+}
+-(void)drawRect:(CGRect)r {
+    if (!g_aimOn) return;
+    CGContextRef ctx=UIGraphicsGetCurrentContext(); if (!ctx) return;
+    CGSize scr=[UIScreen mainScreen].bounds.size;
+    CGFloat cx=scr.width*.5f, cy=scr.height*.5f;
+    CGFloat radius=(g_aimFov/90.f)*(scr.height*.5f);
+    CGContextSetStrokeColorWithColor(ctx,[UIColor colorWithRed:1 green:1 blue:1 alpha:.25f].CGColor);
+    CGContextSetLineWidth(ctx,1.f);
+    CGContextStrokeEllipseInRect(ctx,CGRectMake(cx-radius,cy-radius,radius*2,radius*2));
+}
+@end
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESPView
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface ESPView : UIView @end
 @implementation ESPView
 -(instancetype)init {
-    self = [super initWithFrame:[UIScreen mainScreen].bounds];
-    self.backgroundColor = [UIColor clearColor];
-    self.userInteractionEnabled = NO;
+    self=[super initWithFrame:[UIScreen mainScreen].bounds];
+    self.backgroundColor=[UIColor clearColor];
+    self.userInteractionEnabled=NO;
     return self;
 }
 -(void)drawRect:(CGRect)r {
-    if (!g_espOn || g_espCount == 0) return;
-    CGContextRef ctx = UIGraphicsGetCurrentContext(); if (!ctx) return;
-
-    for (int i = 0; i < g_espCount; i++) {
-        ESPEntry *e = &g_esp[i]; if (!e->valid) continue;
-        CGFloat bh = e->fy - e->hy; if (bh < 4.f) continue;
-        CGFloat bw = bh * 0.45f;
-        CGFloat bx = ((e->fx + e->hx) * 0.5f) - bw * 0.5f;
-
-        // зелёный бокс
-        CGContextSetLineWidth(ctx, 1.5f);
-        CGContextSetStrokeColorWithColor(ctx,
-            [UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
-        CGContextStrokeRect(ctx, CGRectMake(bx, e->hy, bw, bh));
-
-        // красная линия — верх (шапка)
-        CGContextSetStrokeColorWithColor(ctx,
-            [UIColor colorWithRed:.9f green:.2f blue:.1f alpha:.9f].CGColor);
-        CGContextMoveToPoint(ctx, bx, e->hy);
-        CGContextAddLineToPoint(ctx, bx + bw, e->hy);
+    if (!g_espOn||g_espCount==0) return;
+    CGContextRef ctx=UIGraphicsGetCurrentContext(); if (!ctx) return;
+    for (int i=0;i<g_espCount;i++){
+        ESPEntry *e=&g_esp[i]; if (!e->valid) continue;
+        CGFloat bh=e->fy-e->hy; if (bh<4.f) continue;
+        CGFloat bw=bh*.45f;
+        CGFloat bx=((e->fx+e->hx)*.5f)-bw*.5f;
+        CGContextSetLineWidth(ctx,1.5f);
+        CGContextSetStrokeColorWithColor(ctx,[UIColor colorWithRed:.2f green:.8f blue:.2f alpha:.9f].CGColor);
+        CGContextStrokeRect(ctx,CGRectMake(bx,e->hy,bw,bh));
+        CGContextSetStrokeColorWithColor(ctx,[UIColor colorWithRed:.9f green:.2f blue:.1f alpha:.9f].CGColor);
+        CGContextMoveToPoint(ctx,bx,e->hy);
+        CGContextAddLineToPoint(ctx,bx+bw,e->hy);
         CGContextStrokePath(ctx);
     }
 }
@@ -217,14 +351,14 @@ static const NSTimeInterval kDur = 0.22;
 @end
 @implementation PillButton { CGPoint _off; BOOL _moved; }
 -(instancetype)init {
-    self = [super initWithFrame:CGRectMake(20,120,44,28)];
-    self.backgroundColor    = C(0.10f,0.10f,0.13f,0.92f);
-    self.layer.cornerRadius = 14;
-    self.layer.borderColor  = C(0.27f,0.52f,1.00f,0.45f).CGColor;
-    self.layer.borderWidth  = 1;
-    UILabel *l = [[UILabel alloc] initWithFrame:self.bounds];
-    l.text = @"☰"; l.textAlignment = NSTextAlignmentCenter;
-    l.font = [UIFont systemFontOfSize:13]; l.textColor = C(0.75f,0.75f,0.80f,1);
+    self=[super initWithFrame:CGRectMake(20,120,44,28)];
+    self.backgroundColor=C(0.10f,0.10f,0.13f,0.92f);
+    self.layer.cornerRadius=14;
+    self.layer.borderColor=C(0.27f,0.52f,1.00f,0.45f).CGColor;
+    self.layer.borderWidth=1;
+    UILabel *l=[[UILabel alloc] initWithFrame:self.bounds];
+    l.text=@"☰"; l.textAlignment=NSTextAlignmentCenter;
+    l.font=[UIFont systemFontOfSize:13]; l.textColor=C(0.75f,0.75f,0.80f,1);
     [self addSubview:l];
     [self addGestureRecognizer:[[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(pan:)]];
@@ -247,88 +381,130 @@ static const NSTimeInterval kDur = 0.22;
 // MenuView
 // ═══════════════════════════════════════════════════════════════════════════════
 @interface MenuView : UIView
-@property (strong) UIButton *hideBtn;
-@property (strong) UISwitch *espSwitch;
-@property (strong) UILabel  *espStatus;
+@property (strong) UIButton           *hideBtn;
+@property (strong) UISwitch           *espSwitch;
+@property (strong) UILabel            *espStatus;
+@property (strong) UISwitch           *aimSwitch;
+@property (strong) UILabel            *aimStatus;
+@property (strong) UISlider           *fovSlider;
+@property (strong) UILabel            *fovLabel;
+@property (strong) UISegmentedControl *boneSegment;
 @end
+
 @implementation MenuView { CGPoint _drag; }
-
 -(instancetype)initWithFrame:(CGRect)f {
-    self = [super initWithFrame:f];
-    self.backgroundColor    = C(0.07f,0.07f,0.09f,0.93f);
-    self.layer.cornerRadius = kR;
-    self.layer.masksToBounds = YES;
+    self=[super initWithFrame:f];
+    self.backgroundColor=C(0.07f,0.07f,0.09f,0.93f);
+    self.layer.cornerRadius=kR;
+    self.layer.masksToBounds=YES;
 
-    // ── header ────────────────────────────────────────────────────────────────
-    UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,kMenuW,kHdr)];
-    hdr.backgroundColor = C(0.10f,0.10f,0.13f,1);
+    // header
+    UIView *hdr=[[UIView alloc] initWithFrame:CGRectMake(0,0,kMenuW,kHdr)];
+    hdr.backgroundColor=C(0.10f,0.10f,0.13f,1);
     [self addSubview:hdr];
-
-    UIView *acc = [[UIView alloc] initWithFrame:CGRectMake(0,kHdr-1,kMenuW,1)];
-    acc.backgroundColor = C(0.27f,0.52f,1.00f,0.55f);
+    UIView *acc=[[UIView alloc] initWithFrame:CGRectMake(0,kHdr-1,kMenuW,1)];
+    acc.backgroundColor=C(0.27f,0.52f,1.00f,0.55f);
     [self addSubview:acc];
-
-    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(0,(kHdr-17)*.5f,kMenuW,17)];
-    ttl.text = @"☰  Cheat Menu";
-    ttl.textAlignment = NSTextAlignmentCenter;
-    ttl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    ttl.textColor = C(0.92f,0.92f,0.95f,1);
+    UILabel *ttl=[[UILabel alloc] initWithFrame:CGRectMake(0,(kHdr-17)*.5f,kMenuW,17)];
+    ttl.text=@"☰  Cheat Menu"; ttl.textAlignment=NSTextAlignmentCenter;
+    ttl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    ttl.textColor=C(0.92f,0.92f,0.95f,1);
     [self addSubview:ttl];
-
     [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(pan:)]];
 
-    self.hideBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.hideBtn.frame = CGRectMake(kMenuW-30,(kHdr-24)*.5f,24,24);
-    self.hideBtn.layer.cornerRadius = 12;
-    self.hideBtn.layer.masksToBounds = YES;
-    self.hideBtn.backgroundColor = C(0.17f,0.17f,0.21f,1);
-    self.hideBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    self.hideBtn=[UIButton buttonWithType:UIButtonTypeCustom];
+    self.hideBtn.frame=CGRectMake(kMenuW-30,(kHdr-24)*.5f,24,24);
+    self.hideBtn.layer.cornerRadius=12; self.hideBtn.layer.masksToBounds=YES;
+    self.hideBtn.backgroundColor=C(0.17f,0.17f,0.21f,1);
+    self.hideBtn.titleLabel.font=[UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
     [self.hideBtn setTitle:@"−" forState:UIControlStateNormal];
     [self.hideBtn setTitleColor:C(0.55f,0.55f,0.60f,1) forState:UIControlStateNormal];
     [self addSubview:self.hideBtn];
 
-    // ── card ──────────────────────────────────────────────────────────────────
-    CGFloat cw = kMenuW-24;
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(12,kHdr+14,cw,88)];
-    card.backgroundColor = C(0.10f,0.10f,0.13f,1);
-    card.layer.cornerRadius = 8;
-    [self addSubview:card];
+    CGFloat cw=kMenuW-24;
 
-    UILabel *sl = [[UILabel alloc] initWithFrame:CGRectMake(10,10,cw-20,12)];
-    sl.text = @"VISUALS";
-    sl.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
-    sl.textColor = C(0.27f,0.52f,1.00f,1);
-    [card addSubview:sl];
+    // ── VISUALS card
+    UIView *card1=[[UIView alloc] initWithFrame:CGRectMake(12,kHdr+14,cw,88)];
+    card1.backgroundColor=C(0.10f,0.10f,0.13f,1); card1.layer.cornerRadius=8;
+    [self addSubview:card1];
+    UILabel *sl1=[[UILabel alloc] initWithFrame:CGRectMake(10,10,cw-20,12)];
+    sl1.text=@"VISUALS"; sl1.font=[UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    sl1.textColor=C(0.27f,0.52f,1.00f,1); [card1 addSubview:sl1];
+    UILabel *espLbl=[[UILabel alloc] initWithFrame:CGRectMake(10,30,100,24)];
+    espLbl.text=@"ESP"; espLbl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    espLbl.textColor=C(0.80f,0.80f,0.90f,1); [card1 addSubview:espLbl];
+    self.espSwitch=[[UISwitch alloc] init];
+    self.espSwitch.onTintColor=C(0.27f,0.52f,1.00f,1);
+    CGSize ssz=self.espSwitch.frame.size;
+    self.espSwitch.frame=CGRectMake(cw-10-ssz.width,(88-ssz.height)*.5f,ssz.width,ssz.height);
+    [card1 addSubview:self.espSwitch];
+    self.espStatus=[[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
+    self.espStatus.text=@"выключен";
+    self.espStatus.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    self.espStatus.textColor=C(0.35f,0.35f,0.40f,1); [card1 addSubview:self.espStatus];
 
-    UILabel *espLbl = [[UILabel alloc] initWithFrame:CGRectMake(10,30,100,24)];
-    espLbl.text = @"ESP";
-    espLbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    espLbl.textColor = C(0.80f,0.80f,0.90f,1);
-    [card addSubview:espLbl];
+    // ── AIMBOT card
+    CGFloat aimY=kHdr+14+88+10;
+    UIView *card2=[[UIView alloc] initWithFrame:CGRectMake(12,aimY,cw,190)];
+    card2.backgroundColor=C(0.10f,0.10f,0.13f,1); card2.layer.cornerRadius=8;
+    [self addSubview:card2];
+    UILabel *sl2=[[UILabel alloc] initWithFrame:CGRectMake(10,10,cw-20,12)];
+    sl2.text=@"AIMBOT"; sl2.font=[UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    sl2.textColor=C(1.00f,0.45f,0.20f,1); [card2 addSubview:sl2];
+    UILabel *aimLbl=[[UILabel alloc] initWithFrame:CGRectMake(10,30,100,24)];
+    aimLbl.text=@"Aimbot"; aimLbl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    aimLbl.textColor=C(0.80f,0.80f,0.90f,1); [card2 addSubview:aimLbl];
+    self.aimSwitch=[[UISwitch alloc] init];
+    self.aimSwitch.onTintColor=C(1.00f,0.45f,0.20f,1);
+    self.aimSwitch.frame=CGRectMake(cw-10-ssz.width,24,ssz.width,ssz.height);
+    [card2 addSubview:self.aimSwitch];
+    self.aimStatus=[[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
+    self.aimStatus.text=@"выключен";
+    self.aimStatus.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    self.aimStatus.textColor=C(0.35f,0.35f,0.40f,1); [card2 addSubview:self.aimStatus];
 
-    self.espSwitch = [[UISwitch alloc] init];
-    self.espSwitch.onTintColor = C(0.27f,0.52f,1.00f,1);
-    CGSize ssz = self.espSwitch.frame.size;
-    self.espSwitch.frame = CGRectMake(cw-10-ssz.width, (88-ssz.height)*.5f, ssz.width, ssz.height);
-    [card addSubview:self.espSwitch];
+    UILabel *boneLbl=[[UILabel alloc] initWithFrame:CGRectMake(10,84,60,14)];
+    boneLbl.text=@"Цель"; boneLbl.font=[UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    boneLbl.textColor=C(0.60f,0.60f,0.65f,1); [card2 addSubview:boneLbl];
 
-    self.espStatus = [[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
-    self.espStatus.text = @"выключен";
-    self.espStatus.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-    self.espStatus.textColor = C(0.35f,0.35f,0.40f,1);
-    [card addSubview:self.espStatus];
+    self.boneSegment=[[UISegmentedControl alloc] initWithItems:@[@"Голова",@"Грудь"]];
+    self.boneSegment.frame=CGRectMake(10,102,cw-20,28);
+    self.boneSegment.selectedSegmentIndex=0;
+    self.boneSegment.tintColor=C(1.00f,0.45f,0.20f,1);
+    if (@available(iOS 13.0,*)){
+        [self.boneSegment setTitleTextAttributes:
+            @{NSForegroundColorAttributeName:C(0.75f,0.75f,0.80f,1)}
+            forState:UIControlStateNormal];
+        [self.boneSegment setTitleTextAttributes:
+            @{NSForegroundColorAttributeName:[UIColor whiteColor]}
+            forState:UIControlStateSelected];
+    }
+    [card2 addSubview:self.boneSegment];
 
-    // внешняя рамка
-    CALayer *bdr = [CALayer layer];
-    bdr.frame = CGRectMake(0,0,kMenuW,kMenuH);
-    bdr.borderColor = C(0.22f,0.22f,0.28f,0.65f).CGColor;
-    bdr.borderWidth = 1; bdr.cornerRadius = kR;
+    UILabel *fovTitleLbl=[[UILabel alloc] initWithFrame:CGRectMake(10,138,40,14)];
+    fovTitleLbl.text=@"FOV"; fovTitleLbl.font=[UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    fovTitleLbl.textColor=C(0.60f,0.60f,0.65f,1); [card2 addSubview:fovTitleLbl];
+
+    self.fovLabel=[[UILabel alloc] initWithFrame:CGRectMake(cw-50,138,40,14)];
+    self.fovLabel.text=@"60°"; self.fovLabel.textAlignment=NSTextAlignmentRight;
+    self.fovLabel.font=[UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.fovLabel.textColor=C(1.00f,0.45f,0.20f,1); [card2 addSubview:self.fovLabel];
+
+    self.fovSlider=[[UISlider alloc] initWithFrame:CGRectMake(10,156,cw-20,22)];
+    self.fovSlider.minimumValue=5.f; self.fovSlider.maximumValue=180.f; self.fovSlider.value=60.f;
+    self.fovSlider.minimumTrackTintColor=C(1.00f,0.45f,0.20f,1);
+    self.fovSlider.maximumTrackTintColor=C(0.25f,0.25f,0.30f,1);
+    [card2 addSubview:self.fovSlider];
+
+    CALayer *bdr=[CALayer layer];
+    bdr.frame=CGRectMake(0,0,kMenuW,kMenuH);
+    bdr.borderColor=C(0.22f,0.22f,0.28f,0.65f).CGColor;
+    bdr.borderWidth=1; bdr.cornerRadius=kR;
     [self.layer addSublayer:bdr];
 
     return self;
 }
-
 -(void)pan:(UIPanGestureRecognizer*)g {
     CGPoint loc=[g locationInView:self.superview];
     if (g.state==UIGestureRecognizerStateBegan)
@@ -371,6 +547,7 @@ static const NSTimeInterval kDur = 0.22;
     PassthroughWindow *_win;
     MenuView          *_menu;
     ESPView           *_espView;
+    FOVCircleView     *_fovView;
     PillButton        *_pill;
     CADisplayLink     *_dl;
 }
@@ -384,10 +561,10 @@ static const NSTimeInterval kDur = 0.22;
     UIWindowScene *scene=nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
         if ([s isKindOfClass:[UIWindowScene class]]){scene=(UIWindowScene*)s;break;}
-    _win = scene ? [[PassthroughWindow alloc] initWithWindowScene:scene]
-                 : [[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    _win.windowLevel = UIWindowLevelAlert+200;
-    _win.backgroundColor = [UIColor clearColor];
+    _win=scene?[[PassthroughWindow alloc] initWithWindowScene:scene]
+              :[[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    _win.windowLevel=UIWindowLevelAlert+200;
+    _win.backgroundColor=[UIColor clearColor];
 
     PassthroughView *pv=[[PassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     pv.backgroundColor=[UIColor clearColor];
@@ -395,6 +572,7 @@ static const NSTimeInterval kDur = 0.22;
     _win.rootViewController=vc; _win.hidden=NO;
 
     _espView=[ESPView new]; [pv addSubview:_espView];
+    _fovView=[FOVCircleView new]; [pv addSubview:_fovView];
 
     CGSize sz=[UIScreen mainScreen].bounds.size;
     _menu=[[MenuView alloc] initWithFrame:
@@ -405,10 +583,11 @@ static const NSTimeInterval kDur = 0.22;
     _pill=[PillButton new]; _pill.action=^{[ws doShow];}; _pill.hidden=YES;
     [pv addSubview:_pill];
 
-    [_menu.hideBtn addTarget:self action:@selector(doHide)
-          forControlEvents:UIControlEventTouchUpInside];
-    [_menu.espSwitch addTarget:self action:@selector(espChanged:)
-           forControlEvents:UIControlEventValueChanged];
+    [_menu.hideBtn    addTarget:self action:@selector(doHide)       forControlEvents:UIControlEventTouchUpInside];
+    [_menu.espSwitch  addTarget:self action:@selector(espChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.aimSwitch  addTarget:self action:@selector(aimChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.fovSlider  addTarget:self action:@selector(fovChanged:)  forControlEvents:UIControlEventValueChanged];
+    [_menu.boneSegment addTarget:self action:@selector(boneChanged:) forControlEvents:UIControlEventValueChanged];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     _dl.preferredFramesPerSecond=30;
@@ -416,19 +595,35 @@ static const NSTimeInterval kDur = 0.22;
 }
 
 -(void)espChanged:(UISwitch*)sw {
-    g_espOn = sw.isOn;
-    if (g_espOn && !g_initDone) InitClasses();
-    _menu.espStatus.text      = g_espOn ? @"активен"  : @"выключен";
-    _menu.espStatus.textColor = g_espOn
-        ? C(0.35f,0.70f,0.40f,1) : C(0.35f,0.35f,0.40f,1);
-    if (!g_espOn) { g_espCount=0; [_espView setNeedsDisplay]; }
+    g_espOn=sw.isOn;
+    if (g_espOn&&!g_initDone) InitClasses();
+    _menu.espStatus.text      = g_espOn?@"активен":@"выключен";
+    _menu.espStatus.textColor = g_espOn?C(0.35f,0.70f,0.40f,1):C(0.35f,0.35f,0.40f,1);
+    if (!g_espOn){g_espCount=0;[_espView setNeedsDisplay];}
+}
+
+-(void)aimChanged:(UISwitch*)sw {
+    g_aimOn=sw.isOn;
+    if (g_aimOn&&!g_initDone) InitClasses();
+    _menu.aimStatus.text      = g_aimOn?@"активен":@"выключен";
+    _menu.aimStatus.textColor = g_aimOn?C(0.70f,0.40f,0.20f,1):C(0.35f,0.35f,0.40f,1);
+    [_fovView setNeedsDisplay];
+}
+
+-(void)fovChanged:(UISlider*)sl {
+    g_aimFov=sl.value;
+    _menu.fovLabel.text=[NSString stringWithFormat:@"%.0f°",g_aimFov];
+    if (g_aimOn)[_fovView setNeedsDisplay];
+}
+
+-(void)boneChanged:(UISegmentedControl*)seg {
+    g_aimBone=(int)seg.selectedSegmentIndex;
 }
 
 -(void)tick {
-    if (!g_espOn) return;
-    if (!g_initDone) InitClasses();
-    UpdateESP();
-    [_espView setNeedsDisplay];
+    if (!g_initDone&&(g_espOn||g_aimOn)) InitClasses();
+    if (g_espOn){ UpdateESP(); [_espView setNeedsDisplay]; }
+    if (g_aimOn) AimTick();
 }
 
 -(void)doShow {
