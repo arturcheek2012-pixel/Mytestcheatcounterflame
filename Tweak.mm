@@ -111,7 +111,6 @@ static void InitClasses(void) {
             g_getPosM = fp_class_method_from_name(trnC, "get_position", 0);
             g_setRotM = fp_class_method_from_name(trnC, "set_rotation", 1);
         }
-        // LookRotation(Vector3 forward, Vector3 upwards) — 2 параметра, всегда есть
         if (quatC)
             g_lookRotM = fp_class_method_from_name(quatC, "LookRotation", 2);
     }
@@ -228,10 +227,7 @@ static void AimTick(void) {
 
     if (!found) return;
 
-    Vec3 dir={(Vec3)v3norm(v3sub(bestWorld,camPos))};
-    dir = v3norm(v3sub(bestWorld, camPos));
-
-    // LookRotation(forward, up) — 2 параметра
+    Vec3 dir=v3norm(v3sub(bestWorld,camPos));
     Vec3 up={0,1,0};
     void *rotParams[2]={&dir,&up};
     exc=NULL;
@@ -398,7 +394,6 @@ static const NSTimeInterval kDur=0.22;
     self.layer.cornerRadius=kR;
     self.layer.masksToBounds=YES;
 
-    // header
     UIView *hdr=[[UIView alloc] initWithFrame:CGRectMake(0,0,kMenuW,kHdr)];
     hdr.backgroundColor=C(0.10f,0.10f,0.13f,1);
     [self addSubview:hdr];
@@ -423,6 +418,7 @@ static const NSTimeInterval kDur=0.22;
     [self addSubview:self.hideBtn];
 
     CGFloat cw=kMenuW-24;
+    CGSize ssz;
 
     // ── VISUALS card
     UIView *card1=[[UIView alloc] initWithFrame:CGRectMake(12,kHdr+14,cw,88)];
@@ -436,7 +432,7 @@ static const NSTimeInterval kDur=0.22;
     espLbl.textColor=C(0.80f,0.80f,0.90f,1); [card1 addSubview:espLbl];
     self.espSwitch=[[UISwitch alloc] init];
     self.espSwitch.onTintColor=C(0.27f,0.52f,1.00f,1);
-    CGSize ssz=self.espSwitch.frame.size;
+    ssz=self.espSwitch.frame.size;
     self.espSwitch.frame=CGRectMake(cw-10-ssz.width,(88-ssz.height)*.5f,ssz.width,ssz.height);
     [card1 addSubview:self.espSwitch];
     self.espStatus=[[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
@@ -457,6 +453,7 @@ static const NSTimeInterval kDur=0.22;
     aimLbl.textColor=C(0.80f,0.80f,0.90f,1); [card2 addSubview:aimLbl];
     self.aimSwitch=[[UISwitch alloc] init];
     self.aimSwitch.onTintColor=C(1.00f,0.45f,0.20f,1);
+    ssz=self.aimSwitch.frame.size;
     self.aimSwitch.frame=CGRectMake(cw-10-ssz.width,24,ssz.width,ssz.height);
     [card2 addSubview:self.aimSwitch];
     self.aimStatus=[[UILabel alloc] initWithFrame:CGRectMake(10,62,cw-20,14)];
@@ -583,11 +580,11 @@ static const NSTimeInterval kDur=0.22;
     _pill=[PillButton new]; _pill.action=^{[ws doShow];}; _pill.hidden=YES;
     [pv addSubview:_pill];
 
-    [_menu.hideBtn    addTarget:self action:@selector(doHide)       forControlEvents:UIControlEventTouchUpInside];
-    [_menu.espSwitch  addTarget:self action:@selector(espChanged:)  forControlEvents:UIControlEventValueChanged];
-    [_menu.aimSwitch  addTarget:self action:@selector(aimChanged:)  forControlEvents:UIControlEventValueChanged];
-    [_menu.fovSlider  addTarget:self action:@selector(fovChanged:)  forControlEvents:UIControlEventValueChanged];
-    [_menu.boneSegment addTarget:self action:@selector(boneChanged:) forControlEvents:UIControlEventValueChanged];
+    [_menu.hideBtn     addTarget:self action:@selector(doHide)        forControlEvents:UIControlEventTouchUpInside];
+    [_menu.espSwitch   addTarget:self action:@selector(espChanged:)   forControlEvents:UIControlEventValueChanged];
+    [_menu.aimSwitch   addTarget:self action:@selector(aimChanged:)   forControlEvents:UIControlEventValueChanged];
+    [_menu.fovSlider   addTarget:self action:@selector(fovChanged:)   forControlEvents:UIControlEventValueChanged];
+    [_menu.boneSegment addTarget:self action:@selector(boneChanged:)  forControlEvents:UIControlEventValueChanged];
 
     _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     _dl.preferredFramesPerSecond=30;
