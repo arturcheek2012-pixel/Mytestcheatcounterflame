@@ -38,7 +38,7 @@ static bool cfHook(void* target, void* replace, void** orig) {
         t[4] = 0x58000050; // ldr x16, #8
         t[5] = 0xD61F0200; // br x16
         *((uint64_t*)&t[6]) = (uintptr_t)target + 16;
-        __builtin___clear_cache(tramp, (char*)tramp + 64);
+        __builtin___clear_cache((char*)tramp, (char*)tramp + 64);
         *orig = tramp;
     }
 
@@ -47,7 +47,7 @@ static bool cfHook(void* target, void* replace, void** orig) {
     dst[1] = 0xD61F0200; // br x16
     *((uint64_t*)&dst[2]) = (uint64_t)replace;
 
-    __builtin___clear_cache(target, (char*)target + 16);
+    __builtin___clear_cache((char*)target, (char*)target + 16);
     return true;
 }
 
