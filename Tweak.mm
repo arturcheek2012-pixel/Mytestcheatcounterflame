@@ -749,17 +749,8 @@ static void Init() {
     // if (sf) g_cullingInstances = sf + 0x8;
 
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
-        UIWindow* win = GetKeyWindow();
-        if (!win) {
-            // последняя попытка — берём любое видимое окно
-            NSArray* wins = [UIApplication sharedApplication].windows;
-            for (UIWindow* w in wins) {
-                if (!w.isHidden) { win = w; break; }
-            }
-        }
-        if (!win) return;
 
         CGRect s = [UIScreen mainScreen].bounds;
         g_sw = (float)s.size.width;
@@ -767,20 +758,49 @@ static void Init() {
         g_center.x = g_sw * 0.5f;
         g_center.y = g_sh * 0.5f;
 
-        // отдельное окно поверх всего — меню точно не перекроется
-        UIWindow* overlay = [[UIWindow alloc] initWithFrame:s];
-        overlay.windowLevel            = UIWindowLevelAlert + 100;
-        overlay.backgroundColor        = [UIColor clearColor];
-        overlay.userInteractionEnabled = YES;
-        overlay.hidden                 = NO;
+        UIWindow* overlay = nil;
+
+        if (@available(iOS 13.0, *)) {
+            UIWindowScene* scene = nil;
+            for (UIScene* sc in [UIApplication sharedApplication].connectedScenes) {
+                if ([sc isKindOfClass:[UIWindowScene class]] &&
+                    sc.activationState == UISceneActivationStateForegroundActive) {
+                    scene = (UIWindowScene*)sc;
+                    break;
+                }
+            }
+            if (scene) {
+                overlay = [[UIWindow alloc] initWithWindowScene:scene];
+            }
+        }
+
+        if (!overlay) {
+            overlay = [[UIWindow alloc] initWithFrame:s];
+        }
+
+        overlay.frame              = s;
+        overlay.windowLevel        = UIWindowLevelAlert + 100;
+        overlay.backgroundColor    = [UIColor clearColor];
+        overlay.hidden             = NO;
+
+        // rootVC нужен чтобы окно приняло touches
+        UIViewController* vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor = [UIColor clearColor];
+        overlay.rootViewController = vc;
 
         g_espView = [[CFESPView alloc] initWithFrame:s];
         g_espView.userInteractionEnabled = NO;
-        [overlay addSubview:g_espView];
+        [vc.view addSubview:g_espView];
 
         g_menu = [[CFMenu alloc] init];
-        [overlay addSubview:g_menu];
-        [overlay makeKeyAndVisible];
+        [vc.view addSubview:g_menu];
+
+        // НЕ makeKeyAndVisible — только показываем, ввод остаётся у игры
+        overlay.hidden = NO;
+
+        // держим strong ref чтобы не убрал ARC
+        static UIWindow* s_overlay = nil;
+        s_overlay = overlay;
     });
 }
 
