@@ -1,1030 +1,776 @@
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <math.h>
-#import <sys/mman.h>
-#import <mach/mach.h>
-#import <stdint.h>
-#import <string.h>
-#import <libkern/OSCacheControl.h>
+#import <CoreGraphics/CoreGraphics.h>
+#include <substrate.h>
+#include <dlfcn.h>
+#include <vector>
+#include <cmath>
+#include <string>
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// OFFSETS (выверено по dump_cs.txt, base 0x112a70000)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// PlayerCulling (static field, читаем через fp_class_static_data):
-//   0x8  Instances  (List<PlayerCulling>)
-//
-// PlayerCulling (instance):
-//   0x18 _controller          (PlayerController)
-//   0x28 _animatorController  (ScarletWork.Photon.TPS.PlayerAnimatorController)
-//   0x40 _wallHacks
-//   0x48 _occluded            (bool) ← wallhack
-//   0x49 _inFrustum           (bool) ← не трогать
-//
-// PlayerController:
-//   0x40 _movementController  (PlayerMovement)
-//   0x60 _armsController      (ArmsController)
-//   0x80 _view                (PhotonView)
-//   0x98 _animatorController  (PlayerAnimatorController)
-//   0xA8 _isDeath             (bool)
-//
-// PhotonView:
-//   0x60 <IsMine>k__BackingField (bool)
-//
-// PlayerAnimatorController (ScarletWork.Photon.TPS):
-//   0x68 _skeleton  (PlayerSkeleton)
-//
-// PlayerSkeleton (ScarletWork.Game):
-//   0xA8 _headBone   (Transform)
-//   0xB0 _chestBone  (Transform)
-//   0xB8 _pelvisBone (Transform)
-//
-// ArmsController:
-//   0x100 _cameraTransform  (Transform)
-//   0x13D CanFire           (bool)
-//   0x13E isReload          (bool)
-//   0x140 MagazineCapacity  (int16)
-//   0x142 Capacity          (int16)  ← текущий патрон
-//   0x144 _timeFired        (float)
-//   0x1D0 _infiniteShots    (bool)
-//   0xA0  _recoilMult       (float)
-//   0xA4  _accuracyMult     (float)
-//   0x154 _camRecoilV       (float)
-//   0x158 _camRecoilH       (float)
-//   0x200 _movementController (PlayerMovement)
-//
-// PlayerMovement:
-//   0x18 _speed         (float) ← писать фиксированное значение
-//   0x38 NoclipEnabled  (bool)
-//   0x3C _noclipSpeed   (float)
-//   0xDC _gravityScale  (float) ← low gravity
-//
-// ArmsController.Shoot     RVA 0x1277208
-// ArmsController.set_IsGod RVA 0x126FFD4
-//
-// BotController:
-//   0x18 hp      (float)
-//   0x2C isLife  (bool)
-//
-// RVA_TO_OFFSET(rva) = (rva) - 0x100000000ULL  (base уже включает slide+0x100000000)
+// ═══════════════════════════════════════════════════════════════════
+//  OFFSETS
+// ═══════════════════════════════════════════════════════════════════
+#define OFF_PC_FPSCAMERA      0x28
+#define OFF_PC_MAINCAMERA     0x30
+#define OFF_PC_MOVEMENT       0x40
+#define OFF_PC_ARMSCTRL       0x60
+#define OFF_PC_PLAYERLOCK     0x68
+#define OFF_PC_NETWORK        0x88
+#define OFF_PC_ANIMCTRL       0x98
+#define OFF_PC_MATMANAGER     0xA0
+#define OFF_PC_ISDEATH        0xA8
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// IL2CPP API
-// ═══════════════════════════════════════════════════════════════════════════════
-static void*   (*fp_domain_get)(void);
-static void**  (*fp_domain_assemblies)(void*,size_t*);
-static void*   (*fp_assembly_image)(void*);
-static char*   (*fp_image_name)(void*);
-static void*   (*fp_class_from_name)(void*,const char*,const char*);
-static void*   (*fp_class_static_data)(void*);
-static void*   (*fp_class_method_from_name)(void*,const char*,int);
-static void*   (*fp_runtime_invoke)(void*,void*,void**,void**);
-static void*   (*fp_object_unbox)(void*);
-static BOOL g_apiLoaded=NO;
+#define OFF_SKEL_RENDERERS    0x70
+#define OFF_SKEL_HEAD         0xA8
+#define OFF_SKEL_CHEST        0xB0
+#define OFF_SKEL_PELVIS       0xB8
+#define OFF_SKEL_LARM         0xC0
+#define OFF_SKEL_RARM         0xC8
+#define OFF_SKEL_LTHIGH       0xD0
+#define OFF_SKEL_RTHIGH       0xD8
+#define OFF_SKEL_HITBOXOPEN   0x169
 
-static BOOL LoadAPI(void){
-    if(g_apiLoaded)return YES;
-#define R(p,s) p=(__typeof__(p))dlsym(RTLD_DEFAULT,s)
-    R(fp_domain_get,"il2cpp_domain_get");
-    R(fp_domain_assemblies,"il2cpp_domain_get_assemblies");
-    R(fp_assembly_image,"il2cpp_assembly_get_image");
-    R(fp_image_name,"il2cpp_image_get_name");
-    R(fp_class_from_name,"il2cpp_class_from_name");
-    R(fp_class_static_data,"il2cpp_class_get_static_field_data");
-    R(fp_class_method_from_name,"il2cpp_class_get_method_from_name");
-    R(fp_runtime_invoke,"il2cpp_runtime_invoke");
-    R(fp_object_unbox,"il2cpp_object_unbox");
-#undef R
-    g_apiLoaded=(fp_domain_get!=NULL&&fp_class_from_name!=NULL);
-    return g_apiLoaded;
-}
+#define OFF_NET_POSITION      0xBC
+#define OFF_NET_ROTATION      0xC8
+#define OFF_NET_VELOCITY      0xF8
+#define OFF_NET_VIEWVERT      0x10C
+#define OFF_NET_CAMPIVOT      0x110
 
-typedef struct{float x,y,z;}Vec3;
+#define OFF_CULL_CONTROLLER   0x18
+#define OFF_CULL_NETWORK      0x20
+#define OFF_CULL_OCCLUDED     0x48
+#define OFF_CULL_INFRAUSTRUM  0x49
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// memory helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-static BOOL IsPtr(const void*p){
-    uintptr_t v=(uintptr_t)p;
-    return v>0x10000UL&&v<0x00FFFFFFFFFFFFFFULL;
-}
-static void* RdPtr(const void*b,size_t o){
-    if(!IsPtr(b))return NULL;
-    void**a=(void**)((const uint8_t*)b+o);
-    if(!IsPtr(a))return NULL;
-    return*a;
-}
-static BOOL    RdBool (const void*b,size_t o){if(!IsPtr(b))return NO; return*(bool   *)((const uint8_t*)b+o);}
-static float   RdFloat(const void*b,size_t o){if(!IsPtr(b))return 0.f;return*(float  *)((const uint8_t*)b+o);}
-static int16_t RdI16  (const void*b,size_t o){if(!IsPtr(b))return 0;  return*(int16_t*)((const uint8_t*)b+o);}
-static void WrBool (void*b,size_t o,BOOL   v){if(!IsPtr(b))return;*(bool   *)((uint8_t*)b+o)=(bool)v;}
-static void WrFloat(void*b,size_t o,float  v){if(!IsPtr(b))return;*(float  *)((uint8_t*)b+o)=v;}
-static void WrI16  (void*b,size_t o,int16_t v){if(!IsPtr(b))return;*(int16_t*)((uint8_t*)b+o)=v;}
+#define OFF_LOCK_PLAYERBODY   0x20
+#define OFF_LOCK_ROTATIONX    0x38
+#define OFF_LOCK_HIPFOV       0x40
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// arm64 inline hook
-// ═══════════════════════════════════════════════════════════════════════════════
-#define HOOK_SIZE 16
-static BOOL InstallInlineHook(void*dst,void*replacement,void**ppOrig){
-    void*tram=mmap(NULL,4096,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(tram==MAP_FAILED)return NO;
-    uint32_t ldr_x16=0x58000050,br_x16=0xD61F0200;
-    uint8_t*t=(uint8_t*)tram;
-    memcpy(t,dst,HOOK_SIZE);
-    memcpy(t+HOOK_SIZE,&ldr_x16,4);memcpy(t+HOOK_SIZE+4,&br_x16,4);
-    uintptr_t ret=(uintptr_t)dst+HOOK_SIZE;memcpy(t+HOOK_SIZE+8,&ret,8);
-    sys_icache_invalidate(tram,HOOK_SIZE+16);
-    if(ppOrig)*ppOrig=tram;
-    uintptr_t page=(uintptr_t)dst&~(uintptr_t)4095;
-    mprotect((void*)page,4096,PROT_READ|PROT_WRITE|PROT_EXEC);
-    uint8_t patch[HOOK_SIZE];uintptr_t rep=(uintptr_t)replacement;
-    memcpy(patch,&ldr_x16,4);memcpy(patch+4,&br_x16,4);memcpy(patch+8,&rep,8);
-    memcpy(dst,patch,HOOK_SIZE);sys_icache_invalidate(dst,HOOK_SIZE);
-    mprotect((void*)page,4096,PROT_READ|PROT_EXEC);
-    return YES;
-}
+#define OFF_ARMS_CANFIRE      0x13D
+#define OFF_ARMS_ISRELOAD     0x13E
+#define OFF_ARMS_MAINCAMTRANS 0xF8
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// IL2CPP классы
-// ═══════════════════════════════════════════════════════════════════════════════
-static void*g_imgCSharp=NULL,*g_pcullClass=NULL,*g_botClass=NULL;
-static void*g_getTransM=NULL,*g_getPosM=NULL,*g_getForwM=NULL,*g_setForwM=NULL;
-static void*g_getMainM=NULL,*g_w2sM=NULL;
-static BOOL g_initDone=NO;
+#define OFF_TWH_RENDERERS     0x28
+#define OFF_TWH_ISENABLED     0x30
+#define OFF_WF_ENABLED        0x54
 
-static void InitClasses(void){
-    if(g_initDone)return; if(!LoadAPI())return;
-    void*domain=fp_domain_get(); size_t n=0;
-    void**asms=fp_domain_assemblies(domain,&n);
-    void*imgUnity=NULL;
-    for(size_t i=0;i<n;i++){
-        void*img=fp_assembly_image(asms[i]);if(!img)continue;
-        const char*nm=fp_image_name(img);if(!nm)continue;
-        if(!g_imgCSharp&&strcmp(nm,"Assembly-CSharp.dll")==0)g_imgCSharp=img;
-        if(!imgUnity&&(strcmp(nm,"UnityEngine.CoreModule.dll")==0||strcmp(nm,"UnityEngine.dll")==0))imgUnity=img;
+// ═══════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════
+struct Vec2  { float x, y; };
+struct Vec3  { float x, y, z; };
+struct Vec4  { float x, y, z, w; };
+struct Quat  { float x, y, z, w; };
+struct Color { float r, g, b, a; };
+
+struct Matrix4x4 {
+    float m[4][4];
+    Vec3 MultiplyPoint(Vec3 v) const {
+        Vec3 r;
+        r.x = m[0][0]*v.x + m[0][1]*v.y + m[0][2]*v.z + m[0][3];
+        r.y = m[1][0]*v.x + m[1][1]*v.y + m[1][2]*v.z + m[1][3];
+        r.z = m[2][0]*v.x + m[2][1]*v.y + m[2][2]*v.z + m[2][3];
+        float w = m[3][0]*v.x + m[3][1]*v.y + m[3][2]*v.z + m[3][3];
+        if (fabsf(w) > 1e-6f) { r.x/=w; r.y/=w; r.z/=w; }
+        return r;
     }
-    if(g_imgCSharp){
-        g_pcullClass=fp_class_from_name(g_imgCSharp,"","PlayerCulling");
-        g_botClass=fp_class_from_name(g_imgCSharp,"","BotController");
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  MEMORY
+// ═══════════════════════════════════════════════════════════════════
+template<typename T> static inline T Rd(uintptr_t a) {
+    if (!a) return T{};
+    return *reinterpret_cast<T*>(a);
+}
+template<typename T> static inline void Wr(uintptr_t a, T v) {
+    if (!a) return;
+    *reinterpret_cast<T*>(a) = v;
+}
+static inline uintptr_t Ptr(uintptr_t a) { return Rd<uintptr_t>(a); }
+
+static inline uintptr_t ListGet(uintptr_t list, int i) {
+    uintptr_t arr = Ptr(list + 0x10);
+    return arr ? Ptr(arr + 0x20 + i * 0x8) : 0;
+}
+static inline int ListCount(uintptr_t list) {
+    return list ? Rd<int>(list + 0x18) : 0;
+}
+
+static inline float Vec3Dist(Vec3 a, Vec3 b) {
+    float dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
+    return sqrtf(dx*dx+dy*dy+dz*dz);
+}
+static inline float Vec2Dist(Vec2 a, Vec2 b) {
+    float dx=a.x-b.x, dy=a.y-b.y;
+    return sqrtf(dx*dx+dy*dy);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════════════
+struct Config {
+    bool  espEnabled    = false;
+    bool  espBox        = true;
+    bool  espSkeleton   = false;
+    bool  espVisCheck   = true;
+    Color espColorVis   = {0.f, 1.f, 0.f, 1.f};
+    Color espColorHid   = {1.f, 0.f, 0.f, 1.f};
+
+    bool  chamsEnabled  = false;
+    bool  chamsWireframe= false;
+
+    bool  aimEnabled    = false;
+    float aimFov        = 80.f;
+    int   aimBone       = 0;     // 0=голова 1=грудь 2=таз
+    bool  aimVisOnly    = true;
+    float aimSmooth     = 6.f;
+} g_cfg;
+
+// ═══════════════════════════════════════════════════════════════════
+//  IL2CPP API
+// ═══════════════════════════════════════════════════════════════════
+typedef void*       (*t_DomainGet)();
+typedef void*       (*t_DomainGetAssemblies)(void*, size_t*);
+typedef void*       (*t_AssemblyGetImage)(void*);
+typedef size_t      (*t_ImageGetClassCount)(void*);
+typedef void*       (*t_ImageGetClass)(void*, size_t);
+typedef const char* (*t_ClassGetName)(void*);
+typedef void*       (*t_ClassFromName)(void*, const char*, const char*);
+typedef void*       (*t_ClassGetMethod)(void*, const char*, int);
+typedef const void* (*t_MethodGetPtr)(void*);
+typedef void*       (*t_ClassGetStaticFields)(void*);
+
+static t_DomainGet             il2_DomainGet;
+static t_DomainGetAssemblies   il2_DomainGetAssemblies;
+static t_AssemblyGetImage      il2_AssemblyGetImage;
+static t_ImageGetClassCount    il2_ImageGetClassCount;
+static t_ImageGetClass         il2_ImageGetClass;
+static t_ClassGetName          il2_ClassGetName;
+static t_ClassFromName         il2_ClassFromName;
+static t_ClassGetMethod        il2_ClassGetMethod;
+static t_MethodGetPtr          il2_MethodGetPtr;
+static t_ClassGetStaticFields  il2_ClassGetStaticFields;
+
+static void* g_mainImage = nullptr;
+
+static bool Il2CppInit() {
+    void* h = dlopen(NULL, RTLD_NOW);
+    if (!h) return false;
+#define LD(fn) il2_##fn = (decltype(il2_##fn))dlsym(h, "il2cpp_" #fn)
+    LD(DomainGet); LD(DomainGetAssemblies); LD(AssemblyGetImage);
+    LD(ImageGetClassCount); LD(ImageGetClass); LD(ClassGetName);
+    LD(ClassFromName); LD(ClassGetMethod); LD(MethodGetPtr);
+    LD(ClassGetStaticFields);
+#undef LD
+    return il2_DomainGet != nullptr;
+}
+
+static void* GetMainImage() {
+    if (g_mainImage) return g_mainImage;
+    size_t cnt = 0;
+    void* domain = il2_DomainGet();
+    void** asms = (void**)il2_DomainGetAssemblies(domain, &cnt);
+    for (size_t i = 0; i < cnt; i++) {
+        void* img = il2_AssemblyGetImage(asms[i]);
+        if (img && il2_ImageGetClassCount(img) > 2000)
+            { g_mainImage = img; break; }
     }
-    if(imgUnity){
-        void*camC=fp_class_from_name(imgUnity,"UnityEngine","Camera");
-        void*compC=fp_class_from_name(imgUnity,"UnityEngine","Component");
-        void*trnC=fp_class_from_name(imgUnity,"UnityEngine","Transform");
-        if(camC){g_getMainM=fp_class_method_from_name(camC,"get_main",0);g_w2sM=fp_class_method_from_name(camC,"WorldToScreenPoint",1);}
-        if(compC)g_getTransM=fp_class_method_from_name(compC,"get_transform",0);
-        if(trnC){g_getPosM=fp_class_method_from_name(trnC,"get_position",0);g_getForwM=fp_class_method_from_name(trnC,"get_forward",0);g_setForwM=fp_class_method_from_name(trnC,"set_forward",1);}
+    return g_mainImage;
+}
+
+static uintptr_t FindMethod(void* img, const char* ns,
+                             const char* cls, const char* method, int pc = -1) {
+    if (!img) return 0;
+    void* klass = il2_ClassFromName(img, ns, cls);
+    if (!klass) return 0;
+    void* m = il2_ClassGetMethod(klass, method, pc);
+    if (!m) return 0;
+    return (uintptr_t)il2_MethodGetPtr(m);
+}
+
+// статические поля класса
+static uintptr_t GetStaticFields(void* img, const char* ns, const char* cls) {
+    if (!img || !il2_ClassGetStaticFields) return 0;
+    void* klass = il2_ClassFromName(img, ns, cls);
+    if (!klass) return 0;
+    return (uintptr_t)il2_ClassGetStaticFields(klass);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  UNITY CALLS
+// ═══════════════════════════════════════════════════════════════════
+typedef void (*t_GetPos)(uintptr_t, Vec3*);
+typedef void (*t_SetEuler)(uintptr_t, Vec4*);  // Injected принимает Vec4
+typedef void (*t_GetMatrix)(uintptr_t, Matrix4x4*);
+
+static t_GetPos    Transform_get_position  = nullptr;
+static t_SetEuler  Transform_set_eulerAngles = nullptr;
+static t_GetMatrix Camera_get_proj         = nullptr;
+static t_GetMatrix Camera_get_w2cam        = nullptr;
+
+static Vec3 GetPos(uintptr_t transform) {
+    Vec3 v{};
+    if (transform && Transform_get_position)
+        Transform_get_position(transform, &v);
+    return v;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CHAMS API
+// ═══════════════════════════════════════════════════════════════════
+typedef void (*t_TWH_SetOnOutline)(uintptr_t);
+typedef void (*t_TWH_SetOff)(uintptr_t);
+typedef void (*t_WF_SetEnabled)(uintptr_t, bool);
+typedef void (*t_WF_CollectPlayers)(uintptr_t);
+typedef void (*t_WF_Refresh)(uintptr_t);
+
+static t_TWH_SetOnOutline  TWH_SetOnOutline  = nullptr;
+static t_TWH_SetOff        TWH_SetOff        = nullptr;
+static t_WF_SetEnabled     WF_SetEnabled     = nullptr;
+static t_WF_CollectPlayers WF_CollectPlayers = nullptr;
+static t_WF_Refresh        WF_Refresh        = nullptr;
+
+// FILL: найти singleton через static field или хук Awake
+static uintptr_t g_TWH_instance = 0;
+static uintptr_t g_WF_instance  = 0;
+
+static void ApplyChams(bool enable) {
+    if (g_cfg.chamsWireframe) {
+        if (!g_WF_instance) return;
+        if (WF_SetEnabled)     WF_SetEnabled(g_WF_instance, enable);
+        if (enable && WF_CollectPlayers) WF_CollectPlayers(g_WF_instance);
+        if (enable && WF_Refresh)        WF_Refresh(g_WF_instance);
+    } else {
+        if (!g_TWH_instance) return;
+        if (enable && TWH_SetOnOutline) TWH_SetOnOutline(g_TWH_instance);
+        else if (!enable && TWH_SetOff) TWH_SetOff(g_TWH_instance);
     }
-    g_initDone=(g_pcullClass!=NULL&&g_getTransM!=NULL&&g_getPosM!=NULL);
 }
 
-static Vec3 GetPosFromTransform(void*tr){
-    Vec3 z={0,0,0};
-    if(!IsPtr(tr)||!fp_runtime_invoke||!g_getPosM||!fp_object_unbox)return z;
-    void*exc=NULL,*bp=fp_runtime_invoke(g_getPosM,tr,NULL,&exc);
-    if(!IsPtr(bp)||exc)return z;
-    Vec3*p=(Vec3*)fp_object_unbox(bp);return p?*p:z;
-}
-static CGPoint W2S(Vec3 wp){
-    const CGPoint bad={-1,-1};
-    if(!fp_runtime_invoke||!g_getMainM||!g_w2sM||!fp_object_unbox)return bad;
-    void*exc=NULL,*cam=fp_runtime_invoke(g_getMainM,NULL,NULL,&exc);
-    if(!IsPtr(cam)||exc)return bad;
-    void*params[1]={&wp};exc=NULL;
-    void*br=fp_runtime_invoke(g_w2sM,cam,params,&exc);
-    if(!IsPtr(br)||exc)return bad;
-    Vec3*sv=(Vec3*)fp_object_unbox(br);if(!sv||sv->z<=0.f)return bad;
-    CGFloat sc=[UIScreen mainScreen].scale,uH=[UIScreen mainScreen].bounds.size.height;
-    return CGPointMake(sv->x/sc,uH-sv->y/sc);
-}
+// ═══════════════════════════════════════════════════════════════════
+//  CAMERA + W2S
+// ═══════════════════════════════════════════════════════════════════
+static Matrix4x4 g_viewProj{};
+static float     g_sw = 0, g_sh = 0;
+static Vec2      g_center{};
 
-static inline Vec3 v3sub(Vec3 a,Vec3 b){return(Vec3){a.x-b.x,a.y-b.y,a.z-b.z};}
-static inline float v3dot(Vec3 a,Vec3 b){return a.x*b.x+a.y*b.y+a.z*b.z;}
-static inline float v3len(Vec3 v){return sqrtf(v3dot(v,v));}
-static inline Vec3 v3norm(Vec3 v){float l=v3len(v);return l>1e-6f?(Vec3){v.x/l,v.y/l,v.z/l}:(Vec3){0,0,1};}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// game base
-// ═══════════════════════════════════════════════════════════════════════════════
-static uintptr_t g_gameBase=0;
-static uintptr_t GetGameBase(void){
-    if(g_gameBase)return g_gameBase;
-    for(uint32_t i=0;i<_dyld_image_count();i++){
-        const char*nm=_dyld_get_image_name(i);
-        if(nm&&strstr(nm,"CounterFlame")){
-            // _dyld_get_image_vmaddr_slide возвращает ASLR slide
-            // 0x100000000 — стандартная база Mach-O arm64
-            g_gameBase=(uintptr_t)_dyld_get_image_vmaddr_slide(i)+0x100000000ULL;break;
+static void UpdateVP(uintptr_t cam) {
+    if (!cam) return;
+    Matrix4x4 proj{}, w2c{};
+    if (Camera_get_proj)  Camera_get_proj(cam, &proj);
+    if (Camera_get_w2cam) Camera_get_w2cam(cam, &w2c);
+    Matrix4x4& vp = g_viewProj;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            vp.m[r][c] = 0;
+            for (int k = 0; k < 4; k++)
+                vp.m[r][c] += proj.m[r][k] * w2c.m[k][c];
         }
-    }
-    return g_gameBase;
-}
-// RVA из дампа (dump base 0x112a70000) → runtime адрес:
-// runtime = GetGameBase() + (rva - 0x100000000ULL)
-// потому что GetGameBase() = slide + 0x100000000, а rva = dump_base_without_slide + offset
-#define RVA2PTR(rva) ((void*)(GetGameBase() + ((uintptr_t)(rva) - 0x100000000ULL)))
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// FEATURE STATE
-// ═══════════════════════════════════════════════════════════════════════════════
-static BOOL  g_espOn         = NO;
-static BOOL  g_aimOn         = NO;
-static BOOL  g_triggerbotOn  = NO;   // NEW: автовыстрел если цель в прицеле
-static BOOL  g_godOn         = NO;
-static BOOL  g_infAmmoOn     = NO;
-static BOOL  g_noclipOn      = NO;
-static BOOL  g_speedOn       = NO;
-static BOOL  g_noRecoilOn    = NO;
-static BOOL  g_wallhackOn    = NO;
-static BOOL  g_rapidFireOn   = NO;
-static BOOL  g_freezeBotsOn  = NO;   // NEW: заморозить всех ботов
-static BOOL  g_lowGravOn     = NO;   // NEW: low gravity
-static int   g_aimBone       = 0;
-static float g_aimFov        = 60.f;
-static float g_speedVal      = 12.f;
-static float g_noclipSpeed   = 12.f;
-static float g_gravScale     = 0.15f; // low gravity factor
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// List<PlayerCulling> итератор
-// layout: [0x10]=array ptr, [0x18]=size (int32)
-// array:  [0x20 + i*8]=элемент
-// ═══════════════════════════════════════════════════════════════════════════════
-typedef void(^CullingIterBlock)(void*culling,void*ctrl,void*animCtrl);
-static void IterateCulling(CullingIterBlock blk){
-    if(!IsPtr(g_pcullClass)||!fp_class_static_data)return;
-    void*sd=fp_class_static_data(g_pcullClass);if(!IsPtr(sd))return;
-    void*list=RdPtr(sd,0x8);if(!IsPtr(list))return;
-    void*arr=RdPtr(list,0x10);
-    int32_t sz=*(int32_t*)((uint8_t*)list+0x18);
-    if(!IsPtr(arr)||sz<=0||sz>256)return;
-    for(int i=0;i<sz&&i<256;i++){
-        void*c=RdPtr(arr,0x20+(size_t)i*8);if(!IsPtr(c))continue;
-        void*ctrl=RdPtr(c,0x18);if(!IsPtr(ctrl))continue;
-        blk(c,ctrl,RdPtr(c,0x28));
-    }
 }
 
-static void* MyArms(void){
-    __block void*r=NULL;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(r)return;
-        void*view=RdPtr(ctrl,0x80);if(!IsPtr(view)||!RdBool(view,0x60))return;
-        r=RdPtr(ctrl,0x60);
-    });
-    return r;
-}
-static void* MyMv(void){
-    __block void*r=NULL;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(r)return;
-        void*view=RdPtr(ctrl,0x80);if(!IsPtr(view)||!RdBool(view,0x60))return;
-        r=RdPtr(ctrl,0x40);
-    });
-    return r;
+static bool W2S(Vec3 world, Vec2& screen) {
+    Vec3 clip = g_viewProj.MultiplyPoint(world);
+    if (clip.z < 0.01f) return false;
+    screen.x = (1.f + clip.x) * 0.5f * g_sw;
+    screen.y = (1.f - clip.y) * 0.5f * g_sh;
+    return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SILENT AIM
-// ═══════════════════════════════════════════════════════════════════════════════
-static BOOL FindBestTarget(Vec3*out){
-    CGSize scr=[UIScreen mainScreen].bounds.size;
-    CGFloat cx=scr.width*.5f,cy=scr.height*.5f;
-    CGFloat fovPx=(g_aimFov/90.f)*(scr.height*.5f);
-    __block Vec3 best={0,0,0};__block CGFloat bestD=1e9f;__block BOOL found=NO;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(RdBool(ctrl,0xA8))return;
-        void*view=RdPtr(ctrl,0x80);if(IsPtr(view)&&RdBool(view,0x60))return;
-        if(!IsPtr(anim))return;
-        void*skel=RdPtr(anim,0x68);if(!IsPtr(skel))return;
-        size_t bo=(g_aimBone==0)?0xA8:(g_aimBone==1)?0xB0:0xB8;
-        void*bone=RdPtr(skel,bo);if(!IsPtr(bone))return;
-        Vec3 bp=GetPosFromTransform(bone);if(bp.x==0&&bp.y==0&&bp.z==0)return;
-        CGPoint sp=W2S(bp);if(sp.x<0)return;
-        CGFloat dx=sp.x-cx,dy=sp.y-cy,d=sqrtf(dx*dx+dy*dy);
-        if(d>fovPx||d>=bestD)return;
-        bestD=d;best=bp;found=YES;
-    });
-    if(found)*out=best;return found;
-}
+// ═══════════════════════════════════════════════════════════════════
+//  PLAYER DATA
+// ═══════════════════════════════════════════════════════════════════
+struct Player {
+    uintptr_t controller, network, culling, skeleton;
+    Vec3  headPos, chestPos, pelvisPos, netPos;
+    Vec2  headS, chestS, pelvisS, topS, botS;
+    bool  headOnS, chestOnS, pelvisOnS;
+    bool  isDead, occluded, inFrustum;
+    float dist;
+};
 
-typedef void(*Shoot_t)(void*,void*);
-static Shoot_t g_origShoot=NULL;static BOOL g_hookShoot=NO;
+static std::vector<Player> g_players;
+static uintptr_t g_localCtrl = 0;
+static Vec3      g_localPos{};
 
-static void hook_Shoot(void*self,void*mi){
-    if(!g_initDone||!IsPtr(self)){if(g_origShoot)g_origShoot(self,mi);return;}
-    // silent aim: отклоняем вектор камеры перед выстрелом
-    if(g_aimOn){
-        void*camTr=RdPtr(self,0x100);
-        if(IsPtr(camTr)&&g_getForwM&&g_setForwM){
-            void*exc=NULL;
-            void*fb=fp_runtime_invoke(g_getForwM,camTr,NULL,&exc);
-            Vec3 origF={0,0,1};
-            if(IsPtr(fb)&&!exc){Vec3*p=(Vec3*)fp_object_unbox(fb);if(p)origF=*p;}
-            Vec3 camPos=GetPosFromTransform(camTr),target;
-            if(FindBestTarget(&target)&&(camPos.x||camPos.y||camPos.z)){
-                Vec3 dir=v3norm(v3sub(target,camPos));
-                exc=NULL;void*sp[1]={&dir};
-                fp_runtime_invoke(g_setForwM,camTr,sp,&exc);
-            }
-            if(g_origShoot)g_origShoot(self,mi);
-            exc=NULL;void*rp[1]={&origF};
-            fp_runtime_invoke(g_setForwM,camTr,rp,&exc);
-            return;
+// FILL: il2cpp_class_get_static_field_data(PlayerCulling) + 0x8 = List<PlayerCulling>
+static uintptr_t g_cullingInstances = 0;
+
+static void UpdatePlayers() {
+    g_players.clear();
+    if (!g_cullingInstances) return;
+
+    uintptr_t list = Ptr(g_cullingInstances);
+    int count = ListCount(list);
+    if (count <= 0 || count > 64) return;
+
+    for (int i = 0; i < count; i++) {
+        uintptr_t culling = ListGet(list, i);
+        if (!culling) continue;
+
+        uintptr_t ctrl = Ptr(culling + OFF_CULL_CONTROLLER);
+        if (!ctrl || ctrl == g_localCtrl) continue;
+
+        bool dead = Rd<bool>(ctrl + OFF_PC_ISDEATH);
+        bool occ  = Rd<bool>(culling + OFF_CULL_OCCLUDED);
+        bool frus = Rd<bool>(culling + OFF_CULL_INFRAUSTRUM);
+
+        uintptr_t net = Ptr(ctrl + OFF_PC_NETWORK);
+        if (!net) continue;
+
+        Vec3 netPos = Rd<Vec3>(net + OFF_NET_POSITION);
+
+        // скелет: animCtrl → skeleton (оффсет 0x20 — FILL если не совпадёт)
+        uintptr_t animCtrl = Ptr(ctrl + OFF_PC_ANIMCTRL);
+        uintptr_t skel     = animCtrl ? Ptr(animCtrl + 0x20) : 0;
+
+        Vec3 headPos{}, chestPos{}, pelvisPos{};
+        if (skel) {
+            headPos   = GetPos(Ptr(skel + OFF_SKEL_HEAD));
+            chestPos  = GetPos(Ptr(skel + OFF_SKEL_CHEST));
+            pelvisPos = GetPos(Ptr(skel + OFF_SKEL_PELVIS));
+        } else {
+            // fallback: networkPosition + камера-пивот
+            Vec3 pivot = Rd<Vec3>(net + OFF_NET_CAMPIVOT);
+            headPos = { netPos.x + pivot.x, netPos.y + pivot.y, netPos.z + pivot.z };
+            chestPos = netPos; chestPos.y += 1.0f;
+            pelvisPos = netPos; pelvisPos.y += 0.5f;
         }
+
+        if (dead || !frus) continue;
+
+        Player p{};
+        p.controller = ctrl; p.network = net;
+        p.culling = culling; p.skeleton = skel;
+        p.isDead = dead; p.occluded = occ; p.inFrustum = frus;
+        p.headPos = headPos; p.chestPos = chestPos;
+        p.pelvisPos = pelvisPos; p.netPos = netPos;
+        p.dist = Vec3Dist(g_localPos, netPos);
+
+        p.headOnS   = W2S(headPos,   p.headS);
+        p.chestOnS  = W2S(chestPos,  p.chestS);
+        p.pelvisOnS = W2S(pelvisPos, p.pelvisS);
+
+        Vec3 bot = netPos; bot.y -= 0.2f;
+        W2S(headPos, p.topS);
+        W2S(bot,     p.botS);
+
+        g_players.push_back(p);
     }
-    if(g_origShoot)g_origShoot(self,mi);
 }
 
-static void InstallHooks(void){
-    uintptr_t base=GetGameBase();if(!base)return;
-    if(!g_hookShoot){
-        void*addr=RVA2PTR(0x1277208);
-        if(InstallInlineHook(addr,(void*)hook_Shoot,(void**)&g_origShoot))g_hookShoot=YES;
-    }
-}
+// ═══════════════════════════════════════════════════════════════════
+//  AIMBOT
+// ═══════════════════════════════════════════════════════════════════
+static void DoAimbot(uintptr_t localCtrl) {
+    if (!g_cfg.aimEnabled || !localCtrl) return;
+    if (g_players.empty()) return;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// FEATURE TICKS
-// ═══════════════════════════════════════════════════════════════════════════════
+    float bestDist = g_cfg.aimFov;
+    const Player* best = nullptr;
 
-// GOD MODE
-// ArmsController.set_IsGod RVA 0x126FFD4
-// сигнатура: void(void* self, bool val, void* methodInfo)
-static void TickGodMode(void){
-    if(!g_godOn)return;
-    void*arms=MyArms();if(!IsPtr(arms))return;
-    typedef void(*SetGod_t)(void*,bool,void*);
-    static SetGod_t fp_sg=NULL;
-    if(!fp_sg){
-        uintptr_t base=GetGameBase();if(!base)return;
-        fp_sg=(SetGod_t)RVA2PTR(0x126FFD4);
-    }
-    if(fp_sg)fp_sg(arms,true,NULL);
-}
-
-// INF AMMO
-static void TickInfAmmo(void){
-    if(!g_infAmmoOn)return;
-    void*arms=MyArms();if(!IsPtr(arms))return;
-    WrBool(arms,0x1D0,YES);
-    int16_t cap=RdI16(arms,0x140);
-    if(cap>0)WrI16(arms,0x142,cap);
-}
-
-// SPEED HACK
-static float g_origSpeed=0.f;
-static void TickSpeed(void){
-    void*mv=MyMv();if(!IsPtr(mv))return;
-    if(g_speedOn){
-        if(g_origSpeed<0.1f){
-            float cur=RdFloat(mv,0x18);
-            if(cur>0.1f&&cur<30.f)g_origSpeed=cur;
+    for (auto& p : g_players) {
+        if (g_cfg.aimVisOnly && p.occluded) continue;
+        Vec2 tgt{};
+        switch (g_cfg.aimBone) {
+            case 0: tgt = p.headS;   break;
+            case 1: tgt = p.chestS;  break;
+            case 2: tgt = p.pelvisS; break;
+            default: tgt = p.headS;
         }
-        WrFloat(mv,0x18,g_speedVal);
-    } else if(g_origSpeed>0.1f){
-        WrFloat(mv,0x18,g_origSpeed);
-        g_origSpeed=0.f;
+        float d = Vec2Dist(tgt, g_center);
+        if (d < bestDist) { bestDist = d; best = &p; }
+    }
+    if (!best) return;
+
+    Vec2 tgt{};
+    switch (g_cfg.aimBone) {
+        case 0: tgt = best->headS;   break;
+        case 1: tgt = best->chestS;  break;
+        case 2: tgt = best->pelvisS; break;
+        default: tgt = best->headS;
+    }
+
+    float dx = (tgt.x - g_center.x) / g_cfg.aimSmooth;
+    float dy = (tgt.y - g_center.y) / g_cfg.aimSmooth;
+
+    uintptr_t lock = Ptr(localCtrl + OFF_PC_PLAYERLOCK);
+    if (!lock) return;
+
+    float hipFov = Rd<float>(lock + OFF_LOCK_HIPFOV);
+    if (hipFov < 1.f) hipFov = 60.f;
+
+    float curX = Rd<float>(lock + OFF_LOCK_ROTATIONX);
+    float dAngleX = -dy * (hipFov / g_sh);
+    Wr<float>(lock + OFF_LOCK_ROTATIONX, curX + dAngleX);
+
+    // горизонталь: playerBody transform eulerAngles.y
+    uintptr_t body = Ptr(lock + OFF_LOCK_PLAYERBODY);
+    if (body && Transform_set_eulerAngles) {
+        // читаем текущий euler через GetEulerAngles_Injected
+        // FILL: нужен адрес Transform_get_eulerAngles_Injected — добавить аналогично get_position
+        // пока: прямая запись через Vec4 (w=ignored)
+        // float dAngleY = dx * (hipFov / g_sw);
+        // Vec4 euler = { 0, currentY + dAngleY, 0, 0 };
+        // Transform_set_eulerAngles(body, &euler);
     }
 }
 
-// NOCLIP
-static void TickNoclip(void){
-    void*mv=MyMv();if(!IsPtr(mv))return;
-    WrBool(mv,0x38,g_noclipOn?YES:NO);
-    if(g_noclipOn)WrFloat(mv,0x3C,g_noclipSpeed);
-}
-
-// NO RECOIL
-static void TickNoRecoil(void){
-    if(!g_noRecoilOn)return;
-    void*arms=MyArms();if(!IsPtr(arms))return;
-    WrFloat(arms,0xA0,0.f);
-    WrFloat(arms,0xA4,0.f);
-    WrFloat(arms,0x154,0.f);
-    WrFloat(arms,0x158,0.f);
-}
-
-// WALLHACK
-// _occluded @ 0x48 = NO на всех живых врагах каждый тик
-static void TickWallhack(void){
-    if(!g_wallhackOn)return;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(RdBool(ctrl,0xA8))return;
-        void*view=RdPtr(ctrl,0x80);
-        if(IsPtr(view)&&RdBool(view,0x60))return;
-        WrBool(c,0x48,NO);
-    });
-}
-
-// RAPID FIRE
-static void TickRapidFire(void){
-    if(!g_rapidFireOn)return;
-    void*arms=MyArms();if(!IsPtr(arms))return;
-    WrBool(arms,0x13D,YES);
-    WrFloat(arms,0x144,0.f);
-    WrBool(arms,0x13E,NO);
-}
-
-// ─── NEW: FREEZE BOTS ────────────────────────────────────────────────────────
-// BotController.isLife @ 0x2C = false → бот замирает (не стреляет, не двигается)
-// BotController.hp @ 0x18 — можно прочитать для ESP (не используем здесь)
-// Итерируем через culling: если у PlayerController нет PhotonView.IsMine и
-// нет живого _animatorController — это боты. Но в CF боты идут через BotController
-// который не в culling листе. Итерируем culling и патчим всех не-своих.
-// Для ботов из culling (сетевые боты) это работает так же как для игроков.
-static void TickFreezeBots(void){
-    if(!g_freezeBotsOn)return;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(RdBool(ctrl,0xA8))return;                       // уже мёртвый
-        void*view=RdPtr(ctrl,0x80);
-        if(IsPtr(view)&&RdBool(view,0x60))return;          // свой
-        void*arms=RdPtr(ctrl,0x60);if(!IsPtr(arms))return;
-        // блокируем выстрел: CanFire=NO, _timeFired=999
-        WrBool(arms,0x13D,NO);
-        WrFloat(arms,0x144,999.f);
-        // блокируем перезарядку: isReload=YES (враг застревает в анимации)
-        WrBool(arms,0x13E,YES);
-    });
-}
-
-// ─── NEW: LOW GRAVITY ────────────────────────────────────────────────────────
-// PlayerMovement._gravityScale @ 0xDC
-// 1.0 = обычная, 0.15 = лунная, 0.0 = невесомость
-static float g_origGrav = 0.f;
-static void TickLowGrav(void){
-    void*mv=MyMv();if(!IsPtr(mv))return;
-    if(g_lowGravOn){
-        if(g_origGrav<0.01f){
-            float cur=RdFloat(mv,0xDC);
-            if(cur>0.01f&&cur<=2.f)g_origGrav=cur;
-            else g_origGrav=1.f;
-        }
-        WrFloat(mv,0xDC,g_gravScale);
-    } else if(g_origGrav>0.01f){
-        WrFloat(mv,0xDC,g_origGrav);
-        g_origGrav=0.f;
-    }
-}
-
-// ─── NEW: TRIGGERBOT ─────────────────────────────────────────────────────────
-// Если цель в FOV < triggerFov px от центра экрана — вызываем Shoot напрямую.
-// triggerFov жёстко = 15px (≈ 2° при 1080p). Вызываем только если CanFire=YES.
-// Работает независимо от silent aim.
-static void TickTriggerbot(void){
-    if(!g_triggerbotOn||!g_hookShoot)return;
-    void*arms=MyArms();if(!IsPtr(arms))return;
-    if(!RdBool(arms,0x13D))return;   // CanFire = NO → пропускаем
-    if(RdBool(arms,0x13E))return;    // isReload = YES → пропускаем
-    CGSize scr=[UIScreen mainScreen].bounds.size;
-    CGFloat cx=scr.width*.5f,cy=scr.height*.5f;
-    const CGFloat kTriggerPx=15.f;
-    __block BOOL inSight=NO;
-    IterateCulling(^(void*c,void*ctrl,void*anim){
-        if(inSight)return;
-        if(RdBool(ctrl,0xA8))return;
-        void*view=RdPtr(ctrl,0x80);if(IsPtr(view)&&RdBool(view,0x60))return;
-        if(!IsPtr(anim))return;
-        void*skel=RdPtr(anim,0x68);if(!IsPtr(skel))return;
-        // используем тот же кость что и silent aim
-        size_t bo=(g_aimBone==0)?0xA8:(g_aimBone==1)?0xB0:0xB8;
-        void*bone=RdPtr(skel,bo);if(!IsPtr(bone))return;
-        Vec3 bp=GetPosFromTransform(bone);if(bp.x==0&&bp.y==0&&bp.z==0)return;
-        CGPoint sp=W2S(bp);if(sp.x<0)return;
-        CGFloat dx=sp.x-cx,dy=sp.y-cy,d=sqrtf(dx*dx+dy*dy);
-        if(d<=kTriggerPx)inSight=YES;
-    });
-    if(inSight&&g_origShoot)g_origShoot(arms,NULL);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ESP (исправлено: берём позицию через скелет а не через get_transform culling)
-// ═══════════════════════════════════════════════════════════════════════════════
-#define MAX_ESP 64
-typedef struct{
-    CGFloat fx,fy,hx,hy;
-    CGFloat dist;
-    BOOL valid;
-}ESPEntry;
-static ESPEntry g_esp[MAX_ESP];static int g_espCount=0;
-
-static void UpdateESP(void){
-    g_espCount=0;
-    if(!g_espOn||!IsPtr(g_pcullClass)||!fp_class_static_data)return;
-    void*sd=fp_class_static_data(g_pcullClass);if(!IsPtr(sd))return;
-    void*list=RdPtr(sd,0x8);if(!IsPtr(list))return;
-    void*arr=RdPtr(list,0x10);int32_t sz=*(int32_t*)((uint8_t*)list+0x18);
-    if(!IsPtr(arr)||sz<=0)return;
-    // позиция камеры нашего игрока для расстояния
-    Vec3 myPos={0,0,0};
-    void*myMv=MyMv();
-    if(IsPtr(myMv)){
-        // _cameraTransform @ 0x30 в PlayerMovement
-        void*myCamTr=RdPtr(myMv,0x30);
-        if(IsPtr(myCamTr))myPos=GetPosFromTransform(myCamTr);
-    }
-    int n=sz<MAX_ESP?sz:MAX_ESP;
-    for(int i=0;i<n;i++){
-        void*c=RdPtr(arr,0x20+(size_t)i*8);if(!IsPtr(c))continue;
-        void*ctrl=RdPtr(c,0x18);if(!IsPtr(ctrl))continue;
-        if(RdBool(ctrl,0xA8))continue;
-        void*view=RdPtr(ctrl,0x80);if(IsPtr(view)&&RdBool(view,0x60))continue;
-        // берём скелет через animatorController
-        void*anim=RdPtr(c,0x28);if(!IsPtr(anim))continue;
-        void*skel=RdPtr(anim,0x68);if(!IsPtr(skel))continue;
-        void*pelvis=RdPtr(skel,0xB8);if(!IsPtr(pelvis))continue;
-        void*head=RdPtr(skel,0xA8);if(!IsPtr(head))continue;
-        Vec3 foot=GetPosFromTransform(pelvis);
-        if(foot.x==0&&foot.y==0&&foot.z==0)continue;
-        Vec3 top=GetPosFromTransform(head);
-        if(top.x==0&&top.y==0&&top.z==0){
-            top=(Vec3){foot.x,foot.y+1.8f,foot.z};
-        }
-        // смещаем foot немного вниз от pelvis
-        Vec3 footAdj={foot.x,foot.y-0.9f,foot.z};
-        CGPoint fs=W2S(footAdj);if(fs.x<0)continue;
-        CGPoint hs=W2S(top);if(hs.x<0)continue;
-        CGFloat dist=0.f;
-        if(myPos.x||myPos.y||myPos.z)dist=v3len(v3sub(foot,myPos));
-        g_esp[g_espCount++]=(ESPEntry){fs.x,fs.y,hs.x,hs.y,dist,YES};
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// UI helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-static inline UIColor*C(CGFloat r,CGFloat g,CGFloat b,CGFloat a){
-    return[UIColor colorWithRed:r green:g blue:b alpha:a];
-}
-static const CGFloat kW=260.f,kMaxH=560.f,kHdr=34.f,kR=10.f,kRow=38.f;
-static const NSTimeInterval kDur=0.20;
-
-// ── ESP View ──────────────────────────────────────────────────────────────────
-@interface ESPView:UIView @end
-@implementation ESPView
--(instancetype)init{
-    self=[super initWithFrame:[UIScreen mainScreen].bounds];
-    self.backgroundColor=[UIColor clearColor];
-    self.userInteractionEnabled=NO;
+// ═══════════════════════════════════════════════════════════════════
+//  ESP OVERLAY
+// ═══════════════════════════════════════════════════════════════════
+@interface CFESPView : UIView
+@end
+@implementation CFESPView
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
+    self.backgroundColor = [UIColor clearColor];
+    self.userInteractionEnabled = NO;
     return self;
 }
--(void)drawRect:(CGRect)r{
-    if(!g_espOn||g_espCount==0)return;
-    CGContextRef ctx=UIGraphicsGetCurrentContext();if(!ctx)return;
-    NSDictionary*attr=@{NSFontAttributeName:[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold],
-                        NSForegroundColorAttributeName:[UIColor whiteColor]};
-    for(int i=0;i<g_espCount;i++){
-        ESPEntry*e=&g_esp[i];if(!e->valid)continue;
-        CGFloat bh=e->fy-e->hy;if(bh<4.f)continue;
-        CGFloat bw=bh*.45f,bx=((e->fx+e->hx)*.5f)-bw*.5f;
-        // рамка
-        CGContextSetLineWidth(ctx,1.5f);
-        CGContextSetStrokeColorWithColor(ctx,C(.2f,.8f,.2f,.9f).CGColor);
-        CGContextStrokeRect(ctx,CGRectMake(bx,e->hy,bw,bh));
-        // верхняя линия (голова)
-        CGContextSetStrokeColorWithColor(ctx,C(.9f,.2f,.1f,.9f).CGColor);
-        CGContextMoveToPoint(ctx,bx,e->hy);CGContextAddLineToPoint(ctx,bx+bw,e->hy);CGContextStrokePath(ctx);
-        // дистанция
-        if(e->dist>0.f){
-            NSString*ds=[NSString stringWithFormat:@"%.0fm",e->dist];
-            [ds drawAtPoint:CGPointMake(bx,e->hy-12) withAttributes:attr];
+- (void)drawRect:(CGRect)rect {
+    if (!g_cfg.espEnabled) return;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGContextSetLineWidth(ctx, 1.5f);
+
+    for (auto& p : g_players) {
+        Color c = (p.occluded && g_cfg.espVisCheck) ? g_cfg.espColorHid : g_cfg.espColorVis;
+        CGContextSetRGBStrokeColor(ctx, c.r, c.g, c.b, c.a);
+
+        // box
+        if (g_cfg.espBox && p.headOnS && p.pelvisOnS) {
+            float h = p.botS.y - p.topS.y;
+            float w = h * 0.45f;
+            CGContextStrokeRect(ctx,
+                CGRectMake(p.topS.x - w*0.5f, p.topS.y, w, h));
+        }
+
+        // skeleton
+        if (g_cfg.espSkeleton) {
+            auto ln = [&](Vec2 a, Vec2 b) {
+                CGContextMoveToPoint(ctx, a.x, a.y);
+                CGContextAddLineToPoint(ctx, b.x, b.y);
+                CGContextStrokePath(ctx);
+            };
+            if (p.headOnS  && p.chestOnS)  ln(p.headS,  p.chestS);
+            if (p.chestOnS && p.pelvisOnS) ln(p.chestS, p.pelvisS);
         }
     }
+
+    // FOV circle
+    if (g_cfg.aimEnabled) {
+        CGContextSetRGBStrokeColor(ctx, 1, 1, 0, 0.5f);
+        CGContextSetLineWidth(ctx, 1.f);
+        CGContextStrokeEllipseInRect(ctx,
+            CGRectMake(g_center.x - g_cfg.aimFov,
+                       g_center.y - g_cfg.aimFov,
+                       g_cfg.aimFov * 2, g_cfg.aimFov * 2));
+    }
 }
 @end
 
-// ── FOV Circle View ───────────────────────────────────────────────────────────
-@interface FOVCircleView:UIView @end
-@implementation FOVCircleView
--(instancetype)init{
-    self=[super initWithFrame:[UIScreen mainScreen].bounds];
-    self.backgroundColor=[UIColor clearColor];
-    self.userInteractionEnabled=NO;
+// ═══════════════════════════════════════════════════════════════════
+//  MENU
+// ═══════════════════════════════════════════════════════════════════
+@interface CFMenu : UIView
+@property (nonatomic, strong) UIScrollView* panel;
+@property (nonatomic, assign) CGPoint panStart, originStart;
+@end
+
+@implementation CFMenu {
+    CGFloat _y;
+}
+
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(10, 100, 44, 44)];
+    self.backgroundColor = [UIColor clearColor];
+
+    UIButton* btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = CGRectMake(0, 0, 44, 44);
+    [btn setTitle:@"☰" forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:22];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor colorWithRed:.05 green:.05 blue:.1 alpha:.9f];
+    btn.layer.cornerRadius = 8;
+    btn.layer.borderWidth = 1;
+    btn.layer.borderColor = [UIColor colorWithWhite:.3 alpha:1].CGColor;
+    [btn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:btn];
+
+    _panel = [[UIScrollView alloc] initWithFrame:CGRectMake(50, 0, 270, 400)];
+    _panel.backgroundColor = [UIColor colorWithRed:.06 green:.06 blue:.1 alpha:.93f];
+    _panel.layer.cornerRadius = 10;
+    _panel.layer.borderWidth = 1;
+    _panel.layer.borderColor = [UIColor colorWithRed:.2 green:.4 blue:.8 alpha:.8f].CGColor;
+    _panel.hidden = YES;
+    [self addSubview:_panel];
+
+    [self buildUI];
+
+    UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(drag:)];
+    [btn addGestureRecognizer:pan];
+
     return self;
 }
--(void)drawRect:(CGRect)r{
-    if(!g_aimOn&&!g_triggerbotOn)return;
-    CGContextRef ctx=UIGraphicsGetCurrentContext();if(!ctx)return;
-    CGSize s=[UIScreen mainScreen].bounds.size;
-    // кольцо aim fov
-    if(g_aimOn){
-        CGFloat rad=(g_aimFov/90.f)*(s.height*.5f);
-        CGContextSetStrokeColorWithColor(ctx,C(1,1,1,.3f).CGColor);
-        CGContextSetLineWidth(ctx,1.f);
-        CGContextStrokeEllipseInRect(ctx,CGRectMake(s.width*.5f-rad,s.height*.5f-rad,rad*2,rad*2));
-    }
-    // маленький кружок triggerbot зоны
-    if(g_triggerbotOn){
-        const CGFloat tr=15.f;
-        CGContextSetStrokeColorWithColor(ctx,C(1.f,.3f,.3f,.6f).CGColor);
-        CGContextSetLineWidth(ctx,1.f);
-        CGContextStrokeEllipseInRect(ctx,CGRectMake(s.width*.5f-tr,s.height*.5f-tr,tr*2,tr*2));
+
+- (void)toggle { _panel.hidden = !_panel.hidden; }
+
+- (void)drag:(UIPanGestureRecognizer*)gr {
+    if (gr.state == UIGestureRecognizerStateBegan) {
+        _panStart    = [gr locationInView:self.superview];
+        _originStart = self.frame.origin;
+    } else if (gr.state == UIGestureRecognizerStateChanged) {
+        CGPoint p = [gr locationInView:self.superview];
+        CGRect f  = self.frame;
+        f.origin.x = _originStart.x + p.x - _panStart.x;
+        f.origin.y = _originStart.y + p.y - _panStart.y;
+        self.frame = f;
     }
 }
-@end
 
-// ── Pill Button ───────────────────────────────────────────────────────────────
-@interface PillButton:UIView @property(copy)dispatch_block_t action; @end
-@implementation PillButton{CGPoint _off;BOOL _moved;}
--(instancetype)init{
-    self=[super initWithFrame:CGRectMake(20,120,40,26)];
-    self.backgroundColor=C(.10f,.10f,.13f,.92f);self.layer.cornerRadius=13;
-    self.layer.borderColor=C(.27f,.52f,1.f,.45f).CGColor;self.layer.borderWidth=1;
-    UILabel*l=[[UILabel alloc]initWithFrame:self.bounds];
-    l.text=@"☰";l.textAlignment=NSTextAlignmentCenter;l.font=[UIFont systemFontOfSize:12];l.textColor=C(.75f,.75f,.8f,1);
-    [self addSubview:l];
-    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(pan:)]];
-    return self;
+// ── UI helpers ───────────────────────────────────────────────────
+- (void)section:(NSString*)title {
+    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 18)];
+    l.text      = title;
+    l.textColor = [UIColor colorWithRed:.3 green:.7 blue:1 alpha:1];
+    l.font      = [UIFont boldSystemFontOfSize:11];
+    [_panel addSubview:l];
+    _y += 22;
 }
--(void)pan:(UIPanGestureRecognizer*)g{
-    CGPoint loc=[g locationInView:self.superview];
-    if(g.state==UIGestureRecognizerStateBegan){_moved=NO;_off=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);}
-    else if(g.state==UIGestureRecognizerStateChanged){_moved=YES;CGRect f=self.frame;f.origin=CGPointMake(loc.x-_off.x,loc.y-_off.y);self.frame=f;}
+
+- (UISwitch*)row:(NSString*)title val:(BOOL)v sel:(SEL)s {
+    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y+3, 190, 20)];
+    l.text      = title;
+    l.textColor = [UIColor whiteColor];
+    l.font      = [UIFont systemFontOfSize:13];
+    [_panel addSubview:l];
+
+    UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(200, _y, 51, 31)];
+    sw.transform = CGAffineTransformMakeScale(0.78, 0.78);
+    sw.on = v;
+    [sw addTarget:self action:s forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:sw];
+    _y += 36;
+    return sw;
 }
--(void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e{if(!_moved&&_action)_action();}
-@end
 
-// ── Toggle Row ────────────────────────────────────────────────────────────────
-@interface ToggleRow:UIView
-@property(strong)UISwitch*sw;
-@property(strong)UILabel*statusLbl;
--(instancetype)initWithTitle:(NSString*)title color:(UIColor*)col width:(CGFloat)w;
--(void)setOn:(BOOL)on;
-@end
-@implementation ToggleRow
--(instancetype)initWithTitle:(NSString*)title color:(UIColor*)col width:(CGFloat)w{
-    self=[super initWithFrame:CGRectMake(0,0,w,kRow)];
-    UILabel*lbl=[[UILabel alloc]initWithFrame:CGRectMake(10,0,w*.58f,kRow)];
-    lbl.text=title;lbl.font=[UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    lbl.textColor=C(.82f,.82f,.90f,1);[self addSubview:lbl];
-    self.sw=[[UISwitch alloc]init];self.sw.onTintColor=col;
-    self.sw.transform=CGAffineTransformMakeScale(0.72f,0.72f);
-    CGSize sz=self.sw.frame.size;
-    self.sw.frame=CGRectMake(w-10-sz.width,(kRow-sz.height)*.5f,sz.width,sz.height);
-    [self addSubview:self.sw];
-    self.statusLbl=[[UILabel alloc]initWithFrame:CGRectMake(10,kRow-11,w-20,11)];
-    self.statusLbl.font=[UIFont monospacedSystemFontOfSize:8 weight:UIFontWeightRegular];
-    self.statusLbl.textColor=C(.35f,.35f,.4f,1);[self addSubview:self.statusLbl];
-    return self;
+- (UISlider*)slider:(NSString*)title min:(float)mn max:(float)mx
+               val:(float)v sel:(SEL)s tag:(NSInteger)tag {
+    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 16)];
+    l.text      = [NSString stringWithFormat:@"%@ : %.0f", title, v];
+    l.textColor = [UIColor lightGrayColor];
+    l.font      = [UIFont systemFontOfSize:11];
+    l.tag       = tag;
+    [_panel addSubview:l];
+    _y += 18;
+
+    UISlider* sl = [[UISlider alloc] initWithFrame:CGRectMake(10, _y, 250, 26)];
+    sl.minimumValue = mn; sl.maximumValue = mx; sl.value = v;
+    sl.tintColor    = [UIColor colorWithRed:.2 green:.5 blue:1 alpha:1];
+    sl.tag          = tag;
+    [sl addTarget:self action:s forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:sl];
+    _y += 32;
+    return sl;
 }
--(void)setOn:(BOOL)on{
-    self.sw.on=on;
-    self.statusLbl.text=on?@"активен":@"выключен";
-    self.statusLbl.textColor=on?C(.35f,.70f,.4f,1):C(.35f,.35f,.4f,1);
+
+- (void)buildUI {
+    _y = 10;
+
+    [self section:@"─── ESP ───────────────────"];
+    [self row:@"ESP"             val:g_cfg.espEnabled  sel:@selector(onESP:)];
+    [self row:@"Box"             val:g_cfg.espBox      sel:@selector(onBox:)];
+    [self row:@"Skeleton"        val:g_cfg.espSkeleton sel:@selector(onSkel:)];
+    [self row:@"Vis check"       val:g_cfg.espVisCheck sel:@selector(onVis:)];
+
+    [self section:@"─── CHAMS ─────────────────"];
+    [self row:@"Chams"           val:g_cfg.chamsEnabled   sel:@selector(onChams:)];
+    [self row:@"Wireframe"       val:g_cfg.chamsWireframe sel:@selector(onWF:)];
+
+    [self section:@"─── AIMBOT ────────────────"];
+    [self row:@"Aimbot"          val:g_cfg.aimEnabled  sel:@selector(onAim:)];
+    [self row:@"Только видимые"  val:g_cfg.aimVisOnly  sel:@selector(onAimVis:)];
+    [self slider:@"FOV"  min:10 max:350 val:g_cfg.aimFov   sel:@selector(onFov:)  tag:100];
+    [self slider:@"Smooth" min:1 max:25 val:g_cfg.aimSmooth sel:@selector(onSmooth:) tag:101];
+
+    // кость
+    UILabel* bl = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 16)];
+    bl.text      = @"Цель";
+    bl.textColor = [UIColor lightGrayColor];
+    bl.font      = [UIFont systemFontOfSize:11];
+    [_panel addSubview:bl];
+    _y += 18;
+
+    UISegmentedControl* sc = [[UISegmentedControl alloc]
+        initWithItems:@[@"Голова", @"Грудь", @"Таз"]];
+    sc.frame = CGRectMake(10, _y, 250, 28);
+    sc.selectedSegmentIndex = g_cfg.aimBone;
+    [sc addTarget:self action:@selector(onBone:) forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:sc];
+    _y += 36;
+
+    _panel.contentSize = CGSizeMake(270, _y + 16);
+}
+
+// ── Handlers ─────────────────────────────────────────────────────
+- (void)onESP:(UISwitch*)s     { g_cfg.espEnabled    = s.on; }
+- (void)onBox:(UISwitch*)s     { g_cfg.espBox        = s.on; }
+- (void)onSkel:(UISwitch*)s    { g_cfg.espSkeleton   = s.on; }
+- (void)onVis:(UISwitch*)s     { g_cfg.espVisCheck   = s.on; }
+- (void)onChams:(UISwitch*)s   { g_cfg.chamsEnabled  = s.on; ApplyChams(s.on); }
+- (void)onWF:(UISwitch*)s      { g_cfg.chamsWireframe= s.on; ApplyChams(g_cfg.chamsEnabled); }
+- (void)onAim:(UISwitch*)s     { g_cfg.aimEnabled    = s.on; }
+- (void)onAimVis:(UISwitch*)s  { g_cfg.aimVisOnly    = s.on; }
+- (void)onBone:(UISegmentedControl*)sc { g_cfg.aimBone = (int)sc.selectedSegmentIndex; }
+
+- (void)onFov:(UISlider*)sl {
+    g_cfg.aimFov = sl.value;
+    UILabel* l = (UILabel*)[_panel viewWithTag:100];
+    l.text = [NSString stringWithFormat:@"FOV : %.0f", sl.value];
+}
+- (void)onSmooth:(UISlider*)sl {
+    g_cfg.aimSmooth = sl.value;
+    UILabel* l = (UILabel*)[_panel viewWithTag:101];
+    l.text = [NSString stringWithFormat:@"Smooth : %.0f", sl.value];
 }
 @end
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MenuView
-// ═══════════════════════════════════════════════════════════════════════════════
-@interface MenuView:UIView
-@property(strong)UIButton*hideBtn;
-@property(strong)ToggleRow*rowAim,*rowTriggerbot,*rowRapidFire,*rowNoRecoil;
-@property(strong)ToggleRow*rowEsp,*rowWallhack;
-@property(strong)ToggleRow*rowGod,*rowInfAmmo,*rowSpeed,*rowNoclip,*rowFreezeBots,*rowLowGrav;
-@property(strong)UISlider*fovSlider,*speedSlider,*gravSlider;
-@property(strong)UILabel*fovLabel,*speedLabel,*gravLabel;
-@property(strong)UISegmentedControl*boneSegment;
-@end
+// ═══════════════════════════════════════════════════════════════════
+//  HOOK: Camera.OnPreRender — главный тик
+// ═══════════════════════════════════════════════════════════════════
+static uintptr_t   g_mainCam   = 0;
+static CFESPView*  g_espView   = nil;
+static CFMenu*     g_menu      = nil;
 
-@implementation MenuView{CGPoint _drag;}
--(instancetype)initWithFrame:(CGRect)f{
-    self=[super initWithFrame:f];
-    self.backgroundColor=C(.07f,.07f,.09f,.96f);
-    self.layer.cornerRadius=kR;self.layer.masksToBounds=YES;
+typedef void (*t_OnPreRender)(uintptr_t);
+static t_OnPreRender orig_OnPreRender = nullptr;
 
-    // header
-    UIView*hdr=[[UIView alloc]initWithFrame:CGRectMake(0,0,f.size.width,kHdr)];
-    hdr.backgroundColor=C(.10f,.10f,.13f,1);[self addSubview:hdr];
-    UIView*acc=[[UIView alloc]initWithFrame:CGRectMake(0,kHdr-1,f.size.width,1)];
-    acc.backgroundColor=C(.27f,.52f,1.f,.55f);[self addSubview:acc];
-    UILabel*ttl=[[UILabel alloc]initWithFrame:CGRectMake(0,(kHdr-14)*.5f,f.size.width,14)];
-    ttl.text=@"☰  CF Cheat";ttl.textAlignment=NSTextAlignmentCenter;
-    ttl.font=[UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    ttl.textColor=C(.92f,.92f,.95f,1);[self addSubview:ttl];
-    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc]initWithTarget:self action:@selector(pan:)]];
+static void Hook_OnPreRender(uintptr_t thiz) {
+    orig_OnPreRender(thiz);
 
-    self.hideBtn=[UIButton buttonWithType:UIButtonTypeCustom];
-    self.hideBtn.frame=CGRectMake(f.size.width-24,(kHdr-20)*.5f,20,20);
-    self.hideBtn.layer.cornerRadius=10;self.hideBtn.layer.masksToBounds=YES;
-    self.hideBtn.backgroundColor=C(.17f,.17f,.21f,1);
-    [self.hideBtn setTitle:@"−" forState:UIControlStateNormal];
-    [self.hideBtn setTitleColor:C(.55f,.55f,.6f,1) forState:UIControlStateNormal];
-    self.hideBtn.titleLabel.font=[UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    [self addSubview:self.hideBtn];
+    if (!g_mainCam) g_mainCam = thiz;
+    if (thiz != g_mainCam) return;
 
-    CGFloat scrollH=f.size.height-kHdr;
-    UIScrollView*sv=[[UIScrollView alloc]initWithFrame:CGRectMake(0,kHdr,f.size.width,scrollH)];
-    sv.showsVerticalScrollIndicator=YES;sv.indicatorStyle=UIScrollViewIndicatorStyleWhite;sv.bounces=YES;
-    [self addSubview:sv];
+    UpdateVP(thiz);
 
-    CGFloat cw=f.size.width-16;
-    CGFloat y=8;
-
-    // ── COMBAT ───────────────────────────────────────────────────────────────
-    {
-        // Aim + Triggerbot + bone(26) + FOV(38) + RapidFire + NoRecoil
-        CGFloat cardH=18+kRow+kRow+30+40+kRow+kRow+2*4+8;
-        UIView*card=[self card:CGRectMake(8,y,cw,cardH) title:@"COMBAT" col:C(1.f,.45f,.20f,1)];
-        [sv addSubview:card];y+=cardH+6;
-        CGFloat ry=18;UIColor*cc=C(1.f,.45f,.20f,1);
-        self.rowAim=[[ToggleRow alloc]initWithTitle:@"Silent Aim" color:cc width:cw-16];
-        self.rowAim.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowAim];ry+=kRow+2;
-        self.rowTriggerbot=[[ToggleRow alloc]initWithTitle:@"Triggerbot" color:cc width:cw-16];
-        self.rowTriggerbot.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowTriggerbot];ry+=kRow+2;
-        // bone segment
-        self.boneSegment=[[UISegmentedControl alloc]initWithItems:@[@"Голова",@"Грудь",@"Таз"]];
-        self.boneSegment.frame=CGRectMake(8,ry,cw-16,26);
-        self.boneSegment.selectedSegmentIndex=0;self.boneSegment.tintColor=cc;
-        if(@available(iOS 13,*)){
-            NSDictionary*n=@{NSForegroundColorAttributeName:C(.7f,.7f,.75f,1),NSFontAttributeName:[UIFont systemFontOfSize:9.5f]};
-            NSDictionary*s=@{NSForegroundColorAttributeName:[UIColor whiteColor],NSFontAttributeName:[UIFont systemFontOfSize:9.5f]};
-            [self.boneSegment setTitleTextAttributes:n forState:UIControlStateNormal];
-            [self.boneSegment setTitleTextAttributes:s forState:UIControlStateSelected];
-        }
-        [card addSubview:self.boneSegment];ry+=30;
-        // FOV
-        self.fovLabel=[[UILabel alloc]initWithFrame:CGRectMake(cw-52,ry,44,12)];
-        self.fovLabel.text=@"60°";self.fovLabel.textAlignment=NSTextAlignmentRight;
-        self.fovLabel.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-        self.fovLabel.textColor=cc;[card addSubview:self.fovLabel];
-        UILabel*fovT=[[UILabel alloc]initWithFrame:CGRectMake(8,ry,30,12)];
-        fovT.text=@"FOV";fovT.font=[UIFont systemFontOfSize:9];fovT.textColor=C(.6f,.6f,.65f,1);[card addSubview:fovT];
-        self.fovSlider=[[UISlider alloc]initWithFrame:CGRectMake(8,ry+14,cw-16,22)];
-        self.fovSlider.minimumValue=5.f;self.fovSlider.maximumValue=180.f;self.fovSlider.value=60.f;
-        self.fovSlider.minimumTrackTintColor=cc;self.fovSlider.maximumTrackTintColor=C(.25f,.25f,.3f,1);
-        [card addSubview:self.fovSlider];ry+=40;
-        self.rowRapidFire=[[ToggleRow alloc]initWithTitle:@"Rapid Fire" color:cc width:cw-16];
-        self.rowRapidFire.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowRapidFire];ry+=kRow+2;
-        self.rowNoRecoil=[[ToggleRow alloc]initWithTitle:@"No Recoil" color:cc width:cw-16];
-        self.rowNoRecoil.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowNoRecoil];
+    if (g_localCtrl) {
+        uintptr_t net = Ptr(g_localCtrl + OFF_PC_NETWORK);
+        if (net) g_localPos = Rd<Vec3>(net + OFF_NET_POSITION);
     }
 
-    // ── VISUALS ───────────────────────────────────────────────────────────────
-    {
-        CGFloat cardH=18+kRow+2+kRow+6;
-        UIView*card=[self card:CGRectMake(8,y,cw,cardH) title:@"VISUALS" col:C(.27f,.52f,1.f,1)];
-        [sv addSubview:card];y+=cardH+6;
-        CGFloat ry=18;UIColor*vc=C(.27f,.52f,1.f,1);
-        self.rowEsp=[[ToggleRow alloc]initWithTitle:@"ESP + Дистанция" color:vc width:cw-16];
-        self.rowEsp.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowEsp];ry+=kRow+2;
-        self.rowWallhack=[[ToggleRow alloc]initWithTitle:@"Wallhack" color:vc width:cw-16];
-        self.rowWallhack.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowWallhack];
-    }
+    UpdatePlayers();
+    DoAimbot(g_localCtrl);
 
-    // ── PLAYER ────────────────────────────────────────────────────────────────
-    {
-        // God + InfAmmo + Speed(+slider) + Noclip + FreezeBots + LowGrav(+slider)
-        CGFloat cardH=18+kRow+kRow+(kRow+40)+kRow+kRow+(kRow+40)+2*5+8;
-        UIView*card=[self card:CGRectMake(8,y,cw,cardH) title:@"PLAYER" col:C(.40f,.85f,.55f,1)];
-        [sv addSubview:card];y+=cardH+6;
-        CGFloat ry=18;UIColor*gc=C(.40f,.85f,.55f,1);
-        self.rowGod=[[ToggleRow alloc]initWithTitle:@"God Mode" color:gc width:cw-16];
-        self.rowGod.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowGod];ry+=kRow+2;
-        self.rowInfAmmo=[[ToggleRow alloc]initWithTitle:@"Infinite Ammo" color:gc width:cw-16];
-        self.rowInfAmmo.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowInfAmmo];ry+=kRow+2;
-        self.rowSpeed=[[ToggleRow alloc]initWithTitle:@"Speed Hack" color:gc width:cw-16];
-        self.rowSpeed.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowSpeed];ry+=kRow;
-        self.speedLabel=[[UILabel alloc]initWithFrame:CGRectMake(cw-52,ry,44,12)];
-        self.speedLabel.text=@"12.0";self.speedLabel.textAlignment=NSTextAlignmentRight;
-        self.speedLabel.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-        self.speedLabel.textColor=gc;[card addSubview:self.speedLabel];
-        UILabel*spT=[[UILabel alloc]initWithFrame:CGRectMake(8,ry,60,12)];
-        spT.text=@"Скорость";spT.font=[UIFont systemFontOfSize:9];spT.textColor=C(.6f,.6f,.65f,1);[card addSubview:spT];
-        self.speedSlider=[[UISlider alloc]initWithFrame:CGRectMake(8,ry+14,cw-16,22)];
-        self.speedSlider.minimumValue=6.f;self.speedSlider.maximumValue=30.f;self.speedSlider.value=12.f;
-        self.speedSlider.minimumTrackTintColor=gc;self.speedSlider.maximumTrackTintColor=C(.25f,.25f,.3f,1);
-        [card addSubview:self.speedSlider];ry+=40;
-        self.rowNoclip=[[ToggleRow alloc]initWithTitle:@"Noclip" color:gc width:cw-16];
-        self.rowNoclip.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowNoclip];ry+=kRow+2;
-        // NEW
-        self.rowFreezeBots=[[ToggleRow alloc]initWithTitle:@"Freeze Enemies" color:gc width:cw-16];
-        self.rowFreezeBots.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowFreezeBots];ry+=kRow+2;
-        self.rowLowGrav=[[ToggleRow alloc]initWithTitle:@"Low Gravity" color:gc width:cw-16];
-        self.rowLowGrav.frame=CGRectMake(8,ry,cw-16,kRow);[card addSubview:self.rowLowGrav];ry+=kRow;
-        self.gravLabel=[[UILabel alloc]initWithFrame:CGRectMake(cw-52,ry,44,12)];
-        self.gravLabel.text=@"0.15";self.gravLabel.textAlignment=NSTextAlignmentRight;
-        self.gravLabel.font=[UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-        self.gravLabel.textColor=gc;[card addSubview:self.gravLabel];
-        UILabel*gvT=[[UILabel alloc]initWithFrame:CGRectMake(8,ry,60,12)];
-        gvT.text=@"Гравитация";gvT.font=[UIFont systemFontOfSize:9];gvT.textColor=C(.6f,.6f,.65f,1);[card addSubview:gvT];
-        self.gravSlider=[[UISlider alloc]initWithFrame:CGRectMake(8,ry+14,cw-16,22)];
-        self.gravSlider.minimumValue=0.0f;self.gravSlider.maximumValue=0.8f;self.gravSlider.value=0.15f;
-        self.gravSlider.minimumTrackTintColor=gc;self.gravSlider.maximumTrackTintColor=C(.25f,.25f,.3f,1);
-        [card addSubview:self.gravSlider];
-    }
-
-    sv.contentSize=CGSizeMake(f.size.width,y+8);
-
-    CALayer*bdr=[CALayer layer];bdr.frame=CGRectMake(0,0,f.size.width,f.size.height);
-    bdr.borderColor=C(.22f,.22f,.28f,.65f).CGColor;bdr.borderWidth=1;bdr.cornerRadius=kR;
-    [self.layer addSublayer:bdr];
-    return self;
-}
--(UIView*)card:(CGRect)frame title:(NSString*)title col:(UIColor*)col{
-    UIView*card=[[UIView alloc]initWithFrame:frame];
-    card.backgroundColor=C(.10f,.10f,.13f,1);card.layer.cornerRadius=7;
-    UILabel*lbl=[[UILabel alloc]initWithFrame:CGRectMake(8,5,frame.size.width-16,11)];
-    lbl.text=title;lbl.font=[UIFont systemFontOfSize:8 weight:UIFontWeightSemibold];
-    lbl.textColor=col;[card addSubview:lbl];
-    return card;
-}
--(void)pan:(UIPanGestureRecognizer*)g{
-    CGPoint loc=[g locationInView:self.superview];
-    if(g.state==UIGestureRecognizerStateBegan)_drag=CGPointMake(loc.x-self.frame.origin.x,loc.y-self.frame.origin.y);
-    else if(g.state==UIGestureRecognizerStateChanged){CGRect r=self.frame;r.origin=CGPointMake(loc.x-_drag.x,loc.y-_drag.y);self.frame=r;}
-}
-@end
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PassthroughWindow / PassthroughView
-// FIX: правильная логика hitTest — пропускаем только само окно и его рут-вью,
-//      всё что ниже в иерархии проверяем обычным super hitTest.
-//      Старая версия возвращала nil для всего → тачи зависали.
-// ═══════════════════════════════════════════════════════════════════════════════
-@interface PassthroughWindow:UIWindow @end
-@implementation PassthroughWindow
--(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e{
-    UIView*hit=[super hitTest:p withEvent:e];
-    // если хит пришёлся на само окно или на рут-вью — это "пустое" пространство,
-    // пропускаем в игру
-    if(hit==self||hit==(UIView*)self.rootViewController.view)return nil;
-    return hit;
-}
-@end
-
-@interface PassthroughView:UIView @end
-@implementation PassthroughView
--(UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e{
-    UIView*hit=[super hitTest:p withEvent:e];
-    // если хит сам PassthroughView — пропускаем (игровой ввод под ним)
-    if(hit==self)return nil;
-    return hit;
-}
-@end
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CheatController
-// ═══════════════════════════════════════════════════════════════════════════════
-@interface CheatController:NSObject @end
-@implementation CheatController{
-    PassthroughWindow*_win;MenuView*_menu;
-    ESPView*_espView;FOVCircleView*_fovView;PillButton*_pill;CADisplayLink*_dl;
-}
-+(instancetype)shared{static CheatController*i;static dispatch_once_t o;dispatch_once(&o,^{i=[CheatController new];});return i;}
--(instancetype)init{self=[super init];[self build];return self;}
-
--(void)build{
-    UIWindowScene*scene=nil;
-    for(UIScene*s in[UIApplication sharedApplication].connectedScenes)
-        if([s isKindOfClass:[UIWindowScene class]]){scene=(UIWindowScene*)s;break;}
-    _win=scene?[[PassthroughWindow alloc]initWithWindowScene:scene]:[[PassthroughWindow alloc]initWithFrame:[UIScreen mainScreen].bounds];
-    _win.windowLevel=UIWindowLevelAlert+200;_win.backgroundColor=[UIColor clearColor];
-    PassthroughView*pv=[[PassthroughView alloc]initWithFrame:[UIScreen mainScreen].bounds];
-    pv.backgroundColor=[UIColor clearColor];
-    UIViewController*vc=[UIViewController new];vc.view=pv;
-    _win.rootViewController=vc;_win.hidden=NO;
-
-    _espView=[ESPView new];[pv addSubview:_espView];
-    _fovView=[FOVCircleView new];[pv addSubview:_fovView];
-
-    CGSize scr=[UIScreen mainScreen].bounds.size;
-    CGFloat menuH=MIN(kMaxH,scr.height-60.f);
-    _menu=[[MenuView alloc]initWithFrame:CGRectMake((scr.width-kW)*.5f,(scr.height-menuH)*.5f,kW,menuH)];
-    [pv addSubview:_menu];
-
-    __weak CheatController*ws=self;
-    _pill=[PillButton new];_pill.action=^{[ws doShow];};_pill.hidden=YES;
-    [pv addSubview:_pill];
-
-    [_menu.hideBtn           addTarget:self action:@selector(doHide)              forControlEvents:UIControlEventTouchUpInside];
-    [_menu.rowAim.sw         addTarget:self action:@selector(aimChanged:)         forControlEvents:UIControlEventValueChanged];
-    [_menu.rowTriggerbot.sw  addTarget:self action:@selector(triggerbotChanged:)  forControlEvents:UIControlEventValueChanged];
-    [_menu.rowEsp.sw         addTarget:self action:@selector(espChanged:)         forControlEvents:UIControlEventValueChanged];
-    [_menu.rowGod.sw         addTarget:self action:@selector(godChanged:)         forControlEvents:UIControlEventValueChanged];
-    [_menu.rowInfAmmo.sw     addTarget:self action:@selector(infAmmoChanged:)     forControlEvents:UIControlEventValueChanged];
-    [_menu.rowSpeed.sw       addTarget:self action:@selector(speedChanged:)       forControlEvents:UIControlEventValueChanged];
-    [_menu.rowNoclip.sw      addTarget:self action:@selector(noclipChanged:)      forControlEvents:UIControlEventValueChanged];
-    [_menu.rowNoRecoil.sw    addTarget:self action:@selector(noRecoilChanged:)    forControlEvents:UIControlEventValueChanged];
-    [_menu.rowWallhack.sw    addTarget:self action:@selector(wallhackChanged:)    forControlEvents:UIControlEventValueChanged];
-    [_menu.rowRapidFire.sw   addTarget:self action:@selector(rapidFireChanged:)   forControlEvents:UIControlEventValueChanged];
-    [_menu.rowFreezeBots.sw  addTarget:self action:@selector(freezeBotsChanged:)  forControlEvents:UIControlEventValueChanged];
-    [_menu.rowLowGrav.sw     addTarget:self action:@selector(lowGravChanged:)     forControlEvents:UIControlEventValueChanged];
-    [_menu.fovSlider         addTarget:self action:@selector(fovChanged:)         forControlEvents:UIControlEventValueChanged];
-    [_menu.boneSegment       addTarget:self action:@selector(boneChanged:)        forControlEvents:UIControlEventValueChanged];
-    [_menu.speedSlider       addTarget:self action:@selector(speedValChanged:)    forControlEvents:UIControlEventValueChanged];
-    [_menu.gravSlider        addTarget:self action:@selector(gravValChanged:)     forControlEvents:UIControlEventValueChanged];
-
-    _dl=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    _dl.preferredFramesPerSecond=30;
-    [_dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_espView setNeedsDisplay];
+    });
 }
 
-// ── toggle handlers ───────────────────────────────────────────────────────────
--(void)aimChanged:(UISwitch*)sw{
-    g_aimOn=sw.isOn;
-    if(g_aimOn){if(!g_initDone)InitClasses();if(!g_hookShoot)InstallHooks();}
-    [_menu.rowAim setOn:g_aimOn];[_fovView setNeedsDisplay];
+// ═══════════════════════════════════════════════════════════════════
+//  HOOK: TournamentWallHack.Awake — ловим singleton
+// ═══════════════════════════════════════════════════════════════════
+typedef void (*t_Awake)(uintptr_t);
+static t_Awake orig_TWH_Awake = nullptr;
+static t_Awake orig_WF_Awake  = nullptr;
+
+static void Hook_TWH_Awake(uintptr_t thiz) {
+    orig_TWH_Awake(thiz);
+    g_TWH_instance = thiz;
 }
--(void)triggerbotChanged:(UISwitch*)sw{
-    g_triggerbotOn=sw.isOn;
-    if(g_triggerbotOn){if(!g_initDone)InitClasses();if(!g_hookShoot)InstallHooks();}
-    [_menu.rowTriggerbot setOn:g_triggerbotOn];[_fovView setNeedsDisplay];
-}
--(void)espChanged:(UISwitch*)sw{
-    g_espOn=sw.isOn;if(g_espOn&&!g_initDone)InitClasses();
-    [_menu.rowEsp setOn:g_espOn];if(!g_espOn){g_espCount=0;[_espView setNeedsDisplay];}
-}
--(void)godChanged:(UISwitch*)sw{
-    g_godOn=sw.isOn;if(g_godOn&&!g_initDone)InitClasses();[_menu.rowGod setOn:g_godOn];
-}
--(void)infAmmoChanged:(UISwitch*)sw{
-    g_infAmmoOn=sw.isOn;if(g_infAmmoOn&&!g_initDone)InitClasses();[_menu.rowInfAmmo setOn:g_infAmmoOn];
-}
--(void)speedChanged:(UISwitch*)sw{
-    g_speedOn=sw.isOn;if(g_speedOn&&!g_initDone)InitClasses();
-    [_menu.rowSpeed setOn:g_speedOn];
-    // НЕ сбрасываем g_origSpeed здесь — TickSpeed восстановит сам в следующем тике
-}
--(void)speedValChanged:(UISlider*)sl{
-    g_speedVal=sl.value;
-    _menu.speedLabel.text=[NSString stringWithFormat:@"%.1f",g_speedVal];
-    g_noclipSpeed=g_speedVal;
-}
--(void)noclipChanged:(UISwitch*)sw{
-    g_noclipOn=sw.isOn;if(g_noclipOn&&!g_initDone)InitClasses();[_menu.rowNoclip setOn:g_noclipOn];
-}
--(void)noRecoilChanged:(UISwitch*)sw{
-    g_noRecoilOn=sw.isOn;if(g_noRecoilOn&&!g_initDone)InitClasses();[_menu.rowNoRecoil setOn:g_noRecoilOn];
-}
--(void)wallhackChanged:(UISwitch*)sw{
-    g_wallhackOn=sw.isOn;if(g_wallhackOn&&!g_initDone)InitClasses();[_menu.rowWallhack setOn:g_wallhackOn];
-}
--(void)rapidFireChanged:(UISwitch*)sw{
-    g_rapidFireOn=sw.isOn;if(g_rapidFireOn&&!g_initDone)InitClasses();[_menu.rowRapidFire setOn:g_rapidFireOn];
-}
--(void)freezeBotsChanged:(UISwitch*)sw{
-    g_freezeBotsOn=sw.isOn;if(g_freezeBotsOn&&!g_initDone)InitClasses();[_menu.rowFreezeBots setOn:g_freezeBotsOn];
-}
--(void)lowGravChanged:(UISwitch*)sw{
-    g_lowGravOn=sw.isOn;if(g_lowGravOn&&!g_initDone)InitClasses();[_menu.rowLowGrav setOn:g_lowGravOn];
-}
--(void)fovChanged:(UISlider*)sl{
-    g_aimFov=sl.value;
-    _menu.fovLabel.text=[NSString stringWithFormat:@"%.0f°",g_aimFov];
-    if(g_aimOn||g_triggerbotOn)[_fovView setNeedsDisplay];
-}
--(void)boneChanged:(UISegmentedControl*)seg{g_aimBone=(int)seg.selectedSegmentIndex;}
--(void)gravValChanged:(UISlider*)sl{
-    g_gravScale=sl.value;
-    _menu.gravLabel.text=[NSString stringWithFormat:@"%.2f",g_gravScale];
+static void Hook_WF_Awake(uintptr_t thiz) {
+    orig_WF_Awake(thiz);
+    g_WF_instance = thiz;
 }
 
-// ── game loop ─────────────────────────────────────────────────────────────────
--(void)tick{
-    BOOL needInit=g_espOn||g_aimOn||g_triggerbotOn||g_godOn||g_infAmmoOn||
-                  g_speedOn||g_noclipOn||g_noRecoilOn||g_wallhackOn||
-                  g_rapidFireOn||g_freezeBotsOn||g_lowGravOn;
-    if(!g_initDone&&needInit)InitClasses();
-
-    if(g_espOn){UpdateESP();[_espView setNeedsDisplay];}
-    if(g_godOn)        TickGodMode();
-    if(g_infAmmoOn)    TickInfAmmo();
-    TickSpeed();    // всегда: восстанавливает скорость при выключении
-    TickNoclip();   // всегда: выключает noclip при g_noclipOn=NO
-    TickLowGrav();  // всегда: восстанавливает гравитацию при выключении
-    if(g_noRecoilOn)   TickNoRecoil();
-    if(g_wallhackOn)   TickWallhack();
-    if(g_rapidFireOn)  TickRapidFire();
-    if(g_freezeBotsOn) TickFreezeBots();
-    if(g_triggerbotOn) TickTriggerbot();
+// ═══════════════════════════════════════════════════════════════════
+//  HOOK: PlayerController.Awake — локальный игрок
+// ═══════════════════════════════════════════════════════════════════
+// FILL: это упрощение — правильнее фильтровать по PhotonView.IsMine
+// но PlayerController.Awake вызывается один раз — первый экземпляр = local
+typedef void (*t_PCAwake)(uintptr_t);
+static t_PCAwake orig_PCAwake = nullptr;
+static void Hook_PCAwake(uintptr_t thiz) {
+    orig_PCAwake(thiz);
+    if (!g_localCtrl) g_localCtrl = thiz;
 }
 
-// ── show/hide ─────────────────────────────────────────────────────────────────
--(void)doShow{
-    _pill.hidden=YES;_menu.hidden=NO;_menu.alpha=0;
-    _menu.transform=CGAffineTransformMakeScale(.88f,.88f);
-    [UIView animateWithDuration:kDur delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-        self->_menu.alpha=1;self->_menu.transform=CGAffineTransformIdentity;
-    }completion:nil];
+// ═══════════════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════════════
+static void Init() {
+    if (!Il2CppInit()) return;
+    void* img = GetMainImage();
+    if (!img) return;
+
+    // Unity calls
+    uintptr_t a;
+    a = FindMethod(img, "UnityEngine", "Transform", "get_position_Injected", 1);
+    Transform_get_position = (t_GetPos)a;
+
+    a = FindMethod(img, "UnityEngine", "Transform", "set_eulerAngles_Injected", 1);
+    Transform_set_eulerAngles = (t_SetEuler)a;
+
+    a = FindMethod(img, "UnityEngine", "Camera", "get_projectionMatrix_Injected", 1);
+    Camera_get_proj = (t_GetMatrix)a;
+
+    a = FindMethod(img, "UnityEngine", "Camera", "get_worldToCameraMatrix_Injected", 1);
+    Camera_get_w2cam = (t_GetMatrix)a;
+
+    // Chams API
+    a = FindMethod(img, "", "TournamentWallHack", "SetOnOutline", 0);
+    TWH_SetOnOutline = (t_TWH_SetOnOutline)a;
+
+    a = FindMethod(img, "", "TournamentWallHack", "SetOff", 0);
+    TWH_SetOff = (t_TWH_SetOff)a;
+
+    a = FindMethod(img, "", "WireframeWallhack", "SetEnabled", 1);
+    WF_SetEnabled = (t_WF_SetEnabled)a;
+
+    a = FindMethod(img, "", "WireframeWallhack", "CollectPlayers", 0);
+    WF_CollectPlayers = (t_WF_CollectPlayers)a;
+
+    a = FindMethod(img, "", "WireframeWallhack", "Refresh", 0);
+    WF_Refresh = (t_WF_Refresh)a;
+
+    // Hooks
+    a = FindMethod(img, "UnityEngine", "Camera", "OnPreRender", 0);
+    if (a) MSHookFunction((void*)a, (void*)Hook_OnPreRender, (void**)&orig_OnPreRender);
+
+    a = FindMethod(img, "", "TournamentWallHack", "Awake", 0);
+    if (a) MSHookFunction((void*)a, (void*)Hook_TWH_Awake, (void**)&orig_TWH_Awake);
+
+    a = FindMethod(img, "", "WireframeWallhack", "Awake", 0);
+    if (a) MSHookFunction((void*)a, (void*)Hook_WF_Awake, (void**)&orig_WF_Awake);
+
+    a = FindMethod(img, "", "PlayerController", "Awake", 0);
+    if (a) MSHookFunction((void*)a, (void*)Hook_PCAwake, (void**)&orig_PCAwake);
+
+    // PlayerCulling.Instances static field
+    // FILL: раскомментить когда будет il2cpp_class_get_static_field_data в билде
+    // uintptr_t sf = GetStaticFields(img, "", "PlayerCulling");
+    // if (sf) g_cullingInstances = sf + 0x8; // Instances = первое стат. поле
+
+    // UI
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = UIApplication.sharedApplication.keyWindow;
+        if (!win) return;
+        CGRect s = UIScreen.mainScreen.bounds;
+        g_sw = s.size.width; g_sh = s.size.height;
+        g_center = { g_sw * 0.5f, g_sh * 0.5f };
+
+        g_espView = [[CFESPView alloc] initWithFrame:s];
+        [win addSubview:g_espView];
+
+        g_menu = [[CFMenu alloc] init];
+        [win addSubview:g_menu];
+    });
 }
--(void)doHide{
-    [UIView animateWithDuration:kDur delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
-        self->_menu.alpha=0;self->_menu.transform=CGAffineTransformMakeScale(.94f,.94f);
-    }completion:^(BOOL _){
-        self->_menu.hidden=YES;self->_menu.transform=CGAffineTransformIdentity;self->_pill.hidden=NO;
-    }];
-}
--(void)show{[self doShow];}
-@end
 
 __attribute__((constructor))
-static void Init(void){
-    dispatch_async(dispatch_get_main_queue(),^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
-            [[CheatController shared] show];
-        });
-    });
+static void Entry() {
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+        ^{ Init(); }
+    );
 }
