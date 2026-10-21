@@ -5,14 +5,53 @@
 #include <cmath>
 #include <string>
 #include <stdint.h>
+#include <mach-o/dyld.h>
+#include <sys/mman.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-void MSHookFunction(void* symbol, void* replace, void** result);
-#ifdef __cplusplus
+// ═══════════════════════════════════════════════════════════════════
+//  HOOK ENGINE (без substrate — через прямую запись B/BL инструкции)
+// ═══════════════════════════════════════════════════════════════════
+// arm64 trampoline: 4 инструкции, пишем напрямую в память
+static bool cfHook(void* target, void* replace, void** orig) {
+    if (!target || !replace) return false;
+
+    // снимаем защиту
+    uintptr_t page     = (uintptr_t)target & ~(uintptr_t)(4096 - 1);
+    mprotect((void*)page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    uint32_t* dst = (uint32_t*)target;
+
+    // сохраняем оригинал (первые 4 инструкции)
+    if (orig) {
+        // выделяем трамплин (5 инструкций + бранч назад)
+        void* tramp = mmap(NULL, 64,
+            PROT_READ|PROT_WRITE|PROT_EXEC,
+            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (!tramp) return false;
+        uint32_t* t = (uint32_t*)tramp;
+        // копируем 4 инструкции оригинала
+        t[0] = dst[0]; t[1] = dst[1]; t[2] = dst[2]; t[3] = dst[3];
+        // бранч назад к target+16
+        uintptr_t back = (uintptr_t)target + 16;
+        (void)back;
+        // LDR x16, #8 / BR x16 / <addr64>
+        t[4] = 0x58000050; // ldr x16, #8
+        t[5] = 0xD61F0200; // br x16
+        *((uint64_t*)&t[6]) = (uintptr_t)target + 16;
+        __builtin___clear_cache(tramp, (char*)tramp + 64);
+        *orig = tramp;
+    }
+
+    // пишем хук: LDR x16, #8 / BR x16 / <addr64>
+    dst[0] = 0x58000050; // ldr x16, #8
+    dst[1] = 0xD61F0200; // br x16
+    *((uint64_t*)&dst[2]) = (uint64_t)replace;
+
+    __builtin___clear_cache(target, (char*)target + 16);
+    return true;
 }
-#endif
+
+#define HOOK(target, replace, orig) cfHook((void*)(target), (void*)(replace), (void**)(orig))
 
 // ═══════════════════════════════════════════════════════════════════
 //  OFFSETS
@@ -59,7 +98,7 @@ struct CFMatrix4x4 {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  MEMORY  (без имени Ptr — конфликт с MacTypes.h)
+//  MEMORY
 // ═══════════════════════════════════════════════════════════════════
 template<typename T>
 static inline T cfRd(uintptr_t a) {
@@ -70,12 +109,11 @@ template<typename T>
 static inline void cfWr(uintptr_t a, T v) {
     if (a) *reinterpret_cast<T*>(a) = v;
 }
-static inline uintptr_t cfPtr(uintptr_t a) {
-    return cfRd<uintptr_t>(a);
-}
+static inline uintptr_t cfPtr(uintptr_t a) { return cfRd<uintptr_t>(a); }
+
 static inline uintptr_t listGet(uintptr_t list, int i) {
     uintptr_t arr = cfPtr(list + 0x10);
-    return arr ? cfPtr(arr + 0x20 + (uintptr_t)(i) * 0x8) : 0;
+    return arr ? cfPtr(arr + 0x20 + (uintptr_t)i * 0x8) : 0;
 }
 static inline int listCount(uintptr_t list) {
     return list ? cfRd<int>(list + 0x18) : 0;
@@ -93,37 +131,35 @@ static inline float v2dist(CFVec2 a, CFVec2 b) {
 //  CONFIG
 // ═══════════════════════════════════════════════════════════════════
 struct Config {
-    bool  espEnabled;
-    bool  espBox;
-    bool  espSkeleton;
-    bool  espVisCheck;
+    bool    espEnabled;
+    bool    espBox;
+    bool    espSkeleton;
+    bool    espVisCheck;
     CFColor espColorVis;
     CFColor espColorHid;
-    bool  chamsEnabled;
-    bool  chamsWireframe;
-    bool  aimEnabled;
-    float aimFov;
-    int   aimBone;   // 0=голова 1=грудь 2=таз
-    bool  aimVisOnly;
-    float aimSmooth;
+    bool    chamsEnabled;
+    bool    chamsWireframe;
+    bool    aimEnabled;
+    float   aimFov;
+    int     aimBone;
+    bool    aimVisOnly;
+    float   aimSmooth;
 };
-
 static Config g_cfg;
-
 static void ConfigInit(Config* c) {
-    c->espEnabled    = false;
-    c->espBox        = true;
-    c->espSkeleton   = false;
-    c->espVisCheck   = true;
-    c->espColorVis   = (CFColor){0.f, 1.f, 0.f, 1.f};
-    c->espColorHid   = (CFColor){1.f, 0.f, 0.f, 1.f};
-    c->chamsEnabled  = false;
-    c->chamsWireframe= false;
-    c->aimEnabled    = false;
-    c->aimFov        = 80.f;
-    c->aimBone       = 0;
-    c->aimVisOnly    = true;
-    c->aimSmooth     = 6.f;
+    c->espEnabled     = false;
+    c->espBox         = true;
+    c->espSkeleton    = false;
+    c->espVisCheck    = true;
+    c->espColorVis    = (CFColor){0.f,1.f,0.f,1.f};
+    c->espColorHid    = (CFColor){1.f,0.f,0.f,1.f};
+    c->chamsEnabled   = false;
+    c->chamsWireframe = false;
+    c->aimEnabled     = false;
+    c->aimFov         = 80.f;
+    c->aimBone        = 0;
+    c->aimVisOnly     = true;
+    c->aimSmooth      = 6.f;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -197,9 +233,9 @@ static uintptr_t GetStaticFields(void* img, const char* ns, const char* cls) {
 typedef void (*t_GetPos)(uintptr_t, CFVec3*);
 typedef void (*t_GetMatrix)(uintptr_t, CFMatrix4x4*);
 
-static t_GetPos   Transform_get_position = NULL;
-static t_GetMatrix Camera_get_proj       = NULL;
-static t_GetMatrix Camera_get_w2cam      = NULL;
+static t_GetPos    Transform_get_position = NULL;
+static t_GetMatrix Camera_get_proj        = NULL;
+static t_GetMatrix Camera_get_w2cam       = NULL;
 
 static CFVec3 GetPos(uintptr_t transform) {
     CFVec3 v;
@@ -230,7 +266,7 @@ static uintptr_t g_WF_instance  = 0;
 static void ApplyChams(bool enable) {
     if (g_cfg.chamsWireframe) {
         if (!g_WF_instance) return;
-        if (WF_SetEnabled) WF_SetEnabled(g_WF_instance, enable);
+        if (WF_SetEnabled)               WF_SetEnabled(g_WF_instance, enable);
         if (enable && WF_CollectPlayers) WF_CollectPlayers(g_WF_instance);
         if (enable && WF_Refresh)        WF_Refresh(g_WF_instance);
     } else {
@@ -252,7 +288,7 @@ static void UpdateVP(uintptr_t cam) {
     CFMatrix4x4 proj, w2c;
     memset(&proj, 0, sizeof(proj));
     memset(&w2c,  0, sizeof(w2c));
-    if (Camera_get_proj)  Camera_get_proj(cam, &proj);
+    if (Camera_get_proj)  Camera_get_proj(cam,  &proj);
     if (Camera_get_w2cam) Camera_get_w2cam(cam, &w2c);
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) {
@@ -271,7 +307,7 @@ static bool W2S(CFVec3 world, CFVec2* screen) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  PLAYER DATA
+//  PLAYERS
 // ═══════════════════════════════════════════════════════════════════
 struct Player {
     uintptr_t controller, network, culling, skeleton;
@@ -283,7 +319,7 @@ struct Player {
 };
 
 static std::vector<Player> g_players;
-static uintptr_t g_localCtrl   = 0;
+static uintptr_t g_localCtrl      = 0;
 static CFVec3    g_localPos;
 // FILL: GetStaticFields(img,"","PlayerCulling") + 0x8
 static uintptr_t g_cullingInstances = 0;
@@ -336,8 +372,8 @@ static void UpdatePlayers() {
 
         Player p;
         memset(&p, 0, sizeof(p));
-        p.controller = ctrl; p.network = net;
-        p.culling = culling; p.skeleton = skel;
+        p.controller = ctrl; p.network  = net;
+        p.culling    = culling; p.skeleton = skel;
         p.isDead = dead; p.occluded = occ; p.inFrustum = frus;
         p.headPos = headPos; p.chestPos = chestPos;
         p.pelvisPos = pelvisPos; p.netPos = netPos;
@@ -359,8 +395,7 @@ static void UpdatePlayers() {
 //  AIMBOT
 // ═══════════════════════════════════════════════════════════════════
 static void DoAimbot(uintptr_t localCtrl) {
-    if (!g_cfg.aimEnabled || !localCtrl) return;
-    if (g_players.empty()) return;
+    if (!g_cfg.aimEnabled || !localCtrl || g_players.empty()) return;
 
     float bestDist = g_cfg.aimFov;
     const Player* best = NULL;
@@ -382,7 +417,6 @@ static void DoAimbot(uintptr_t localCtrl) {
     else if (g_cfg.aimBone == 2) tgt = best->pelvisS;
     else                          tgt = best->headS;
 
-    float dx = (tgt.x - g_center.x) / g_cfg.aimSmooth;
     float dy = (tgt.y - g_center.y) / g_cfg.aimSmooth;
 
     uintptr_t lock = cfPtr(localCtrl + OFF_PC_PLAYERLOCK);
@@ -391,15 +425,13 @@ static void DoAimbot(uintptr_t localCtrl) {
     float hipFov = cfRd<float>(lock + OFF_LOCK_HIPFOV);
     if (hipFov < 1.f) hipFov = 60.f;
 
-    float curX   = cfRd<float>(lock + OFF_LOCK_ROTATIONX);
-    float dAngleX = -dy * (hipFov / g_sh);
-    cfWr<float>(lock + OFF_LOCK_ROTATIONX, curX + dAngleX);
-    // горизонталь: FILL Transform_get/set_eulerAngles_Injected на _playerBody
-    (void)dx;
+    float curX = cfRd<float>(lock + OFF_LOCK_ROTATIONX);
+    cfWr<float>(lock + OFF_LOCK_ROTATIONX, curX + (-dy * (hipFov / g_sh)));
+    // горизонталь: FILL eulerAngles на _playerBody
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  ESP OVERLAY
+//  ESP VIEW
 // ═══════════════════════════════════════════════════════════════════
 @interface CFESPView : UIView
 @end
@@ -428,7 +460,6 @@ static void DoAimbot(uintptr_t localCtrl) {
             CGContextStrokeRect(ctx,
                 CGRectMake(p.topS.x - w*0.5f, p.topS.y, w, h));
         }
-
         if (g_cfg.espSkeleton) {
             if (p.headOnS && p.chestOnS) {
                 CGContextMoveToPoint(ctx, p.headS.x, p.headS.y);
@@ -442,7 +473,6 @@ static void DoAimbot(uintptr_t localCtrl) {
             }
         }
     }
-
     if (g_cfg.aimEnabled) {
         CGContextSetRGBStrokeColor(ctx, 1, 1, 0, 0.5f);
         CGContextSetLineWidth(ctx, 1.f);
@@ -466,7 +496,6 @@ static void DoAimbot(uintptr_t localCtrl) {
 @implementation CFMenu {
     CGFloat _y;
 }
-
 - (instancetype)init {
     self = [super initWithFrame:CGRectMake(10, 100, 44, 44)];
     self.backgroundColor = [UIColor clearColor];
@@ -485,7 +514,7 @@ static void DoAimbot(uintptr_t localCtrl) {
     [self addSubview:btn];
 
     _panel = [[UIScrollView alloc] initWithFrame:CGRectMake(50, 0, 270, 420)];
-    _panel.backgroundColor   = [UIColor colorWithRed:.06f green:.06f blue:.1f alpha:.93f];
+    _panel.backgroundColor    = [UIColor colorWithRed:.06f green:.06f blue:.1f alpha:.93f];
     _panel.layer.cornerRadius = 10;
     _panel.layer.borderWidth  = 1;
     _panel.layer.borderColor  =
@@ -500,9 +529,7 @@ static void DoAimbot(uintptr_t localCtrl) {
     [btn addGestureRecognizer:pan];
     return self;
 }
-
 - (void)toggle { _panel.hidden = !_panel.hidden; }
-
 - (void)drag:(UIPanGestureRecognizer*)gr {
     if (gr.state == UIGestureRecognizerStateBegan) {
         _panStart    = [gr locationInView:self.superview];
@@ -515,21 +542,18 @@ static void DoAimbot(uintptr_t localCtrl) {
         self.frame = f;
     }
 }
-
 - (void)section:(NSString*)title {
     UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 18)];
-    l.text      = title;
+    l.text = title;
     l.textColor = [UIColor colorWithRed:.3f green:.7f blue:1 alpha:1];
-    l.font      = [UIFont boldSystemFontOfSize:11];
+    l.font = [UIFont boldSystemFontOfSize:11];
     [_panel addSubview:l];
     _y += 22;
 }
-
 - (void)row:(NSString*)title val:(BOOL)v sel:(SEL)s {
     UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y+3, 190, 20)];
-    l.text      = title;
-    l.textColor = [UIColor whiteColor];
-    l.font      = [UIFont systemFontOfSize:13];
+    l.text = title; l.textColor = [UIColor whiteColor];
+    l.font = [UIFont systemFontOfSize:13];
     [_panel addSubview:l];
     UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(200, _y, 51, 31)];
     sw.transform = CGAffineTransformMakeScale(0.78f, 0.78f);
@@ -538,48 +562,44 @@ static void DoAimbot(uintptr_t localCtrl) {
     [_panel addSubview:sw];
     _y += 36;
 }
-
 - (void)slider:(NSString*)title min:(float)mn max:(float)mx
            val:(float)v sel:(SEL)s tag:(NSInteger)tag {
     UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 16)];
-    l.text      = [NSString stringWithFormat:@"%@ : %.0f", title, v];
+    l.text = [NSString stringWithFormat:@"%@ : %.0f", title, v];
     l.textColor = [UIColor lightGrayColor];
-    l.font      = [UIFont systemFontOfSize:11];
-    l.tag       = tag;
+    l.font = [UIFont systemFontOfSize:11];
+    l.tag = tag;
     [_panel addSubview:l];
     _y += 18;
     UISlider* sl = [[UISlider alloc] initWithFrame:CGRectMake(10, _y, 250, 26)];
     sl.minimumValue = mn; sl.maximumValue = mx; sl.value = v;
-    sl.tintColor    = [UIColor colorWithRed:.2f green:.5f blue:1 alpha:1];
-    sl.tag          = tag;
+    sl.tintColor = [UIColor colorWithRed:.2f green:.5f blue:1 alpha:1];
+    sl.tag = tag;
     [sl addTarget:self action:s forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:sl];
     _y += 32;
 }
-
 - (void)buildUI {
     _y = 10;
     [self section:@"\u2500\u2500\u2500 ESP \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"];
-    [self row:@"ESP"            val:(BOOL)g_cfg.espEnabled  sel:@selector(onESP:)];
-    [self row:@"Box"            val:(BOOL)g_cfg.espBox      sel:@selector(onBox:)];
-    [self row:@"Skeleton"       val:(BOOL)g_cfg.espSkeleton sel:@selector(onSkel:)];
-    [self row:@"Vis check"      val:(BOOL)g_cfg.espVisCheck sel:@selector(onVis:)];
-
+    [self row:@"ESP"       val:(BOOL)g_cfg.espEnabled  sel:@selector(onESP:)];
+    [self row:@"Box"       val:(BOOL)g_cfg.espBox      sel:@selector(onBox:)];
+    [self row:@"Skeleton"  val:(BOOL)g_cfg.espSkeleton sel:@selector(onSkel:)];
+    [self row:@"Vis check" val:(BOOL)g_cfg.espVisCheck sel:@selector(onVis:)];
     [self section:@"\u2500\u2500\u2500 CHAMS \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"];
-    [self row:@"Chams"          val:(BOOL)g_cfg.chamsEnabled    sel:@selector(onChams:)];
-    [self row:@"Wireframe"      val:(BOOL)g_cfg.chamsWireframe  sel:@selector(onWF:)];
-
+    [self row:@"Chams"     val:(BOOL)g_cfg.chamsEnabled    sel:@selector(onChams:)];
+    [self row:@"Wireframe" val:(BOOL)g_cfg.chamsWireframe  sel:@selector(onWF:)];
     [self section:@"\u2500\u2500\u2500 AIMBOT \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"];
-    [self row:@"Aimbot"         val:(BOOL)g_cfg.aimEnabled  sel:@selector(onAim:)];
+    [self row:@"Aimbot"    val:(BOOL)g_cfg.aimEnabled  sel:@selector(onAim:)];
     [self row:@"\u0422\u043e\u043b\u044c\u043a\u043e \u0432\u0438\u0434\u0438\u043c\u044b\u0435"
               val:(BOOL)g_cfg.aimVisOnly sel:@selector(onAimVis:)];
     [self slider:@"FOV"    min:10 max:350 val:g_cfg.aimFov    sel:@selector(onFov:)    tag:100];
     [self slider:@"Smooth" min:1  max:25  val:g_cfg.aimSmooth sel:@selector(onSmooth:) tag:101];
 
     UILabel* bl = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 16)];
-    bl.text      = @"\u0426\u0435\u043b\u044c";
+    bl.text = @"\u0426\u0435\u043b\u044c";
     bl.textColor = [UIColor lightGrayColor];
-    bl.font      = [UIFont systemFontOfSize:11];
+    bl.font = [UIFont systemFontOfSize:11];
     [_panel addSubview:bl];
     _y += 18;
 
@@ -596,7 +616,6 @@ static void DoAimbot(uintptr_t localCtrl) {
 
     _panel.contentSize = CGSizeMake(270, _y + 16);
 }
-
 - (void)onESP:(UISwitch*)s    { g_cfg.espEnabled    = s.on; }
 - (void)onBox:(UISwitch*)s    { g_cfg.espBox        = s.on; }
 - (void)onSkel:(UISwitch*)s   { g_cfg.espSkeleton   = s.on; }
@@ -605,9 +624,7 @@ static void DoAimbot(uintptr_t localCtrl) {
 - (void)onWF:(UISwitch*)s     { g_cfg.chamsWireframe= s.on; ApplyChams(g_cfg.chamsEnabled); }
 - (void)onAim:(UISwitch*)s    { g_cfg.aimEnabled    = s.on; }
 - (void)onAimVis:(UISwitch*)s { g_cfg.aimVisOnly    = s.on; }
-- (void)onBone:(UISegmentedControl*)sc {
-    g_cfg.aimBone = (int)sc.selectedSegmentIndex;
-}
+- (void)onBone:(UISegmentedControl*)sc { g_cfg.aimBone = (int)sc.selectedSegmentIndex; }
 - (void)onFov:(UISlider*)sl {
     g_cfg.aimFov = sl.value;
     UILabel* l = (UILabel*)[_panel viewWithTag:100];
@@ -623,31 +640,24 @@ static void DoAimbot(uintptr_t localCtrl) {
 // ═══════════════════════════════════════════════════════════════════
 //  HOOKS
 // ═══════════════════════════════════════════════════════════════════
-static CFESPView* g_espView  = nil;
-static CFMenu*    g_menu     = nil;
-static uintptr_t  g_mainCam  = 0;
+static CFESPView* g_espView = nil;
+static CFMenu*    g_menu    = nil;
+static uintptr_t  g_mainCam = 0;
 
 typedef void (*t_OnPreRender)(uintptr_t);
 static t_OnPreRender orig_OnPreRender = NULL;
-
 static void Hook_OnPreRender(uintptr_t thiz) {
     orig_OnPreRender(thiz);
     if (!g_mainCam) g_mainCam = thiz;
     if (thiz != g_mainCam) return;
-
     UpdateVP(thiz);
-
     if (g_localCtrl) {
         uintptr_t net = cfPtr(g_localCtrl + OFF_PC_NETWORK);
         if (net) g_localPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
     }
-
     UpdatePlayers();
     DoAimbot(g_localCtrl);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [g_espView setNeedsDisplay];
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ [g_espView setNeedsDisplay]; });
 }
 
 typedef void (*t_Awake)(uintptr_t);
@@ -655,18 +665,31 @@ static t_Awake orig_TWH_Awake = NULL;
 static t_Awake orig_WF_Awake  = NULL;
 static t_Awake orig_PCAwake   = NULL;
 
-static void Hook_TWH_Awake(uintptr_t thiz) {
-    orig_TWH_Awake(thiz);
-    g_TWH_instance = thiz;
-}
-static void Hook_WF_Awake(uintptr_t thiz) {
-    orig_WF_Awake(thiz);
-    g_WF_instance = thiz;
-}
-static void Hook_PCAwake(uintptr_t thiz) {
+static void Hook_TWH_Awake(uintptr_t thiz) { orig_TWH_Awake(thiz); g_TWH_instance = thiz; }
+static void Hook_WF_Awake(uintptr_t  thiz) { orig_WF_Awake(thiz);  g_WF_instance  = thiz; }
+static void Hook_PCAwake(uintptr_t   thiz) {
     orig_PCAwake(thiz);
-    // FILL: фильтр по PhotonView.IsMine чтобы взять только local
+    // FILL: фильтр PhotonView.IsMine
     if (!g_localCtrl) g_localCtrl = thiz;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  UIWindow helper — iOS 13+ совместимо
+// ═══════════════════════════════════════════════════════════════════
+static UIWindow* GetKeyWindow() {
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene* scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow* w in scene.windows) {
+                    if (w.isKeyWindow) return w;
+                }
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -674,9 +697,9 @@ static void Hook_PCAwake(uintptr_t thiz) {
 // ═══════════════════════════════════════════════════════════════════
 static void Init() {
     ConfigInit(&g_cfg);
-    memset(&g_localPos,  0, sizeof(g_localPos));
-    memset(&g_viewProj,  0, sizeof(g_viewProj));
-    memset(&g_center,    0, sizeof(g_center));
+    memset(&g_localPos, 0, sizeof(g_localPos));
+    memset(&g_viewProj, 0, sizeof(g_viewProj));
+    memset(&g_center,   0, sizeof(g_center));
 
     if (!Il2CppInit()) return;
     void* img = GetMainImage();
@@ -709,24 +732,23 @@ static void Init() {
     WF_Refresh = (t_WF_Refresh)a;
 
     a = FindMethod(img, "UnityEngine", "Camera", "OnPreRender", 0);
-    if (a) MSHookFunction((void*)a, (void*)Hook_OnPreRender, (void**)&orig_OnPreRender);
+    if (a) HOOK(a, Hook_OnPreRender, &orig_OnPreRender);
 
     a = FindMethod(img, "", "TournamentWallHack", "Awake", 0);
-    if (a) MSHookFunction((void*)a, (void*)Hook_TWH_Awake, (void**)&orig_TWH_Awake);
+    if (a) HOOK(a, Hook_TWH_Awake, &orig_TWH_Awake);
 
     a = FindMethod(img, "", "WireframeWallhack", "Awake", 0);
-    if (a) MSHookFunction((void*)a, (void*)Hook_WF_Awake, (void**)&orig_WF_Awake);
+    if (a) HOOK(a, Hook_WF_Awake, &orig_WF_Awake);
 
     a = FindMethod(img, "", "PlayerController", "Awake", 0);
-    if (a) MSHookFunction((void*)a, (void*)Hook_PCAwake, (void**)&orig_PCAwake);
+    if (a) HOOK(a, Hook_PCAwake, &orig_PCAwake);
 
-    // PlayerCulling.Instances
-    // раскомментить после проверки оффсета:
+    // PlayerCulling.Instances — раскомментить после проверки оффсета:
     // uintptr_t sf = GetStaticFields(img, "", "PlayerCulling");
     // if (sf) g_cullingInstances = sf + 0x8;
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = [UIApplication sharedApplication].keyWindow;
+        UIWindow* win = GetKeyWindow(); // ← фикс: было .keyWindow напрямую
         if (!win) return;
         CGRect s = [UIScreen mainScreen].bounds;
         g_sw = (float)s.size.width;
@@ -736,7 +758,6 @@ static void Init() {
 
         g_espView = [[CFESPView alloc] initWithFrame:s];
         [win addSubview:g_espView];
-
         g_menu = [[CFMenu alloc] init];
         [win addSubview:g_menu];
     });
