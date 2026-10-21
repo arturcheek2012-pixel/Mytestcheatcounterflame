@@ -748,19 +748,39 @@ static void Init() {
     // uintptr_t sf = GetStaticFields(img, "", "PlayerCulling");
     // if (sf) g_cullingInstances = sf + 0x8;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetKeyWindow(); // ← фикс: было .keyWindow напрямую
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+        UIWindow* win = GetKeyWindow();
+        if (!win) {
+            // последняя попытка — берём любое видимое окно
+            NSArray* wins = [UIApplication sharedApplication].windows;
+            for (UIWindow* w in wins) {
+                if (!w.isHidden) { win = w; break; }
+            }
+        }
         if (!win) return;
+
         CGRect s = [UIScreen mainScreen].bounds;
         g_sw = (float)s.size.width;
         g_sh = (float)s.size.height;
         g_center.x = g_sw * 0.5f;
         g_center.y = g_sh * 0.5f;
 
+        // отдельное окно поверх всего — меню точно не перекроется
+        UIWindow* overlay = [[UIWindow alloc] initWithFrame:s];
+        overlay.windowLevel            = UIWindowLevelAlert + 100;
+        overlay.backgroundColor        = [UIColor clearColor];
+        overlay.userInteractionEnabled = YES;
+        overlay.hidden                 = NO;
+
         g_espView = [[CFESPView alloc] initWithFrame:s];
-        [win addSubview:g_espView];
+        g_espView.userInteractionEnabled = NO;
+        [overlay addSubview:g_espView];
+
         g_menu = [[CFMenu alloc] init];
-        [win addSubview:g_menu];
+        [overlay addSubview:g_menu];
+        [overlay makeKeyAndVisible];
     });
 }
 
