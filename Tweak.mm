@@ -11,7 +11,7 @@
 #include <libkern/OSCacheControl.h>
 
 // ═══════════════════════════════════════════════════════════════════
-//  HOOK ENGINE (arm64 inline hook)
+//  HOOK ENGINE
 // ═══════════════════════════════════════════════════════════════════
 static bool cfHook(void* target, void* replace, void** orig) {
     if (!target || !replace) return false;
@@ -42,7 +42,7 @@ static bool cfHook(void* target, void* replace, void** orig) {
 #define HOOK(target, replace, orig) cfHook((void*)(target), (void*)(replace), (void**)(orig))
 
 // ═══════════════════════════════════════════════════════════════════
-//  OFFSETS (из дампа)
+//  OFFSETS
 // ═══════════════════════════════════════════════════════════════════
 #define OFF_PC_FPSCAM        0x28
 #define OFF_PC_MAINCAM       0x30
@@ -81,21 +81,26 @@ struct CFColor { float r, g, b, a; };
 // ═══════════════════════════════════════════════════════════════════
 template<typename T>
 static inline T cfRd(uintptr_t a) {
-    if (!a) { T z; memset(&z,0,sizeof(z)); return z; }
+    if (a < 0x10000) { T z; memset(&z,0,sizeof(z)); return z; }
     return *reinterpret_cast<T*>(a);
 }
 template<typename T>
 static inline void cfWr(uintptr_t a, T v) {
-    if (a) *reinterpret_cast<T*>(a) = v;
+    if (a >= 0x10000) *reinterpret_cast<T*>(a) = v;
 }
-static inline uintptr_t cfPtr(uintptr_t a) { return cfRd<uintptr_t>(a); }
+static inline uintptr_t cfPtr(uintptr_t a) {
+    if (a < 0x10000) return 0;
+    uintptr_t p = *reinterpret_cast<uintptr_t*>(a);
+    return p >= 0x10000 ? p : 0;
+}
 
 static inline uintptr_t listGet(uintptr_t list, int i) {
     uintptr_t arr = cfPtr(list + 0x10);
     return arr ? cfPtr(arr + 0x20 + (uintptr_t)i * 0x8) : 0;
 }
 static inline int listCount(uintptr_t list) {
-    return list ? cfRd<int>(list + 0x18) : 0;
+    if (list < 0x10000) return 0;
+    return *reinterpret_cast<int*>(list + 0x18);
 }
 static inline float v3dist(CFVec3 a, CFVec3 b) {
     float dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
@@ -185,7 +190,9 @@ static void* FindImageByName(const char* needle) {
         !il2_AssemblyGetImage || !il2_ImageGetName) return NULL;
     size_t cnt = 0;
     void* domain = il2_DomainGet();
+    if (!domain) return NULL;
     void** asms = (void**)il2_DomainGetAssemblies(domain, &cnt);
+    if (!asms) return NULL;
     for (size_t i = 0; i < cnt; i++) {
         void* img = il2_AssemblyGetImage(asms[i]);
         if (!img) continue;
@@ -205,14 +212,15 @@ static uintptr_t FindMethodInImage(void* img, const char* ns,
     return (uintptr_t)il2_MethodGetPtr(m);
 }
 
-// ищет метод во ВСЕХ картинках (для UnityEngine.* / Assembly-CSharp)
 static uintptr_t FindMethodAnywhere(const char* ns,
                                     const char* cls, const char* meth, int pc) {
     if (!il2_DomainGet || !il2_DomainGetAssemblies || !il2_AssemblyGetImage)
         return 0;
     size_t cnt = 0;
     void* domain = il2_DomainGet();
+    if (!domain) return 0;
     void** asms = (void**)il2_DomainGetAssemblies(domain, &cnt);
+    if (!asms) return 0;
     for (size_t i = 0; i < cnt; i++) {
         void* img = il2_AssemblyGetImage(asms[i]);
         if (!img) continue;
@@ -231,17 +239,17 @@ static uintptr_t GetStaticFieldsOf(void* img, const char* ns, const char* cls) {
 // ═══════════════════════════════════════════════════════════════════
 //  UNITY CALLS
 // ═══════════════════════════════════════════════════════════════════
-typedef void     (*t_GetPos)(uintptr_t, CFVec3*);
-typedef void     (*t_W2SInjected)(uintptr_t, CFVec3*, CFVec3*);
-typedef uintptr_t(*t_GetMain)();
+typedef void      (*t_GetPos)(uintptr_t, CFVec3*);
+typedef void      (*t_W2SInjected)(uintptr_t, CFVec3*, CFVec3*);
+typedef uintptr_t (*t_GetMain)();
 
-static t_GetPos       Transform_get_position = NULL;
-static t_W2SInjected  Camera_W2S             = NULL;
-static t_GetMain      Camera_GetMain         = NULL;
+static t_GetPos      Transform_get_position = NULL;
+static t_W2SInjected Camera_W2S             = NULL;
+static t_GetMain     Camera_GetMain         = NULL;
 
 static CFVec3 GetPos(uintptr_t transform) {
     CFVec3 v; memset(&v,0,sizeof(v));
-    if (transform && Transform_get_position)
+    if (transform >= 0x10000 && Transform_get_position)
         Transform_get_position(transform, &v);
     return v;
 }
@@ -252,12 +260,12 @@ static CFVec3 GetPos(uintptr_t transform) {
 typedef void (*t_TWH_SetOnOutline)(uintptr_t);
 typedef void (*t_TWH_SetOff)(uintptr_t);
 
-static t_TWH_SetOnOutline  TWH_SetOnOutline = NULL;
-static t_TWH_SetOff        TWH_SetOff       = NULL;
-static uintptr_t           g_TWH_instance   = 0;
+static t_TWH_SetOnOutline TWH_SetOnOutline = NULL;
+static t_TWH_SetOff       TWH_SetOff       = NULL;
+static uintptr_t          g_TWH_instance   = 0;
 
 static void ApplyChams(bool enable) {
-    if (!g_TWH_instance) return;
+    if (g_TWH_instance < 0x10000) return;
     if (enable  && TWH_SetOnOutline) TWH_SetOnOutline(g_TWH_instance);
     if (!enable && TWH_SetOff)       TWH_SetOff(g_TWH_instance);
 }
@@ -265,17 +273,17 @@ static void ApplyChams(bool enable) {
 // ═══════════════════════════════════════════════════════════════════
 //  SCREEN / W2S
 // ═══════════════════════════════════════════════════════════════════
-static float  g_sw = 0.f, g_sh = 0.f;
+static float g_sw = 0.f, g_sh = 0.f;
 static CFVec2 g_center;
 static uintptr_t g_mainCam = 0;
 
 static bool W2S(CFVec3 world, CFVec2* out) {
-    if (!Camera_W2S || !g_mainCam) return false;
+    if (!Camera_W2S || g_mainCam < 0x10000) return false;
     CFVec3 r; memset(&r,0,sizeof(r));
     Camera_W2S(g_mainCam, &world, &r);
     if (r.z < 0.01f) return false;
     out->x = r.x;
-    out->y = g_sh - r.y;   // Unity Y снизу
+    out->y = g_sh - r.y;
     return true;
 }
 
@@ -293,12 +301,13 @@ struct Player {
 
 static std::vector<Player> g_players;
 static uintptr_t g_localCtrl        = 0;
+static uintptr_t g_localArms        = 0;
 static CFVec3    g_localPos;
-static uintptr_t g_cullingInstances = 0;  // адрес поля PlayerCulling.Instances
+static uintptr_t g_cullingInstances = 0;
 
 static void UpdatePlayers() {
     g_players.clear();
-    if (!g_cullingInstances) return;
+    if (g_cullingInstances < 0x10000) return;
 
     uintptr_t list = cfPtr(g_cullingInstances);
     int count = listCount(list);
@@ -306,10 +315,10 @@ static void UpdatePlayers() {
 
     for (int i = 0; i < count; i++) {
         uintptr_t culling = listGet(list, i);
-        if (!culling) continue;
+        if (culling < 0x10000) continue;
 
         uintptr_t ctrl = cfPtr(culling + OFF_CULL_CONTROLLER);
-        if (!ctrl || ctrl == g_localCtrl) continue;
+        if (ctrl < 0x10000 || ctrl == g_localCtrl) continue;
 
         bool dead = cfRd<bool>(ctrl + OFF_PC_ISDEATH);
         if (dead) continue;
@@ -318,7 +327,7 @@ static void UpdatePlayers() {
         bool frus = cfRd<bool>(culling + OFF_CULL_INFRAUSTRUM);
 
         uintptr_t net = cfPtr(ctrl + OFF_PC_NETWORK);
-        if (!net) continue;
+        if (net < 0x10000) continue;
 
         CFVec3 netPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
 
@@ -330,7 +339,7 @@ static void UpdatePlayers() {
         memset(&chestPos,  0, sizeof(chestPos));
         memset(&pelvisPos, 0, sizeof(pelvisPos));
 
-        if (skel) {
+        if (skel >= 0x10000) {
             headPos   = GetPos(cfPtr(skel + OFF_SKEL_HEAD));
             chestPos  = GetPos(cfPtr(skel + OFF_SKEL_CHEST));
             pelvisPos = GetPos(cfPtr(skel + OFF_SKEL_PELVIS));
@@ -368,7 +377,7 @@ static void UpdatePlayers() {
 //  AIMBOT
 // ═══════════════════════════════════════════════════════════════════
 static void DoAimbot(uintptr_t localCtrl) {
-    if (!g_cfg.aimEnabled || !localCtrl || g_players.empty()) return;
+    if (!g_cfg.aimEnabled || localCtrl < 0x10000 || g_players.empty()) return;
 
     float bestDist = g_cfg.aimFov;
     const Player* best = NULL;
@@ -376,11 +385,11 @@ static void DoAimbot(uintptr_t localCtrl) {
     for (size_t i = 0; i < g_players.size(); i++) {
         const Player& p = g_players[i];
         if (g_cfg.aimVisOnly && p.occluded) continue;
+        if (!p.headOnS) continue;
         CFVec2 tgt;
         if      (g_cfg.aimBone == 1) tgt = p.chestS;
         else if (g_cfg.aimBone == 2) tgt = p.pelvisS;
         else                          tgt = p.headS;
-        if (!p.headOnS) continue;
         float d = v2dist(tgt, g_center);
         if (d < bestDist) { bestDist = d; best = &p; }
     }
@@ -392,12 +401,10 @@ static void DoAimbot(uintptr_t localCtrl) {
     else                          tgt = best->headS;
 
     float dy = (tgt.y - g_center.y) / g_cfg.aimSmooth;
-    float dx = (tgt.x - g_center.x) / g_cfg.aimSmooth;
 
     uintptr_t lock = cfPtr(localCtrl + OFF_PC_PLAYERLOCK);
-    if (!lock) return;
+    if (lock < 0x10000) return;
 
-    // принудительно разрешаем поворот
     cfWr<bool>(lock + OFF_LOCK_CANMOVE, true);
 
     float hipFov = cfRd<float>(lock + OFF_LOCK_HIPFOV);
@@ -405,25 +412,7 @@ static void DoAimbot(uintptr_t localCtrl) {
 
     float curX = cfRd<float>(lock + OFF_LOCK_ROTATIONX);
     cfWr<float>(lock + OFF_LOCK_ROTATIONX, curX + (-dy * (hipFov / g_sh)));
-
-    // горизонталь через _playerBody.eulerAngles
-    // (если нужен полноценный yaw — добавь вызов Transform.get_eulerAngles
-    //  и Transform.set_eulerAngles на cfPtr(lock + OFF_LOCK_PLAYERBODY))
-    (void)dx;
 }
-
-// ═══════════════════════════════════════════════════════════════════
-//  PASSTHROUGH WINDOW / VIEW
-// ═══════════════════════════════════════════════════════════════════
-@interface CFPassthroughWindow : UIWindow @end
-@implementation CFPassthroughWindow
-- (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
-    UIView* v = [super hitTest:p withEvent:e];
-    if (!v || v == self || v == self.rootViewController.view) return nil;
-    if (!v.userInteractionEnabled) return nil;
-    return v;
-}
-@end
 
 // ═══════════════════════════════════════════════════════════════════
 //  ESP VIEW
@@ -517,6 +506,7 @@ static void DoAimbot(uintptr_t localCtrl) {
 
     UIView* hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,270,42)];
     hdr.backgroundColor = [UIColor colorWithRed:.10f green:.10f blue:.13f alpha:1];
+    hdr.userInteractionEnabled = YES;
     [self addSubview:hdr];
 
     UIView* acc = [[UIView alloc] initWithFrame:CGRectMake(0,41,270,1)];
@@ -533,7 +523,6 @@ static void DoAimbot(uintptr_t localCtrl) {
     UIPanGestureRecognizer* pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
     [hdr addGestureRecognizer:pan];
-    hdr.userInteractionEnabled = YES;
 
     _panel = [[UIScrollView alloc] initWithFrame:CGRectMake(0,43,270,h-43)];
     _panel.backgroundColor = [UIColor clearColor];
@@ -655,64 +644,71 @@ static void DoAimbot(uintptr_t localCtrl) {
 @end
 
 // ═══════════════════════════════════════════════════════════════════
+//  UI GLOBALS
+// ═══════════════════════════════════════════════════════════════════
+static CFESPView* g_espView = nil;
+static CFMenu*    g_menu    = nil;
+static bool       g_uiReady = false;
+
+// ═══════════════════════════════════════════════════════════════════
 //  HOOKS
 // ═══════════════════════════════════════════════════════════════════
-static CFESPView* g_espView  = nil;
-static CFMenu*    g_menu     = nil;
-static bool       g_uiReady  = false;
+typedef void (*t_ArmsLateUpdate)(uintptr_t);
+static t_ArmsLateUpdate orig_ArmsLateUpdate = NULL;
 
-typedef void (*t_OnPreRender)(uintptr_t);
-static t_OnPreRender orig_OnPreRender = NULL;
+static void Hook_ArmsLateUpdate(uintptr_t thiz) {
+    // обязательно вызываем оригинал первым
+    if (orig_ArmsLateUpdate) orig_ArmsLateUpdate(thiz);
 
-static void Hook_OnPreRender(uintptr_t thiz) {
-    orig_OnPreRender(thiz);
+    // guards
+    if (!g_uiReady)          return;
+    if (g_localCtrl == 0)    return;
+    if (g_localArms == 0)    return;
+    if (thiz != g_localArms) return;
+    if (!Camera_W2S || !Camera_GetMain) return;
 
-    // только для главной камеры
-    if (Camera_GetMain) {
-        uintptr_t main = Camera_GetMain();
-        if (thiz != main) return;
+    // обновляем главную камеру (один раз)
+    if (g_mainCam == 0) {
+        uintptr_t mc = Camera_GetMain();
+        if (mc >= 0x10000) g_mainCam = mc;
     }
-    if (!g_mainCam) g_mainCam = thiz;
 
     // локальная позиция
-    if (g_localCtrl) {
-        uintptr_t net = cfPtr(g_localCtrl + OFF_PC_NETWORK);
-        if (net) g_localPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
+    uintptr_t net = cfPtr(g_localCtrl + OFF_PC_NETWORK);
+    if (net >= 0x10000) {
+        g_localPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
     }
 
     UpdatePlayers();
     DoAimbot(g_localCtrl);
 
-    if (g_uiReady && g_espView) {
+    if (g_espView) {
         CFESPView* view = g_espView;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [view setNeedsDisplay];
-        });
+        dispatch_async(dispatch_get_main_queue(), ^{ [view setNeedsDisplay]; });
     }
 }
 
-// TournamentWallHack — ищем на локальном PlayerController через
-// gameObject.GetComponents, но проще: хукнуть Awake и проверить,
-// что у объекта есть PlayerController (значит это локальный/игрок).
 typedef void (*t_Awake)(uintptr_t);
 static t_Awake orig_TWH_Awake = NULL;
 static t_Awake orig_PCAwake   = NULL;
 
 static void Hook_TWH_Awake(uintptr_t thiz) {
-    orig_TWH_Awake(thiz);
-    // g_TWH_instance = первый найденный; можно уточнить проверкой,
-    // что объект принадлежит локальному PlayerController, но для outline
-    // он и так наносит только на игроков (см. renderers поле).
-    if (!g_TWH_instance) g_TWH_instance = thiz;
+    if (orig_TWH_Awake) orig_TWH_Awake(thiz);
+    if (g_TWH_instance == 0 && thiz >= 0x10000)
+        g_TWH_instance = thiz;
 }
 
 static void Hook_PCAwake(uintptr_t thiz) {
-    orig_PCAwake(thiz);
-    // локальный игрок: у него есть _fpsCamera и _network
-    if (g_localCtrl) return;
+    if (orig_PCAwake) orig_PCAwake(thiz);
+    if (g_localCtrl != 0) return;
+    if (thiz < 0x10000) return;
+
     uintptr_t fps = cfPtr(thiz + OFF_PC_FPSCAM);
     uintptr_t net = cfPtr(thiz + OFF_PC_NETWORK);
-    if (fps && net) g_localCtrl = thiz;
+    if (fps < 0x10000 || net < 0x10000) return;
+
+    g_localCtrl = thiz;
+    g_localArms = cfPtr(thiz + OFF_PC_ARMSCTRL);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -730,61 +726,58 @@ static UIWindowScene* GetActiveScene(void) {
     return nil;
 }
 
+static UIWindow* GetGameWindow(UIWindowScene* scene) {
+    if (!scene) return nil;
+    for (UIWindow* w in scene.windows) {
+        if (w.rootViewController) return w;
+    }
+    return nil;
+}
+
 // ═══════════════════════════════════════════════════════════════════
-//  INIT
+//  BuildUI — ретраит пока не появится активная сцена и game-окно
 // ═══════════════════════════════════════════════════════════════════
 static void BuildUI(void) {
+    UIWindowScene* scene = GetActiveScene();
+    if (!scene) {
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ BuildUI(); });
+        return;
+    }
+
+    UIWindow* gameWin = GetGameWindow(scene);
+    if (!gameWin) {
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ BuildUI(); });
+        return;
+    }
+
+    if (g_uiReady) return;  // уже собрано
+
     CGRect scr = [UIScreen mainScreen].bounds;
     g_sw = scr.size.width;
     g_sh = scr.size.height;
     g_center.x = g_sw * 0.5f;
     g_center.y = g_sh * 0.5f;
 
-    CFPassthroughWindow* overlay = nil;
-    UIWindowScene* scene = GetActiveScene();
-
-    if (@available(iOS 13.0, *)) {
-        if (scene) {
-            overlay = [[CFPassthroughWindow alloc] initWithWindowScene:scene];
-        }
-    }
-    if (!overlay) {
-        overlay = [[CFPassthroughWindow alloc] initWithFrame:scr];
-    }
-
-    overlay.frame           = scr;
-    overlay.windowLevel     = UIWindowLevelAlert + 100;
-    overlay.backgroundColor = [UIColor clearColor];
-    overlay.hidden          = NO;
-    overlay.opaque          = NO;
-
-    UIViewController* vc = [[UIViewController alloc] init];
-    vc.view = [[UIView alloc] initWithFrame:scr];
-    vc.view.backgroundColor = [UIColor clearColor];
-    vc.view.userInteractionEnabled = YES;
-    overlay.rootViewController = vc;
-
-    // ESP-слой
+    // ESP-слой (не перехватывает touch)
     g_espView = [[CFESPView alloc] initWithFrame:scr];
     g_espView.userInteractionEnabled = NO;
-    [vc.view addSubview:g_espView];
+    [gameWin addSubview:g_espView];
 
-    // меню
+    // Меню (перехватывает touch только в своей области)
     g_menu = [[CFMenu alloc] initWithScreen:scr];
-    [vc.view addSubview:g_menu];
-
-    // показываем окно и делаем его key — но тачи уходят через passthrough
-    overlay.hidden = NO;
-    [overlay makeKeyAndVisible];
-
-    // держим strong ref
-    static UIWindow* s_keep = nil;
-    s_keep = overlay;
+    [gameWin addSubview:g_menu];
 
     g_uiReady = true;
 }
 
-static void Init() {
+// ═══════════════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════════════
+static void Init(void) {
     ConfigInit(&g_cfg);
     memset(&g_localPos, 0, sizeof(g_localPos));
 
@@ -794,9 +787,6 @@ static void Init() {
     Transform_get_position = (t_GetPos)
         FindMethodAnywhere("UnityEngine", "Transform", "get_position_Injected", 1);
     if (!Transform_get_position) {
-        // fallback: get_position (возвращает Vector3 by value — но Injected есть
-        // в большинстве сборок; если нет — работаем через transform.position
-        // нативной памяти, но лучше иметь Injected)
         Transform_get_position = (t_GetPos)
             FindMethodAnywhere("UnityEngine", "Transform", "get_position", 0);
     }
@@ -813,16 +803,16 @@ static void Init() {
     TWH_SetOff = (t_TWH_SetOff)
         FindMethodAnywhere("", "TournamentWallHack", "SetOff", 0);
 
-    // PlayerCulling.Instances — статическое поле на +0x8 от static_fields
+    // PlayerCulling.Instances (статик-поле)
     void* asmImg = FindImageByName("Assembly-CSharp");
     if (asmImg) {
         uintptr_t sf = GetStaticFieldsOf(asmImg, "", "PlayerCulling");
-        if (sf) g_cullingInstances = sf + 0x8;
+        if (sf >= 0x10000) g_cullingInstances = sf + 0x8;
     }
 
     // Hooks
-    uintptr_t a = FindMethodAnywhere("UnityEngine", "Camera", "OnPreRender", 0);
-    if (a) HOOK(a, Hook_OnPreRender, &orig_OnPreRender);
+    uintptr_t a = FindMethodAnywhere("", "ArmsController", "LateUpdate", 0);
+    if (a) HOOK(a, Hook_ArmsLateUpdate, &orig_ArmsLateUpdate);
 
     a = FindMethodAnywhere("", "TournamentWallHack", "Awake", 0);
     if (a) HOOK(a, Hook_TWH_Awake, &orig_TWH_Awake);
@@ -830,14 +820,14 @@ static void Init() {
     a = FindMethodAnywhere("", "PlayerController", "Awake", 0);
     if (a) HOOK(a, Hook_PCAwake, &orig_PCAwake);
 
-    // UI после небольшой задержки (нужна активная scene)
+    // UI — на main thread с ретраем
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ BuildUI(); });
 }
 
 __attribute__((constructor))
-static void Entry() {
+static void Entry(void) {
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
         dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
