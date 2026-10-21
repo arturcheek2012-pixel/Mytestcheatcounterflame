@@ -1,6 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <CoreGraphics/CoreGraphics.h>
-#include <substrate.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern void MSHookFunction(void* symbol, void* replace, void** result) __attribute__((weak_import));
+#ifdef __cplusplus
+}
+#endif
 #include <dlfcn.h>
 #include <vector>
 #include <cmath>
