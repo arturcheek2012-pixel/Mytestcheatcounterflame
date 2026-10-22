@@ -25,7 +25,6 @@ jobs:
             -I. \
             -DIMGUI_DISABLE_DEMO_WINDOWS \
             -DIMGUI_DISABLE_DEBUG_TOOLS \
-            -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
             -dynamiclib \
             -framework UIKit -framework Metal -framework MetalKit \
             -framework QuartzCore -framework Foundation \
