@@ -9,7 +9,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#include <substrate.h>
+#include <objc/runtime.h>
 #include <mach-o/dyld.h>
 #include <stdint.h>
 #include <cmath>
@@ -589,6 +589,9 @@ static void tweak_init() {
     if (cls) {
         SEL sel = @selector(application:didFinishLaunchingWithOptions:);
         Method m = class_getInstanceMethod(cls, sel);
-        if (m) MSHookMessageEx(cls, sel, (IMP)hooked_didFinishLaunching, &orig_didFinishLaunching);
+        if (m) {
+            orig_didFinishLaunching = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_didFinishLaunching);
+        }
     }
 }
