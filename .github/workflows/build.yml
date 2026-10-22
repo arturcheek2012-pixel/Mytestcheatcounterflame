@@ -10,113 +10,83 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Cache Theos
-        id: cache-theos
+      - name: Cache Theos + SDK
+        id: cache
         uses: actions/cache@v4
         with:
-          path: |
-            /opt/theos
-            ~/.cache/theos-sdks
-          key: theos-sdks-ios165-${{ runner.os }}-v2
+          path: /opt/theos
+          key: theos-ios165-v1
 
-      - name: Install Theos
-        if: steps.cache-theos.outputs.cache-hit != 'true'
+      - name: Install Theos + SDK
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get install -y curl git make xz-utils ca-certificates
           git clone --recursive https://github.com/theos/theos /opt/theos
-          # iOS 16.5 SDK
           mkdir -p /opt/theos/sdks
-          curl -Ls "https://github.com/theos/sdks/archive/master.tar.gz" | \
-            tar -xz -C /opt/theos/sdks --strip-components=2 \
-            sdks-master/iPhoneOS16.5.sdk
-          # ImGui: clone into vendor include
-          git clone --depth 1 https://github.com/ocornut/imgui /tmp/imgui
-          mkdir -p /opt/theos/vendor/include/imgui
-          cp /tmp/imgui/imgui.h         /opt/theos/vendor/include/imgui/
-          cp /tmp/imgui/imgui.cpp       /opt/theos/vendor/include/imgui/
-          cp /tmp/imgui/imgui_internal.h /opt/theos/vendor/include/imgui/
-          cp /tmp/imgui/imgui_draw.cpp  /opt/theos/vendor/include/imgui/
-          cp /tmp/imgui/imgui_tables.cpp /opt/theos/vendor/include/imgui/
-          cp /tmp/imgui/imgui_widgets.cpp /opt/theos/vendor/include/imgui/
+          curl -Ls https://github.com/theos/sdks/archive/master.tar.gz | \
+            tar -xz -C /opt/theos/sdks --strip-components=2 sdks-master/iPhoneOS16.5.sdk
 
-      - name: Set up Theos env
+      - name: Clone ImGui into repo
         run: |
-          echo "THEOS=/opt/theos"    >> $GITHUB_ENV
-          echo "/opt/theos/bin"      >> $GITHUB_PATH
+          git clone --depth 1 https://github.com/ocornut/imgui imgui
 
-      - name: Generate ImGui unity build
+      - name: Build dylib
         run: |
-          cat > /tmp/imgui_impl.cpp << 'CPPEOF'
-          #include "/opt/theos/vendor/include/imgui/imgui.cpp"
-          #include "/opt/theos/vendor/include/imgui/imgui_draw.cpp"
-          #include "/opt/theos/vendor/include/imgui/imgui_tables.cpp"
-          #include "/opt/theos/vendor/include/imgui/imgui_widgets.cpp"
-          CPPEOF
+          SDK=/opt/theos/sdks/iPhoneOS16.5.sdk
+          CC=/opt/theos/toolchain/linux/iphone/bin/clang++
 
-      - name: Generate Makefile
-        run: |
-          cat > Makefile << 'EOF'
-          THEOS_PACKAGE_SCHEME = rootful
-          include $(THEOS)/makefiles/common.mk
+          # ImGui unity compile → .o for each arch
+          for ARCH in arm64 arm64e; do
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -std=c++17 -O2 -fPIC \
+              -I. \
+              -DIMGUI_DISABLE_DEMO_WINDOWS \
+              -DIMGUI_DISABLE_DEBUG_TOOLS \
+              -c imgui/imgui.cpp         -o imgui_${ARCH}.o
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -std=c++17 -O2 -fPIC -I. \
+              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
+              -c imgui/imgui_draw.cpp    -o imgui_draw_${ARCH}.o
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -std=c++17 -O2 -fPIC -I. \
+              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
+              -c imgui/imgui_tables.cpp  -o imgui_tables_${ARCH}.o
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -std=c++17 -O2 -fPIC -I. \
+              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
+              -c imgui/imgui_widgets.cpp -o imgui_widgets_${ARCH}.o
 
-          TWEAK_NAME = CrezMenu
-          CrezMenu_FILES = Tweak.mm /tmp/imgui_impl.cpp
-          CrezMenu_CFLAGS = \
-            -fobjc-arc \
-            -std=c++17 \
-            -I$(THEOS)/vendor/include \
-            -DIMGUI_DISABLE_DEMO_WINDOWS \
-            -DIMGUI_DISABLE_DEBUG_TOOLS \
-            -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
-            -Wno-deprecated-declarations \
-            -Wno-unknown-warning-option
-          CrezMenu_CCFLAGS = $(CrezMenu_CFLAGS)
-          CrezMenu_FRAMEWORKS = UIKit Metal MetalKit QuartzCore Foundation
-          CrezMenu_PRIVATE_FRAMEWORKS = SpringBoard SpringBoardFoundation
-          ARCHS = arm64 arm64e
-          TARGET = iphone:clang:16.5:15.0
+            # Tweak.mm → .o
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -std=c++17 -O2 -fPIC -fobjc-arc \
+              -I. \
+              -DIMGUI_DISABLE_DEMO_WINDOWS \
+              -DIMGUI_DISABLE_DEBUG_TOOLS \
+              -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
+              -Wno-deprecated-declarations \
+              -F$SDK/System/Library/Frameworks \
+              -c Tweak.mm -o Tweak_${ARCH}.o
 
-          include $(THEOS)/makefiles/tweak.mk
-          EOF
+            # link → .dylib per arch
+            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
+              -dynamiclib -install_name /usr/lib/CrezMenu.dylib \
+              -framework UIKit -framework Metal -framework MetalKit \
+              -framework QuartzCore -framework Foundation \
+              -lobjc \
+              Tweak_${ARCH}.o imgui_${ARCH}.o imgui_draw_${ARCH}.o \
+              imgui_tables_${ARCH}.o imgui_widgets_${ARCH}.o \
+              -o CrezMenu_${ARCH}.dylib
+          done
 
-      - name: Generate control
-        run: |
-          cat > control << 'EOF'
-          Package: com.crez.menu
-          Name: CREZ Menu
-          Version: 1.0.0
-          Architecture: iphoneos-arm
-          Description: CREZ premium mod menu
-          Author: crez
-          Section: Tweaks
-          EOF
+          # lipo → fat dylib
+          /opt/theos/toolchain/linux/iphone/bin/lipo \
+            -create CrezMenu_arm64.dylib CrezMenu_arm64e.dylib \
+            -output CrezMenu.dylib
 
-      - name: Build
-        run: |
-          export THEOS=/opt/theos
-          make -j$(nproc) 2>&1 | tee build.log
-          echo "--- build output ---"
-          find .theos/obj -name "*.dylib" 2>/dev/null || true
-
-      - name: Collect dylibs
-        run: |
-          mkdir -p dist
-          find .theos/obj -name "*.dylib" -exec cp {} dist/ \;
-          ls -la dist/
-
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: crez-menu-dylib
-          path: dist/*.dylib
+          path: CrezMenu.dylib
           if-no-files-found: error
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
