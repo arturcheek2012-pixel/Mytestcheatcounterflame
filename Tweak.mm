@@ -232,7 +232,7 @@ typedef struct {
     _fontTexture = [_device newTextureWithDescriptor:td];
     [_fontTexture replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0
                       withBytes:px bytesPerRow:(NSUInteger)(w*4)];
-    io.Fonts->SetTexID((__bridge void*)_fontTexture);
+    io.Fonts->SetTexID((ImTextureID)(uintptr_t)(__bridge void*)_fontTexture);
 }
 
 - (id<MTLBuffer>)dequeueBufferWithLength:(NSUInteger)len {
@@ -296,7 +296,7 @@ typedef struct {
             sr.height = (NSUInteger)(cmd.ClipRect.w - cmd.ClipRect.y);
             [enc setScissorRect:sr];
             if (cmd.GetTexID())
-                [enc setFragmentTexture:(__bridge id<MTLTexture>)cmd.GetTexID() atIndex:0];
+                [enc setFragmentTexture:(__bridge id<MTLTexture>)(void*)(uintptr_t)cmd.GetTexID() atIndex:0];
             else
                 [enc setFragmentTexture:_fontTexture atIndex:0];
             [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
