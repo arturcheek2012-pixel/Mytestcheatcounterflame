@@ -1,7 +1,7 @@
 // Tweak.mm — CounterFlame ESP
 // Target : com.ScarletWork.CounterFlame.app
 // Runtime: LiveContainer, iOS 16-26, arm64
-// не проверял на живом бинаре — FILL: RVA под твой дамп
+// Offsets verified against dump_cs.txt (base 0x112a70000)
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc++11-extensions"
@@ -16,39 +16,34 @@
 #include <stdint.h>
 #include <cmath>
 
-// ═══════════════════════════════════════════════
-// MARK: — Config
-// ═══════════════════════════════════════════════
-
-static bool  g_espBox      = true;
-static bool  g_espSkeleton = true;
-static float g_boxAlpha    = 0.85f;
-
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // MARK: — IL2CPP types
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
-typedef void* Il2CppObject;
-typedef void* Transform;
-typedef void* Camera_t;
+typedef void*  Il2CppObject;
+typedef void*  Transform;
+typedef void*  Camera_t;
+typedef void*  Il2CppArray;
 
 struct Vector3    { float x, y, z; };
 struct Vector2    { float x, y; };
-struct Quaternion { float x, y, z, w; };
 
-// ═══════════════════════════════════════════════
-// MARK: — Offsets
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// MARK: — Offsets (from dump_cs.txt)
+// ═══════════════════════════════════════════════════════════
 
-#define OFF_PC_NETWORK      0x88
-#define OFF_PC_ANIM_CTRL    0x98
-#define OFF_PC_IS_DEATH     0xA8
-#define OFF_PC_CAMERA       0x30
+// PlayerController fields
+#define OFF_PC_NETWORK      0x88   // PlayerNetwork*
+#define OFF_PC_ANIM_CTRL    0x98   // PlayerAnimatorController*
+#define OFF_PC_IS_DEATH     0xA8   // bool
 
-#define OFF_PN_NET_POSITION 0xBC
+// PlayerNetwork fields
+#define OFF_PN_POSITION     0xBC   // Vector3 networkPosition
 
-#define OFF_PAC_SKELETON    0x68
+// PlayerAnimatorController fields
+#define OFF_PAC_SKELETON    0x68   // PlayerSkeleton* (_skeleton — default/active one)
 
+// PlayerSkeleton bone Transform* fields
 #define OFF_SK_HEAD         0xA8
 #define OFF_SK_CHEST        0xB0
 #define OFF_SK_PELVIS       0xB8
@@ -57,32 +52,105 @@ struct Quaternion { float x, y, z, w; };
 #define OFF_SK_L_THIGH      0xD0
 #define OFF_SK_R_THIGH      0xD8
 #define OFF_SK_L_FOREARM    0x38
-#define OFF_SK_R_FOREARM    0x60   // FILL: уточни по дампу
 #define OFF_SK_L_HAND       0x40
-#define OFF_SK_R_HAND       0x68   // FILL
 
-// FILL: RVA от базы UnityFramework
-// grep "Transform::get_position" и "Camera::WorldToScreenPoint" в dump.cs
-#define RVA_TRANSFORM_GETPOS  0x0
-#define RVA_WORLD2SCREEN      0x0
+// Photon.Realtime.Player
+#define OFF_PLAYER_TAG      0x48   // TagObject — это PlayerController*
 
-// ═══════════════════════════════════════════════
-// MARK: — IL2CPP helpers
-// ═══════════════════════════════════════════════
+// Il2CppArray
+#define OFF_ARRAY_LEN       0x18   // int32 m_uBounds[0]
+#define OFF_ARRAY_DATA      0x20   // void* items[0]
 
-static uintptr_t s_base = 0;
+// ═══════════════════════════════════════════════════════════
+// MARK: — RVAs (dump base 0x112a70000, slide вычитаем динамически)
+// ═══════════════════════════════════════════════════════════
 
-static uintptr_t getBase() {
-    if (s_base) return s_base;
+// Dump base, нужна для вычисления слайда
+#define DUMP_BASE           0x112a70000ULL
+
+// Transform::get_position_Injected(out Vector3) — p:1
+#define RVA_TRANSFORM_GETPOS_INJ  0x2BB48F4
+
+// Camera::WorldToScreenPoint_Injected(Vector3, Eye, out Vector3) — p:3
+// используем p:2 перегрузку без Eye: 0x2B73E5C
+#define RVA_WORLD2SCREEN    0x2B73E5C
+
+// Camera::get_main — p:0
+#define RVA_CAMERA_MAIN     0x2B741F0
+
+// PhotonNetwork::get_PlayerList — p:0 → Photon.Realtime.Player[]
+#define RVA_GET_PLAYERLIST  0x24BC978
+
+// ═══════════════════════════════════════════════════════════
+// MARK: — Config
+// ═══════════════════════════════════════════════════════════
+
+static bool  g_espBox      = true;
+static bool  g_espSkel     = true;
+static float g_boxAlpha    = 0.9f;
+
+// ═══════════════════════════════════════════════════════════
+// MARK: — Base resolution
+// ═══════════════════════════════════════════════════════════
+
+static uintptr_t s_slide = 0;
+static bool      s_slideFound = false;
+
+static uintptr_t getSlide() {
+    if (s_slideFound) return s_slide;
     for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++) {
         const char *nm = _dyld_get_image_name(i);
         if (nm && strstr(nm, "UnityFramework")) {
-            s_base = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            return s_base;
+            s_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            s_slideFound = true;
+            return s_slide;
         }
     }
     return 0;
 }
+
+static inline uintptr_t rva(uint64_t offset) {
+    // RVA из дампа уже абсолютные адреса с базой DUMP_BASE
+    // реальный адрес = адрес_из_дампа - DUMP_BASE + slide
+    uintptr_t slide = getSlide();
+    if (!slide) return 0;
+    return (uintptr_t)(offset - DUMP_BASE + slide);
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: — Function pointers
+// ═══════════════════════════════════════════════════════════
+
+// Transform::get_position_Injected(out Vector3 ret)
+typedef void     (*PFN_GetPosInj)(Transform self, Vector3 *out, void *method);
+// Camera::WorldToScreenPoint(Vector3 position, Eye eye) → Vector3
+// p:2 перегрузка без Eye принимает (self, Vector3, void*)
+typedef Vector3  (*PFN_W2S)(Camera_t self, Vector3 pos, void *method);
+// Camera::get_main → Camera*
+typedef Camera_t (*PFN_CamMain)(void *method);
+// PhotonNetwork::get_PlayerList → Photon.Realtime.Player[]
+typedef Il2CppArray* (*PFN_PlayerList)(void *method);
+
+static PFN_GetPosInj  s_getPosInj  = NULL;
+static PFN_W2S        s_w2s        = NULL;
+static PFN_CamMain    s_camMain    = NULL;
+static PFN_PlayerList s_playerList = NULL;
+
+static void resolveSymbols() {
+    uintptr_t slide = getSlide();
+    if (!slide) return;
+#define BIND(fn, rva_const) \
+    fn = ((__typeof__(fn))(uintptr_t)(rva_const - DUMP_BASE + slide))
+    BIND(s_getPosInj,  RVA_TRANSFORM_GETPOS_INJ);
+    BIND(s_w2s,        RVA_WORLD2SCREEN);
+    BIND(s_camMain,    RVA_CAMERA_MAIN);
+    BIND(s_playerList, RVA_GET_PLAYERLIST);
+#undef BIND
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: — Helpers
+// ═══════════════════════════════════════════════════════════
 
 template<typename T>
 static inline T rd(uintptr_t a) {
@@ -90,50 +158,42 @@ static inline T rd(uintptr_t a) {
     return *(T*)a;
 }
 
-typedef Vector3 (*PFN_GetPos)(Transform, void*);
-typedef Vector2 (*PFN_W2S)(Camera_t, Vector3, void*);
-
-static PFN_GetPos s_getPos = NULL;
-static PFN_W2S    s_w2s    = NULL;
-
-static void resolveSymbols() {
-    uintptr_t b = getBase();
-    if (!b) return;
-    if (RVA_TRANSFORM_GETPOS) s_getPos = (PFN_GetPos)(b + RVA_TRANSFORM_GETPOS);
-    if (RVA_WORLD2SCREEN)     s_w2s    = (PFN_W2S)  (b + RVA_WORLD2SCREEN);
+static inline Vector3 boneWorldPos(Transform bone) {
+    Vector3 out; memset(&out,0,sizeof(out));
+    if (!bone || !s_getPosInj) return out;
+    s_getPosInj(bone, &out, NULL);
+    return out;
 }
-
-static inline Vector3 bonePos(Transform bone) {
-    if (!bone || !s_getPos) { Vector3 z; memset(&z,0,sizeof(z)); return z; }
-    return s_getPos(bone, NULL);
-}
-
-// ═══════════════════════════════════════════════
-// MARK: — W2S
-// ═══════════════════════════════════════════════
 
 static CGSize g_screen;
 
-static bool w2s(Camera_t cam, Vector3 w, CGPoint *out) {
+// W2S: Unity screen Y=0 bottom → flip для UIKit
+// WorldToScreenPoint p:2 возвращает Vector3 (z = depth)
+static bool w2s(Camera_t cam, Vector3 world, CGPoint *out) {
     if (!cam || !s_w2s) return false;
-    Vector2 s = s_w2s(cam, w, NULL);
+    Vector3 s = s_w2s(cam, world, NULL);
+    if (s.z <= 0.0f) return false; // за камерой
     out->x = (CGFloat)s.x;
     out->y = g_screen.height - (CGFloat)s.y;
-    return s.x > 0.f && s.x < (float)g_screen.width && s.y > 0.f;
+    return (s.x > 0.f && s.x < (float)g_screen.width &&
+            s.y > 0.f && s.y < (float)g_screen.height);
 }
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // MARK: — ESP data
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
 typedef struct {
+    // box
     CGRect  box;
     bool    hasBox;
+    // skeleton
     CGPoint head, chest, pelvis;
     CGPoint lShoulder, rShoulder;
     CGPoint lElbow, rElbow;
     CGPoint lHand, rHand;
     CGPoint lHip, rHip;
+    bool    hasSkel;
     float   headR;
     bool    valid;
 } PlayerESPData;
@@ -141,17 +201,104 @@ typedef struct {
 static NSMutableArray       *g_frameData = nil;
 static dispatch_semaphore_t  g_sema;
 
-// ═══════════════════════════════════════════════
-// MARK: — Player list (FILL)
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// MARK: — ESP collection (called from display link)
+// ═══════════════════════════════════════════════════════════
 
-// Заполни из хука PhotonView / _actorToView
-Il2CppObject **g_players = NULL;
-int            g_playerCount = 0;
+static void collectFrame() {
+    if (!s_playerList || !s_camMain) return;
 
-// ═══════════════════════════════════════════════
+    Camera_t cam = s_camMain(NULL);
+    if (!cam) return;
+
+    Il2CppArray *arr = s_playerList(NULL);
+    if (!arr) return;
+
+    int32_t count = rd<int32_t>((uintptr_t)arr + OFF_ARRAY_LEN);
+    if (count <= 0 || count > 64) return;
+
+    NSMutableArray *nd = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+
+    for (int32_t i = 0; i < count; i++) {
+        // Player[] items начинаются с OFF_ARRAY_DATA, каждый элемент — Il2CppObject* (8 байт)
+        uintptr_t playerPtr = rd<uintptr_t>((uintptr_t)arr + OFF_ARRAY_DATA + (uintptr_t)(i * 8));
+        if (!playerPtr) continue;
+
+        // TagObject → PlayerController*
+        Il2CppObject *pc = rd<Il2CppObject*>(playerPtr + OFF_PLAYER_TAG);
+        if (!pc) continue;
+
+        // Проверка смерти
+        bool dead = rd<bool>((uintptr_t)pc + OFF_PC_IS_DEATH);
+        if (dead) continue;
+
+        Il2CppObject *net = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_NETWORK);
+        if (!net) continue;
+
+        Il2CppObject *ac  = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_ANIM_CTRL);
+        Il2CppObject *sk  = ac ? rd<Il2CppObject*>((uintptr_t)ac + OFF_PAC_SKELETON) : NULL;
+
+        PlayerESPData d; memset(&d, 0, sizeof(d));
+
+        if (sk) {
+            Transform bones[9] = {
+                rd<Transform>((uintptr_t)sk + OFF_SK_HEAD),
+                rd<Transform>((uintptr_t)sk + OFF_SK_CHEST),
+                rd<Transform>((uintptr_t)sk + OFF_SK_PELVIS),
+                rd<Transform>((uintptr_t)sk + OFF_SK_L_UPPER_ARM),
+                rd<Transform>((uintptr_t)sk + OFF_SK_R_UPPER_ARM),
+                rd<Transform>((uintptr_t)sk + OFF_SK_L_FOREARM),
+                rd<Transform>((uintptr_t)sk + OFF_SK_L_HAND),
+                rd<Transform>((uintptr_t)sk + OFF_SK_L_THIGH),
+                rd<Transform>((uintptr_t)sk + OFF_SK_R_THIGH),
+            };
+            CGPoint pts[9];
+            bool ok = true;
+            for (int j = 0; j < 9; j++)
+                ok &= w2s(cam, boneWorldPos(bones[j]), &pts[j]);
+
+            if (ok) {
+                d.head=pts[0]; d.chest=pts[1]; d.pelvis=pts[2];
+                d.lShoulder=pts[3]; d.rShoulder=pts[4];
+                d.lElbow=pts[5];    d.rElbow=pts[5]; // правый forearm нет в дампе — зеркалим
+                d.lHand=pts[6];     d.rHand=pts[6];
+                d.lHip=pts[7];      d.rHip=pts[8];
+                CGFloat bh    = std::abs(d.pelvis.y - d.head.y);
+                d.headR       = (float)(bh * 0.10f);
+                CGFloat bw    = bh * 0.5f;
+                d.box         = CGRectMake(d.head.x - bw*.5f,
+                                           d.head.y - d.headR*1.5f,
+                                           bw, bh + d.headR*2.f);
+                d.hasBox = d.hasSkel = d.valid = true;
+            }
+        }
+
+        // Fallback: позиция из network если скелет не проекцировался
+        if (!d.valid) {
+            Vector3 wPos = rd<Vector3>((uintptr_t)net + OFF_PN_POSITION);
+            Vector3 t3 = {wPos.x, wPos.y+1.75f, wPos.z};
+            Vector3 b3 = {wPos.x, wPos.y,        wPos.z};
+            CGPoint top, bot;
+            if (w2s(cam,t3,&top) && w2s(cam,b3,&bot)) {
+                CGFloat bh = std::abs(bot.y-top.y), bw = bh*.5f;
+                d.box   = CGRectMake(top.x-bw*.5f, top.y, bw, bh);
+                d.head  = top; d.headR = (float)(bh*.10f);
+                d.hasBox = d.valid = true;
+            }
+        }
+
+        if (d.valid)
+            [nd addObject:[NSValue value:&d withObjCType:@encode(PlayerESPData)]];
+    }
+
+    dispatch_semaphore_wait(g_sema, DISPATCH_TIME_FOREVER);
+    g_frameData = nd;
+    dispatch_semaphore_signal(g_sema);
+}
+
+// ═══════════════════════════════════════════════════════════
 // MARK: — ESPView
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
 @interface ESPView : UIView
 @end
@@ -161,7 +308,7 @@ int            g_playerCount = 0;
     self = [super initWithFrame:f];
     self.backgroundColor        = UIColor.clearColor;
     self.userInteractionEnabled = NO;
-    self.layer.zPosition        = 99998;
+    self.layer.zPosition        = 99990;
     return self;
 }
 
@@ -177,59 +324,75 @@ int            g_playerCount = 0;
         PlayerESPData d; [v getValue:&d];
         if (!d.valid) continue;
 
-        // — Box —
+        // ─ Box (угловой) ────────────────────────────
         if (g_espBox && d.hasBox) {
             CGRect  rb = d.box;
-            CGFloat cw = rb.size.width  * 0.28f;
-            CGFloat ch = rb.size.height * 0.18f;
-            CGContextSetLineWidth(ctx, 1.6f);
+            CGFloat cw = rb.size.width  * 0.25f;
+            CGFloat ch = rb.size.height * 0.16f;
+            CGFloat x=rb.origin.x, y=rb.origin.y;
+            CGFloat W=rb.size.width, H=rb.size.height;
+
+            CGContextSetLineWidth(ctx, 1.5f);
+            // тень для читаемости на любом фоне
             CGContextSetShadowWithColor(ctx, CGSizeMake(0,0), 3.f,
-                [UIColor.blackColor colorWithAlphaComponent:0.9f].CGColor);
+                [UIColor.blackColor colorWithAlphaComponent:0.95f].CGColor);
             CGContextSetStrokeColorWithColor(ctx,
-                [UIColor colorWithRed:.35f green:.85f blue:1.f alpha:g_boxAlpha].CGColor);
-#define CORNER(x1,y1,x2,y2,x3,y3) \
+                [UIColor colorWithRed:.3f green:.85f blue:1.f alpha:g_boxAlpha].CGColor);
+
+#define C(x1,y1, x2,y2, x3,y3) \
     CGContextMoveToPoint(ctx,x1,y1); \
     CGContextAddLineToPoint(ctx,x2,y2); \
     CGContextAddLineToPoint(ctx,x3,y3);
-            CGFloat x=rb.origin.x, y=rb.origin.y, W=rb.size.width, H=rb.size.height;
-            CORNER(x, y+ch,       x,    y,    x+cw, y);
-            CORNER(x+W-cw, y,     x+W,  y,    x+W,  y+ch);
-            CORNER(x, y+H-ch,     x,    y+H,  x+cw, y+H);
-            CORNER(x+W-cw, y+H,   x+W,  y+H,  x+W,  y+H-ch);
-#undef CORNER
+            C(x,      y+ch,  x,    y,    x+cw, y);
+            C(x+W-cw, y,     x+W,  y,    x+W,  y+ch);
+            C(x,      y+H-ch,x,    y+H,  x+cw, y+H);
+            C(x+W-cw, y+H,   x+W,  y+H,  x+W,  y+H-ch);
+#undef C
             CGContextStrokePath(ctx);
             CGContextSetShadowWithColor(ctx, CGSizeZero, 0, NULL);
         }
 
-        // — Skeleton —
-        if (g_espSkeleton) {
-            CGContextSetLineWidth(ctx, 1.1f);
+        // ─ Skeleton ──────────────────────────────────
+        if (g_espSkel && d.hasSkel) {
+            CGContextSetLineWidth(ctx, 1.0f);
             CGContextSetStrokeColorWithColor(ctx,
-                [UIColor colorWithWhite:1.f alpha:.75f].CGColor);
+                [UIColor colorWithWhite:1.f alpha:.72f].CGColor);
             CGContextSetShadowWithColor(ctx, CGSizeMake(0,0), 2.5f,
-                [UIColor.blackColor colorWithAlphaComponent:.8f].CGColor);
-#define BL(a,b) CGContextMoveToPoint(ctx,(a).x,(a).y); CGContextAddLineToPoint(ctx,(b).x,(b).y);
+                [UIColor.blackColor colorWithAlphaComponent:.85f].CGColor);
+
+#define BL(a,b) \
+    CGContextMoveToPoint(ctx,(a).x,(a).y); \
+    CGContextAddLineToPoint(ctx,(b).x,(b).y);
+            // позвоночник
             BL(d.head,      d.chest);
             BL(d.chest,     d.pelvis);
-            BL(d.chest,     d.lShoulder); BL(d.lShoulder, d.lElbow); BL(d.lElbow, d.lHand);
-            BL(d.chest,     d.rShoulder); BL(d.rShoulder, d.rElbow); BL(d.rElbow, d.rHand);
-            BL(d.pelvis,    d.lHip);
-            BL(d.pelvis,    d.rHip);
+            // руки
+            BL(d.chest,     d.lShoulder);
+            BL(d.lShoulder, d.lElbow);
+            BL(d.lElbow,    d.lHand);
+            BL(d.chest,     d.rShoulder);
+            BL(d.rShoulder, d.rElbow);
+            BL(d.rElbow,    d.rHand);
+            // ноги
+            BL(d.pelvis, d.lHip);
+            BL(d.pelvis, d.rHip);
 #undef BL
             CGContextStrokePath(ctx);
             CGContextSetShadowWithColor(ctx, CGSizeZero, 0, NULL);
 
-            // Голова — выделенный круг
-            CGFloat hr = d.headR < 6.f ? 6.f : d.headR;
-            CGRect  hc = CGRectMake(d.head.x-hr, d.head.y-hr, hr*2.f, hr*2.f);
+            // Голова — чёткий круг
+            CGFloat hr = d.headR < 5.f ? 5.f : d.headR;
+            CGRect hc  = CGRectMake(d.head.x-hr, d.head.y-hr, hr*2.f, hr*2.f);
+
             CGContextSetFillColorWithColor(ctx,
-                [UIColor colorWithRed:.35f green:.85f blue:1.f alpha:.18f].CGColor);
+                [UIColor colorWithRed:.3f green:.85f blue:1.f alpha:.15f].CGColor);
             CGContextFillEllipseInRect(ctx, hc);
+
             CGContextSetLineWidth(ctx, 1.4f);
             CGContextSetStrokeColorWithColor(ctx,
-                [UIColor colorWithRed:.35f green:.85f blue:1.f alpha:.95f].CGColor);
-            CGContextSetShadowWithColor(ctx, CGSizeMake(0,0), 4.f,
-                [UIColor colorWithRed:0 green:.6f blue:1.f alpha:.9f].CGColor);
+                [UIColor colorWithRed:.3f green:.85f blue:1.f alpha:1.f].CGColor);
+            CGContextSetShadowWithColor(ctx, CGSizeMake(0,0), 5.f,
+                [UIColor colorWithRed:.0f green:.6f blue:1.f alpha:1.f].CGColor);
             CGContextStrokeEllipseInRect(ctx, hc);
             CGContextSetShadowWithColor(ctx, CGSizeZero, 0, NULL);
         }
@@ -237,108 +400,124 @@ int            g_playerCount = 0;
 }
 @end
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // MARK: — Colors
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
-static UIColor *cAccent()  { return [UIColor colorWithRed:.35f green:.85f blue:1.f alpha:1.f]; }
-static UIColor *cBg()      { return [UIColor colorWithRed:.06f green:.06f blue:.09f alpha:.95f]; }
-static UIColor *cPanel()   { return [UIColor colorWithRed:.09f green:.09f blue:.13f alpha:1.f]; }
-static UIColor *cPrim()    { return [UIColor colorWithWhite:.92f alpha:1.f]; }
-static UIColor *cSub()     { return [UIColor colorWithWhite:.45f alpha:1.f]; }
+NS_INLINE UIColor *cA()  { return [UIColor colorWithRed:.28f green:.82f blue:1.f alpha:1.f]; }
+NS_INLINE UIColor *cBg() { return [UIColor colorWithRed:.05f green:.05f blue:.08f alpha:.96f]; }
+NS_INLINE UIColor *cP2() { return [UIColor colorWithRed:.08f green:.08f blue:.12f alpha:1.f]; }
+NS_INLINE UIColor *cTx() { return [UIColor colorWithWhite:.90f alpha:1.f]; }
+NS_INLINE UIColor *cS()  { return [UIColor colorWithWhite:.40f alpha:1.f]; }
 
-// ═══════════════════════════════════════════════
-// MARK: — MenuView
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// MARK: — MenuView  (горизонтальное меню, CS-стиль)
+// ═══════════════════════════════════════════════════════════
 
 @interface MenuView : UIView
+@property (nonatomic, strong) UIButton *closeBtn;
 @end
+
 @implementation MenuView
 
 - (instancetype)init {
-    CGFloat W = 310.f, H = 195.f;
+    const CGFloat W = 290.f, H = 185.f;
     CGFloat sx = UIScreen.mainScreen.bounds.size.width;
     CGFloat sy = UIScreen.mainScreen.bounds.size.height;
-    self = [super initWithFrame:CGRectMake((sx-W)*.5f, sy-H-100.f, W, H)];
+    self = [super initWithFrame:CGRectMake((sx-W)*.5f, sy-H-110.f, W, H)];
     self.backgroundColor     = cBg();
-    self.layer.cornerRadius  = 6.f;
+    self.layer.cornerRadius  = 4.f;      // минимальный — как в читах для КС
     self.layer.masksToBounds = YES;
-    self.layer.borderColor   = [UIColor colorWithWhite:.18f alpha:1.f].CGColor;
+    self.layer.borderColor   = [UIColor colorWithWhite:.16f alpha:1.f].CGColor;
     self.layer.borderWidth   = .5f;
-    [self buildUI];
+    [self build];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onPan:)];
     [self addGestureRecognizer:pan];
     return self;
 }
 
-- (void)buildUI {
-    CGFloat W = self.bounds.size.width;
+- (void)build {
+    const CGFloat W = self.bounds.size.width;
 
-    // Tab bar
-    UIView *tb = [[UIView alloc] initWithFrame:CGRectMake(0,0,W,34)];
-    tb.backgroundColor = cPanel();
+    // ── шапка ────────────────────────────────────
+    UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,W,30.f)];
+    hdr.backgroundColor = cP2();
 
-    UILabel *logo = [[UILabel alloc] initWithFrame:CGRectMake(10,0,80,34)];
-    logo.text = @"FLAME"; logo.textColor = cAccent();
-    logo.font = [UIFont systemFontOfSize:11 weight:UIFontWeightHeavy];
-    [tb addSubview:logo];
+    UILabel *logo = [[UILabel alloc] initWithFrame:CGRectMake(10,0,120,30)];
+    logo.text = @"COUNTERFLAME";
+    logo.textColor = cA();
+    logo.font = [UIFont monospacedSystemFontOfSize:10.f weight:UIFontWeightBold];
+    [hdr addSubview:logo];
 
-    UIButton *tESP = [[UIButton alloc] initWithFrame:CGRectMake(88,0,60,34)];
-    [tESP setTitle:@"ESP" forState:UIControlStateNormal];
-    [tESP setTitleColor:cAccent() forState:UIControlStateNormal];
-    tESP.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    UIView *ln = [[UIView alloc] initWithFrame:CGRectMake(0,31,60,2)];
-    ln.backgroundColor = cAccent(); ln.layer.cornerRadius = 1;
-    [tESP addSubview:ln];
-    [tb addSubview:tESP];
+    // Таб ESP — единственный, просто декоративная подчёркнутость
+    UILabel *tab = [[UILabel alloc] initWithFrame:CGRectMake(150,0,60,30)];
+    tab.text = @"ESP"; tab.textColor = cA();
+    tab.font = [UIFont systemFontOfSize:11.f weight:UIFontWeightSemibold];
+    tab.textAlignment = NSTextAlignmentCenter;
+    UIView *tabLine = [[UIView alloc] initWithFrame:CGRectMake(0,27,60,2)];
+    tabLine.backgroundColor = cA(); tabLine.layer.cornerRadius = 1;
+    [tab addSubview:tabLine];
+    [hdr addSubview:tab];
 
-    UILabel *drag = [[UILabel alloc] initWithFrame:CGRectMake(W-34,0,34,34)];
-    drag.text = @"⠿"; drag.textColor = cSub();
-    drag.font = [UIFont systemFontOfSize:14]; drag.textAlignment = NSTextAlignmentCenter;
-    [tb addSubview:drag];
-    [self addSubview:tb];
+    // Крестик закрытия — справа в шапке
+    self.closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.closeBtn.frame = CGRectMake(W-30,0,30,30);
+    [self.closeBtn setTitle:@"×" forState:UIControlStateNormal];
+    [self.closeBtn setTitleColor:cS() forState:UIControlStateNormal];
+    self.closeBtn.titleLabel.font = [UIFont systemFontOfSize:18.f weight:UIFontWeightThin];
+    [hdr addSubview:self.closeBtn];
 
-    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(0,34,W,.5f)];
-    sep.backgroundColor = [UIColor colorWithWhite:.2f alpha:1];
+    // Разделитель
+    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(0,30,W,.5f)];
+    sep.backgroundColor = [UIColor colorWithWhite:.15f alpha:1.f];
+
+    [self addSubview:hdr];
     [self addSubview:sep];
 
-    CGFloat py = 44.f;
-    py = [self addRow:@"ESP Box"  sub:@"Угловой box вокруг игрока" val:g_espBox   y:py W:W
-              toggle:^(BOOL v){ g_espBox = (bool)v; }];
-    py = [self addRow:@"Skeleton" sub:@"Тонкий скелет + голова"    val:g_espSkeleton y:py W:W
-              toggle:^(BOOL v){ g_espSkeleton = (bool)v; }];
+    // ── строки ────────────────────────────────────
+    CGFloat y = 38.f;
+    y = [self row:@"ESP Box" sub:@"Угловой box" val:g_espBox y:y W:W
+          tog:^(BOOL v){ g_espBox = (bool)v; }];
+    y = [self row:@"Skeleton" sub:@"Скелет + голова" val:g_espSkel y:y W:W
+          tog:^(BOOL v){ g_espSkel = (bool)v; }];
 }
 
-- (CGFloat)addRow:(NSString*)name sub:(NSString*)sub val:(bool)val
-                y:(CGFloat)y W:(CGFloat)W toggle:(void(^)(BOOL))blk {
-    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8,y,W-16,44)];
-    row.backgroundColor = cPanel(); row.layer.cornerRadius = 5;
+- (CGFloat)row:(NSString*)nm sub:(NSString*)sub val:(bool)val
+             y:(CGFloat)y W:(CGFloat)W tog:(void(^)(BOOL))blk {
+    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(6,y,W-12,42)];
+    row.backgroundColor    = cP2();
+    row.layer.cornerRadius = 3.f;
 
-    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(12,5,W-100,18)];
-    lb.text = name; lb.textColor = cPrim();
-    lb.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(10,5,W-90,16)];
+    lb.text = nm; lb.textColor = cTx();
+    lb.font = [UIFont systemFontOfSize:12.f weight:UIFontWeightMedium];
 
-    UILabel *sb = [[UILabel alloc] initWithFrame:CGRectMake(12,23,W-100,13)];
-    sb.text = sub; sb.textColor = cSub();
-    sb.font = [UIFont systemFontOfSize:10];
+    UILabel *sb = [[UILabel alloc] initWithFrame:CGRectMake(10,22,W-90,13)];
+    sb.text = sub; sb.textColor = cS();
+    sb.font = [UIFont systemFontOfSize:10.f];
 
     UISwitch *sw = [[UISwitch alloc] init];
-    sw.frame = CGRectMake(W-70,10,51,31);
-    sw.transform = CGAffineTransformMakeScale(.75f,.75f);
-    sw.on = val; sw.onTintColor = cAccent();
+    sw.frame = CGRectMake(W-64,8,0,0); // sizeToFit ниже
+    [sw sizeToFit];
+    sw.frame = CGRectMake(W-64, (42.f-sw.frame.size.height)*.5f,
+                          sw.frame.size.width, sw.frame.size.height);
+    sw.transform   = CGAffineTransformMakeScale(.72f,.72f);
+    sw.on          = val;
+    sw.onTintColor = cA();
+    sw.tintColor   = [UIColor colorWithWhite:.18f alpha:1.f];
 
-    void(^cap)(BOOL) = blk;
+    void(^cb)(BOOL) = blk;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a){
-        cap(((UISwitch*)a.sender).on);
+        cb(((UISwitch *)a.sender).on);
     }] forControlEvents:UIControlEventValueChanged];
 
     [row addSubview:lb]; [row addSubview:sb]; [row addSubview:sw];
     [self addSubview:row];
-    return y + 50.f;
+    return y + 48.f;
 }
 
-- (void)onPan:(UIPanGestureRecognizer*)gr {
+- (void)onPan:(UIPanGestureRecognizer *)gr {
     UIView *sv = self.superview; if (!sv) return;
     CGPoint t = [gr translationInView:sv];
     self.center = CGPointMake(self.center.x+t.x, self.center.y+t.y);
@@ -346,241 +525,76 @@ static UIColor *cSub()     { return [UIColor colorWithWhite:.45f alpha:1.f]; }
 }
 @end
 
-// ═══════════════════════════════════════════════
-// MARK: — Overlay globals + inject
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// MARK: — Overlay globals
+// ═══════════════════════════════════════════════════════════
 
-static ESPView  *g_esp     = nil;
-static MenuView *g_menu    = nil;
+static ESPView  *g_esp    = nil;
+static MenuView *g_menu   = nil;
+static UIButton *g_tog    = nil;    // иконка-кнопка после скрытия меню
 static bool      g_menuVis = false;
-static bool      g_overlayReady = false;
+static bool      g_ready   = false;
 
-// Ищем окно через все доступные API — работает на iOS 13-26 и в LiveContainer
 static UIWindow *findWindow() {
-    // iOS 15+ / LiveContainer: connectedScenes
     if ([UIApplication.sharedApplication respondsToSelector:@selector(connectedScenes)]) {
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
             if (![sc isKindOfClass:UIWindowScene.class]) continue;
-            UIWindowScene *ws = (UIWindowScene*)sc;
-            for (UIWindow *w in ws.windows) {
-                if (!w.isHidden && w.windowLevel == UIWindowLevelNormal) return w;
-            }
-            if (ws.windows.firstObject) return ws.windows.firstObject;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            for (UIWindow *w in ws.windows)
+                if (!w.isHidden) return w;
         }
     }
-    // fallback legacy
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows)
         if (!w.isHidden) return w;
-    }
     return UIApplication.sharedApplication.keyWindow;
 }
 
-static void injectOverlay() {
-    if (g_overlayReady) return;
+static void showMenu(bool show) {
+    g_menuVis     = show;
+    g_menu.hidden = !show;
+    // иконку показываем только когда меню скрыто
+    g_tog.hidden  = show;
+}
 
+static void injectOverlay() {
+    if (g_ready) return;
     UIWindow *win = findWindow();
     if (!win) return;
 
     g_screen = UIScreen.mainScreen.bounds.size;
 
+    // ESP layer
     g_esp = [[ESPView alloc] initWithFrame:win.bounds];
     g_esp.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
     [win addSubview:g_esp];
 
+    // Menu (изначально скрыто)
     g_menu = [[MenuView alloc] init];
     g_menu.hidden = YES;
+    g_menu.layer.zPosition = 99995;
     [win addSubview:g_menu];
 
-    UIButton *tog = [UIButton buttonWithType:UIButtonTypeCustom];
-    tog.frame              = CGRectMake(10, 120, 40, 40);
-    tog.backgroundColor    = [UIColor colorWithRed:.06f green:.06f blue:.09f alpha:.9f];
-    tog.layer.cornerRadius = 6.f;
-    tog.layer.borderWidth  = .5f;
-    tog.layer.borderColor  = [UIColor colorWithWhite:.22f alpha:1].CGColor;
-    tog.layer.zPosition    = 99999;
-    [tog setTitle:@"▤" forState:UIControlStateNormal];
-    [tog setTitleColor:cAccent() forState:UIControlStateNormal];
-    tog.titleLabel.font = [UIFont systemFontOfSize:18];
-    [tog addAction:[UIAction actionWithHandler:^(UIAction *a){
-        g_menuVis = !g_menuVis;
-        g_menu.hidden = !g_menuVis;
+    // Крестик меню → закрыть, показать иконку
+    [g_menu.closeBtn addAction:[UIAction actionWithHandler:^(UIAction *a){
+        showMenu(false);
     }] forControlEvents:UIControlEventTouchUpInside];
-    [win addSubview:tog];
 
-    g_overlayReady = true;
-}
+    // Floating иконка — показывается когда меню закрыто, тап открывает
+    g_tog = [UIButton buttonWithType:UIButtonTypeCustom];
+    g_tog.frame = CGRectMake(8.f, 120.f, 36.f, 36.f);
+    g_tog.backgroundColor    = [UIColor colorWithRed:.05f green:.05f blue:.08f alpha:.92f];
+    g_tog.layer.cornerRadius = 4.f;
+    g_tog.layer.borderWidth  = .5f;
+    g_tog.layer.borderColor  = [UIColor colorWithWhite:.2f alpha:1.f].CGColor;
+    g_tog.layer.zPosition    = 99996;
+    [g_tog setTitle:@"⊞" forState:UIControlStateNormal];
+    [g_tog setTitleColor:cA() forState:UIControlStateNormal];
+    g_tog.titleLabel.font = [UIFont systemFontOfSize:16.f];
+    g_tog.hidden = NO;
 
-// ═══════════════════════════════════════════════
-// MARK: — Polling CADisplayLink
-// Крутится пока не найдёт окно, потом останавливается
-// ═══════════════════════════════════════════════
+    [g_tog addAction:[UIAction actionWithHandler:^(UIAction *a){
+        showMenu(true);
+    }] forControlEvents:UIControlEventTouchUpInside];
 
-@interface CFPoller : NSObject
-+ (void)start;
-@end
-@implementation CFPoller {
-    CADisplayLink *_dl;
-    int _ticks;
-}
-+ (void)start {
-    static CFPoller *p; // retain
-    p = [[CFPoller alloc] init];
-    [p begin];
-}
-- (void)begin {
-    _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    _dl.preferredFramesPerSecond = 10;
-    [_dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-}
-- (void)tick {
-    _ticks++;
-    if (!g_overlayReady) {
-        injectOverlay();
-    }
-    // Останавливаемся через 30 сек или когда готово + ещё 5 тиков
-    if (g_overlayReady || _ticks > 300) {
-        [_dl invalidate];
-    }
-}
-@end
+    // Drag для иконки
 
-// ═══════════════════════════════════════════════
-// MARK: — ESP frame collection
-// ═══════════════════════════════════════════════
-
-static void collectESPFrame(Camera_t cam) {
-    if (!cam || !g_players || g_playerCount <= 0 || !g_overlayReady) return;
-
-    NSMutableArray *nd = [NSMutableArray arrayWithCapacity:(NSUInteger)g_playerCount];
-
-    for (int i = 0; i < g_playerCount; i++) {
-        Il2CppObject *pc = g_players[i];
-        if (!pc) continue;
-        if (rd<bool>((uintptr_t)pc + OFF_PC_IS_DEATH)) continue;
-
-        Il2CppObject *net = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_NETWORK);
-        if (!net) continue;
-
-        Vector3 wPos = rd<Vector3>((uintptr_t)net + OFF_PN_NET_POSITION);
-
-        Il2CppObject *ac  = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_ANIM_CTRL);
-        Il2CppObject *sk  = ac ? rd<Il2CppObject*>((uintptr_t)ac + OFF_PAC_SKELETON) : NULL;
-
-        PlayerESPData d; memset(&d,0,sizeof(d));
-
-        if (sk) {
-            Transform bones[] = {
-                rd<Transform>((uintptr_t)sk + OFF_SK_HEAD),
-                rd<Transform>((uintptr_t)sk + OFF_SK_CHEST),
-                rd<Transform>((uintptr_t)sk + OFF_SK_PELVIS),
-                rd<Transform>((uintptr_t)sk + OFF_SK_L_UPPER_ARM),
-                rd<Transform>((uintptr_t)sk + OFF_SK_R_UPPER_ARM),
-                rd<Transform>((uintptr_t)sk + OFF_SK_L_FOREARM),
-                rd<Transform>((uintptr_t)sk + OFF_SK_R_FOREARM),
-                rd<Transform>((uintptr_t)sk + OFF_SK_L_HAND),
-                rd<Transform>((uintptr_t)sk + OFF_SK_R_HAND),
-                rd<Transform>((uintptr_t)sk + OFF_SK_L_THIGH),
-                rd<Transform>((uintptr_t)sk + OFF_SK_R_THIGH),
-            };
-            CGPoint pts[11];
-            bool ok = true;
-            for (int j = 0; j < 11; j++)
-                ok &= w2s(cam, bonePos(bones[j]), &pts[j]);
-
-            if (ok) {
-                d.head=pts[0]; d.chest=pts[1]; d.pelvis=pts[2];
-                d.lShoulder=pts[3]; d.rShoulder=pts[4];
-                d.lElbow=pts[5];    d.rElbow=pts[6];
-                d.lHand=pts[7];     d.rHand=pts[8];
-                d.lHip=pts[9];      d.rHip=pts[10];
-                CGFloat bh = std::abs(d.pelvis.y - d.head.y);
-                d.headR = (float)(bh * 0.09f);
-                CGFloat bw = bh * 0.45f;
-                d.box = CGRectMake(d.head.x - bw*.5f, d.head.y - d.headR*1.5f, bw, bh + d.headR*2.f);
-                d.hasBox = d.valid = true;
-            }
-        }
-
-        if (!d.valid) {
-            CGPoint top, bot;
-            Vector3 t3 = {wPos.x, wPos.y+1.75f, wPos.z};
-            Vector3 b3 = {wPos.x, wPos.y,        wPos.z};
-            if (w2s(cam,t3,&top) && w2s(cam,b3,&bot)) {
-                CGFloat bh = std::abs(bot.y-top.y), bw = bh*.45f;
-                d.box = CGRectMake(top.x-bw*.5f, top.y, bw, bh);
-                d.head = top; d.headR = (float)(bh*.09f);
-                d.hasBox = d.valid = true;
-            }
-        }
-
-        [nd addObject:[NSValue value:&d withObjCType:@encode(PlayerESPData)]];
-    }
-
-    dispatch_semaphore_wait(g_sema, DISPATCH_TIME_FOREVER);
-    g_frameData = nd;
-    dispatch_semaphore_signal(g_sema);
-
-    dispatch_async(dispatch_get_main_queue(), ^{ [g_esp setNeedsDisplay]; });
-}
-
-// ═══════════════════════════════════════════════
-// MARK: — FILL: хук Update для collectESPFrame
-// ═══════════════════════════════════════════════
-//
-// static IMP orig_update;
-// static void hooked_update(id self, SEL _cmd) {
-//     orig_update(self, _cmd);
-//     Camera_t cam = rd<Camera_t>((uintptr_t)(__bridge void*)self + OFF_PC_CAMERA);
-//     collectESPFrame(cam);
-// }
-//
-// Подключи в tweak_init():
-//   Class uc = NSClassFromString(@"ИмяКласса");
-//   Method m  = class_getInstanceMethod(uc, @selector(Update));
-//   if (m) { orig_update = method_getImplementation(m);
-//             method_setImplementation(m,(IMP)hooked_update); }
-
-// ═══════════════════════════════════════════════
-// MARK: — Constructor
-// Грузимся через __attribute__((constructor)) —
-// работает и в Substrate, и в LiveContainer
-// ═══════════════════════════════════════════════
-
-__attribute__((constructor))
-static void tweak_init() {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
-    if (![bid isEqualToString:@"com.ScarletWork.CounterFlame"]) return;
-
-    g_sema      = dispatch_semaphore_create(1);
-    g_frameData = [NSMutableArray new];
-
-    resolveSymbols();
-
-    // Запускаем поллер сразу — не ждём AppDelegate
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [CFPoller start];
-    });
-
-    // Дополнительный триггер через сцену
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:UIWindowDidBecomeKeyNotification
-                    object:nil queue:NSOperationQueue.mainQueue
-                usingBlock:^(NSNotification *n){
-        if (!g_overlayReady) injectOverlay();
-    }];
-
-    // И через UIScene если iOS 13+
-    if (@available(iOS 13, *)) {
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:UISceneDidActivateNotification
-                        object:nil queue:NSOperationQueue.mainQueue
-                    usingBlock:^(NSNotification *n){
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(.5*NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (!g_overlayReady) injectOverlay();
-            });
-        }];
-    }
-}
-
-#pragma clang diagnostic pop
