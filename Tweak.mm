@@ -678,7 +678,7 @@ static bool CrezCheckbox(ImDrawList* dl, ImVec2 pos, bool& val, const char* labe
     if (val) {
         // checkmark
         ImVec2 p1={a.x+3.f, a.y+8.f}, p2={a.x+6.f,a.y+12.f}, p3={a.x+13.f,a.y+4.f};
-        dl->AddPolyline((ImVec2[]){p1,p2,p3}, 3, IM_COL32(255,255,255,(int)(alpha*255)), 0, 2.f);
+        { ImVec2 pts[3] = {p1,p2,p3}; dl->AddPolyline(pts, 3, IM_COL32(255,255,255,(int)(alpha*255)), ImDrawFlags_None, 2.f); }
     }
     // glow on active
     if (val)
