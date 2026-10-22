@@ -12,9 +12,9 @@
 #import <objc/runtime.h>
 
 // ── ImGui ────────────────────────────────────────────────────────────────────
-#define IMGUI_IMPL_METAL_CPP_EXTENSIONS
-#include <imgui/imgui.h>
-#include <imgui/imgui_internal.h>
+#include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
+#include <algorithm>
 
 // ── Constants ────────────────────────────────────────────────────────────────
 static const char* kVersion       = "v1.0.0";
@@ -295,8 +295,8 @@ typedef struct {
             sr.width  = (NSUInteger)(cmd.ClipRect.z - cmd.ClipRect.x);
             sr.height = (NSUInteger)(cmd.ClipRect.w - cmd.ClipRect.y);
             [enc setScissorRect:sr];
-            if (cmd.TextureId)
-                [enc setFragmentTexture:(__bridge id<MTLTexture>)cmd.TextureId atIndex:0];
+            if (cmd.GetTexID())
+                [enc setFragmentTexture:(__bridge id<MTLTexture>)cmd.GetTexID() atIndex:0];
             else
                 [enc setFragmentTexture:_fontTexture atIndex:0];
             [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -325,8 +325,8 @@ typedef struct {
     bool           _btnTouchActive;
     // snap-anim
     bool           _snapping;
-    CGPoint        _snapTarget;
-    CGPoint        _snapCurrent;
+    ImVec2         _snapTarget;
+    ImVec2         _snapCurrent;
 }
 
 - (instancetype)initWithFrame:(CGRect)f {
@@ -452,8 +452,8 @@ typedef struct {
     // animate via a display link tick is not trivial here — we do it in render loop
     // set snap flag
     _snapping   = true;
-    _snapTarget = {(float)targetX, g_btnPos.y};
-    _snapCurrent= g_btnPos;
+    _snapTarget  = ImVec2((float)targetX, g_btnPos.y);
+    _snapCurrent = g_btnPos;
     // persist
     [self saveState];
 }
@@ -472,7 +472,7 @@ typedef struct {
 }
 
 - (BOOL)isSnapping { return _snapping; }
-- (CGPoint)snapTarget { return _snapTarget; }
+- (ImVec2)snapTarget { return _snapTarget; }
 - (void)clearSnap { _snapping = false; }
 @end
 
@@ -598,7 +598,7 @@ static CrezMenuController* g_ctrl = nil;
 
     // snap animation
     if ([_touchView isSnapping]) {
-        CGPoint tgt = [_touchView snapTarget];
+        ImVec2 tgt = [_touchView snapTarget];
         float spd   = 1.f - powf(0.002f, dt);
         g_btnPos.x  += (tgt.x - g_btnPos.x) * spd;
         g_btnPos.y  += (tgt.y - g_btnPos.y) * spd;
@@ -704,7 +704,7 @@ static void CrezSliderF(ImDrawList* dl, ImVec2 pos, float width, float& val,
     bool hover  = mpos.x>=ta.x-2.f && mpos.x<=tb.x+2.f && mpos.y>=ta.y-8.f && mpos.y<=tb.y+8.f;
     if (hover && ImGui::IsMouseDown(0)) {
         float nt = (mpos.x - ta.x) / width;
-        val = mn + IM_CLAMP(nt, 0.f, 1.f) * (mx - mn);
+        val = mn + std::clamp(nt, 0.f, 1.f) * (mx - mn);
     }
     // track bg
     dl->AddRectFilled(ta, tb, IM_COL32(40,40,55,(int)(alpha*255)), 2.f);
@@ -1114,8 +1114,8 @@ static void CrezColorPicker(ImDrawList* dl, ImVec2 pos, float width,
             g_menuPos.x = mp.x - g_titleDragOff.x;
             g_menuPos.y = mp.y - g_titleDragOff.y;
             CGSize scr = UIScreen.mainScreen.bounds.size;
-            g_menuPos.x = IM_CLAMP(g_menuPos.x, 0.f, (float)scr.width  - g_menuSize.x);
-            g_menuPos.y = IM_CLAMP(g_menuPos.y, 0.f, (float)scr.height - g_menuSize.y);
+            g_menuPos.x = std::clamp(g_menuPos.x, 0.f, (float)scr.width  - g_menuSize.x);
+            g_menuPos.y = std::clamp(g_menuPos.y, 0.f, (float)scr.height - g_menuSize.y);
         }
         if (!ImGui::IsMouseDown(0)) {
             if (g_titleDragging) [_touchView saveState];
@@ -1233,7 +1233,7 @@ static void CrezColorPicker(ImDrawList* dl, ImVec2 pos, float width,
     float wheel = ImGui::GetIO().MouseWheel;
     if (wheel != 0.f) {
         sc2 -= wheel * 20.f;
-        sc2  = IM_CLAMP(sc2, 0.f, MAX(0.f, contentTotalH - contentH + 40.f));
+        sc2  = std::clamp(sc2, 0.f, MAX(0.f, contentTotalH - contentH + 40.f));
     }
 
     // Scrollbar
@@ -1272,8 +1272,8 @@ static void CrezColorPicker(ImDrawList* dl, ImVec2 pos, float width,
                 g_menuSize.x = g_resizeSizeStart.x + (mp.x - g_resizeStart.x) / sc;
                 g_menuSize.y = g_resizeSizeStart.y + (mp.y - g_resizeStart.y) / sc;
                 CGSize scr = UIScreen.mainScreen.bounds.size;
-                g_menuSize.x = IM_CLAMP(g_menuSize.x, kMinW, (float)scr.width  - g_menuPos.x);
-                g_menuSize.y = IM_CLAMP(g_menuSize.y, kMinH, (float)scr.height - g_menuPos.y);
+                g_menuSize.x = std::clamp(g_menuSize.x, kMinW, (float)scr.width  - g_menuPos.x);
+                g_menuSize.y = std::clamp(g_menuSize.y, kMinH, (float)scr.height - g_menuPos.y);
             } else {
                 g_resizing = false;
                 [_touchView saveState];
@@ -1296,7 +1296,7 @@ static void CrezColorPicker(ImDrawList* dl, ImVec2 pos, float width,
 @end
 
 // ── Logos inject ─────────────────────────────────────────────────────────────
-%ctor {
+__attribute__((constructor)) static void CrezInit() {
     NSLog(@"[CREZ] loading");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
