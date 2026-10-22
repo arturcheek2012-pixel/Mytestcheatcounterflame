@@ -7,85 +7,38 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Theos + SDK
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: /opt/theos
-          key: theos-ios165-v1
+      - name: Clone ImGui
+        run: git clone --depth 1 https://github.com/ocornut/imgui imgui
 
-      - name: Install Theos + SDK
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Compile
         run: |
-          git clone --recursive https://github.com/theos/theos /opt/theos
-          mkdir -p /opt/theos/sdks
-          curl -Ls https://github.com/theos/sdks/archive/master.tar.gz | \
-            tar -xz -C /opt/theos/sdks --strip-components=2 sdks-master/iPhoneOS16.5.sdk
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang++ \
+            -arch arm64 -arch arm64e \
+            -isysroot $SDK \
+            -std=c++17 -fobjc-arc -O2 \
+            -I. \
+            -DIMGUI_DISABLE_DEMO_WINDOWS \
+            -DIMGUI_DISABLE_DEBUG_TOOLS \
+            -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
+            -dynamiclib \
+            -framework UIKit -framework Metal -framework MetalKit \
+            -framework QuartzCore -framework Foundation \
+            -lobjc -lc++ \
+            imgui/imgui.cpp imgui/imgui_draw.cpp \
+            imgui/imgui_tables.cpp imgui/imgui_widgets.cpp \
+            Tweak.mm \
+            -o CrezMenu.dylib
 
-      - name: Clone ImGui into repo
-        run: |
-          git clone --depth 1 https://github.com/ocornut/imgui imgui
+      - name: Sign
+        run: xcrun -sdk iphoneos ldid -S CrezMenu.dylib || true
 
-      - name: Build dylib
-        run: |
-          SDK=/opt/theos/sdks/iPhoneOS16.5.sdk
-          CC=/opt/theos/toolchain/linux/iphone/bin/clang++
-
-          # ImGui unity compile → .o for each arch
-          for ARCH in arm64 arm64e; do
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -std=c++17 -O2 -fPIC \
-              -I. \
-              -DIMGUI_DISABLE_DEMO_WINDOWS \
-              -DIMGUI_DISABLE_DEBUG_TOOLS \
-              -c imgui/imgui.cpp         -o imgui_${ARCH}.o
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -std=c++17 -O2 -fPIC -I. \
-              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
-              -c imgui/imgui_draw.cpp    -o imgui_draw_${ARCH}.o
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -std=c++17 -O2 -fPIC -I. \
-              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
-              -c imgui/imgui_tables.cpp  -o imgui_tables_${ARCH}.o
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -std=c++17 -O2 -fPIC -I. \
-              -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
-              -c imgui/imgui_widgets.cpp -o imgui_widgets_${ARCH}.o
-
-            # Tweak.mm → .o
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -std=c++17 -O2 -fPIC -fobjc-arc \
-              -I. \
-              -DIMGUI_DISABLE_DEMO_WINDOWS \
-              -DIMGUI_DISABLE_DEBUG_TOOLS \
-              -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
-              -Wno-deprecated-declarations \
-              -F$SDK/System/Library/Frameworks \
-              -c Tweak.mm -o Tweak_${ARCH}.o
-
-            # link → .dylib per arch
-            $CC -target ${ARCH}-apple-ios15.0 -isysroot $SDK \
-              -dynamiclib -install_name /usr/lib/CrezMenu.dylib \
-              -framework UIKit -framework Metal -framework MetalKit \
-              -framework QuartzCore -framework Foundation \
-              -lobjc \
-              Tweak_${ARCH}.o imgui_${ARCH}.o imgui_draw_${ARCH}.o \
-              imgui_tables_${ARCH}.o imgui_widgets_${ARCH}.o \
-              -o CrezMenu_${ARCH}.dylib
-          done
-
-          # lipo → fat dylib
-          /opt/theos/toolchain/linux/iphone/bin/lipo \
-            -create CrezMenu_arm64.dylib CrezMenu_arm64e.dylib \
-            -output CrezMenu.dylib
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: crez-menu-dylib
           path: CrezMenu.dylib
