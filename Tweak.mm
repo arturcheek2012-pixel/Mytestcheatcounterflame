@@ -1,835 +1,688 @@
+// Tweak.mm — CounterFlame ESP
+// Target: com.ScarletWork.CounterFlame.app
+// Build: theos dylib, iOS 14+, arm64
+// Offsets from Assembly-CSharp dump (IL2CPP)
+// не проверял на живом бинаре — FILL: по своему дампу если что-то съехало
+
 #import <UIKit/UIKit.h>
-#import <CoreGraphics/CoreGraphics.h>
-#include <dlfcn.h>
-#include <vector>
-#include <cmath>
-#include <cstring>
-#include <string>
-#include <stdint.h>
+#import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
-#include <sys/mman.h>
-#include <libkern/OSCacheControl.h>
+#include <stdint.h>
+#include <math.h>
 
-// ═══════════════════════════════════════════════════════════════════
-//  HOOK ENGINE
-// ═══════════════════════════════════════════════════════════════════
-static bool cfHook(void* target, void* replace, void** orig) {
-    if (!target || !replace) return false;
-    uintptr_t page = (uintptr_t)target & ~(uintptr_t)(4096 - 1);
-    mprotect((void*)page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+// ─────────────────────────────────────────
+// MARK: — Config
+// ─────────────────────────────────────────
 
-    uint32_t* dst = (uint32_t*)target;
+static bool  g_espBox      = true;
+static bool  g_espSkeleton = true;
+static float g_boxAlpha    = 0.85f;
 
-    if (orig) {
-        void* tramp = mmap(NULL, 64, PROT_READ|PROT_WRITE|PROT_EXEC,
-                           MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        if (!tramp) return false;
-        uint32_t* t = (uint32_t*)tramp;
-        t[0] = dst[0]; t[1] = dst[1]; t[2] = dst[2]; t[3] = dst[3];
-        t[4] = 0x58000050; // ldr x16, #8
-        t[5] = 0xD61F0200; // br  x16
-        *((uint64_t*)&t[6]) = (uintptr_t)target + 16;
-        sys_icache_invalidate(tramp, 64);
-        *orig = tramp;
-    }
+// ─────────────────────────────────────────
+// MARK: — IL2CPP types (opaque)
+// ─────────────────────────────────────────
 
-    dst[0] = 0x58000050;
-    dst[1] = 0xD61F0200;
-    *((uint64_t*)&dst[2]) = (uint64_t)replace;
-    sys_icache_invalidate(target, 16);
-    return true;
-}
-#define HOOK(target, replace, orig) cfHook((void*)(target), (void*)(replace), (void**)(orig))
+typedef void*    Il2CppObject;
+typedef void*    Il2CppString;
+typedef void*    Transform;
+typedef void*    Camera;
 
-// ═══════════════════════════════════════════════════════════════════
-//  OFFSETS
-// ═══════════════════════════════════════════════════════════════════
-#define OFF_PC_FPSCAM        0x28
-#define OFF_PC_MAINCAM       0x30
-#define OFF_PC_ARMSCTRL      0x60
-#define OFF_PC_PLAYERLOCK    0x68
-#define OFF_PC_NETWORK       0x88
-#define OFF_PC_PLAYER        0x90
-#define OFF_PC_ANIMCTRL      0x98
-#define OFF_PC_ISDEATH       0xA8
+struct Vector3 { float x, y, z; };
+struct Vector2 { float x, y; };
+struct Quaternion { float x, y, z, w; };
 
-#define OFF_SKEL_HEAD        0xA8
-#define OFF_SKEL_CHEST       0xB0
-#define OFF_SKEL_PELVIS      0xB8
+// ─────────────────────────────────────────
+// MARK: — Offsets (from dump)
+// ─────────────────────────────────────────
 
-#define OFF_NET_POSITION     0xBC
-#define OFF_NET_CAMPIVOT     0x110
+// PlayerController
+#define OFF_PC_CAMERA           0x30   // Camera*
+#define OFF_PC_NETWORK          0x88   // PlayerNetwork*
+#define OFF_PC_ANIM_CTRL        0x98   // PlayerAnimatorController*
+#define OFF_PC_IS_DEATH         0xA8   // bool
 
-#define OFF_CULL_CONTROLLER  0x18
-#define OFF_CULL_OCCLUDED    0x48
-#define OFF_CULL_INFRAUSTRUM 0x49
+// PlayerNetwork
+#define OFF_PN_NET_POSITION     0xBC   // Vector3
+#define OFF_PN_NET_ROTATION     0xC8   // Quaternion
 
-#define OFF_LOCK_PLAYERBODY  0x20
-#define OFF_LOCK_ROTATIONX   0x38
-#define OFF_LOCK_CANMOVE     0x3C
-#define OFF_LOCK_HIPFOV      0x40
+// PlayerAnimatorController
+#define OFF_PAC_SKELETON        0x68   // PlayerSkeleton*
 
-// ═══════════════════════════════════════════════════════════════════
-//  TYPES
-// ═══════════════════════════════════════════════════════════════════
-struct CFVec2  { float x, y; };
-struct CFVec3  { float x, y, z; };
-struct CFColor { float r, g, b, a; };
+// PlayerSkeleton bones (Transform*)
+#define OFF_SK_HEAD             0xA8
+#define OFF_SK_CHEST            0xB0
+#define OFF_SK_PELVIS           0xB8
+#define OFF_SK_L_UPPER_ARM      0xC0
+#define OFF_SK_R_UPPER_ARM      0xC8
+#define OFF_SK_L_THIGH          0xD0
+#define OFF_SK_R_THIGH          0xD8
+#define OFF_SK_L_FOREARM        0x38
+#define OFF_SK_R_FOREARM        0x38   // FILL: нет отдельного правого forearm в дампе — уточни
+#define OFF_SK_L_HAND           0x40
+#define OFF_SK_L_PALM           0x48
 
-// ═══════════════════════════════════════════════════════════════════
-//  MEMORY
-// ═══════════════════════════════════════════════════════════════════
-template<typename T>
-static inline T cfRd(uintptr_t a) {
-    if (a < 0x10000) { T z; memset(&z,0,sizeof(z)); return z; }
-    return *reinterpret_cast<T*>(a);
-}
-template<typename T>
-static inline void cfWr(uintptr_t a, T v) {
-    if (a >= 0x10000) *reinterpret_cast<T*>(a) = v;
-}
-static inline uintptr_t cfPtr(uintptr_t a) {
-    if (a < 0x10000) return 0;
-    uintptr_t p = *reinterpret_cast<uintptr_t*>(a);
-    return p >= 0x10000 ? p : 0;
-}
+// _actorToView static — FILL: адрес из il2cpp_inspect / dumpcs для поля _actorToView
+// Пока используем PhotonNetwork.PlayerList через API
 
-static inline uintptr_t listGet(uintptr_t list, int i) {
-    uintptr_t arr = cfPtr(list + 0x10);
-    return arr ? cfPtr(arr + 0x20 + (uintptr_t)i * 0x8) : 0;
-}
-static inline int listCount(uintptr_t list) {
-    if (list < 0x10000) return 0;
-    return *reinterpret_cast<int*>(list + 0x18);
-}
-static inline float v3dist(CFVec3 a, CFVec3 b) {
-    float dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
-    return sqrtf(dx*dx+dy*dy+dz*dz);
-}
-static inline float v2dist(CFVec2 a, CFVec2 b) {
-    float dx=a.x-b.x, dy=a.y-b.y;
-    return sqrtf(dx*dx+dy*dy);
-}
+// ─────────────────────────────────────────
+// MARK: — IL2CPP helper resolvers
+// ─────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════
-//  CONFIG
-// ═══════════════════════════════════════════════════════════════════
-struct Config {
-    bool    espEnabled;
-    bool    espBox;
-    bool    espSkeleton;
-    bool    espVisCheck;
-    CFColor espColorVis;
-    CFColor espColorHid;
-    bool    chamsEnabled;
-    bool    aimEnabled;
-    float   aimFov;
-    int     aimBone;
-    bool    aimVisOnly;
-    float   aimSmooth;
-};
-static Config g_cfg;
+static uintptr_t il2cpp_base = 0;
 
-static void ConfigInit(Config* c) {
-    c->espEnabled   = false;
-    c->espBox       = true;
-    c->espSkeleton  = false;
-    c->espVisCheck  = true;
-    c->espColorVis  = (CFColor){0.f,1.f,0.f,1.f};
-    c->espColorHid  = (CFColor){1.f,0.f,0.f,1.f};
-    c->chamsEnabled = false;
-    c->aimEnabled   = false;
-    c->aimFov       = 80.f;
-    c->aimBone      = 0;
-    c->aimVisOnly   = true;
-    c->aimSmooth    = 6.f;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  IL2CPP
-// ═══════════════════════════════════════════════════════════════════
-typedef void*       (*t_DomainGet)();
-typedef void*       (*t_DomainGetAssemblies)(void*, size_t*);
-typedef void*       (*t_AssemblyGetImage)(void*);
-typedef const char* (*t_ImageGetName)(void*);
-typedef size_t      (*t_ImageGetClassCount)(void*);
-typedef void*       (*t_ClassFromName)(void*, const char*, const char*);
-typedef void*       (*t_ClassGetMethod)(void*, const char*, int);
-typedef const void* (*t_MethodGetPtr)(void*);
-typedef void*       (*t_ClassGetStaticFieldData)(void*);
-
-static t_DomainGet               il2_DomainGet;
-static t_DomainGetAssemblies     il2_DomainGetAssemblies;
-static t_AssemblyGetImage        il2_AssemblyGetImage;
-static t_ImageGetName            il2_ImageGetName;
-static t_ImageGetClassCount      il2_ImageGetClassCount;
-static t_ClassFromName           il2_ClassFromName;
-static t_ClassGetMethod          il2_ClassGetMethod;
-static t_MethodGetPtr            il2_MethodGetPtr;
-static t_ClassGetStaticFieldData il2_ClassGetStaticFieldData;
-
-static bool Il2CppInit() {
-    void* h = dlopen(NULL, RTLD_NOW);
-    if (!h) return false;
-#define LD(var, name) il2_##var = (t_##var)dlsym(h, "il2cpp_" name)
-    LD(DomainGet,               "domain_get");
-    LD(DomainGetAssemblies,     "domain_get_assemblies");
-    LD(AssemblyGetImage,        "assembly_get_image");
-    LD(ImageGetName,            "image_get_name");
-    LD(ImageGetClassCount,      "image_get_class_count");
-    LD(ClassFromName,           "class_from_name");
-    LD(ClassGetMethod,          "class_get_method_from_name");
-    LD(MethodGetPtr,            "method_get_pointer");
-    LD(ClassGetStaticFieldData, "class_get_static_field_data");
-#undef LD
-    return il2_DomainGet && il2_ClassFromName && il2_ClassGetMethod;
-}
-
-static void* FindImageByName(const char* needle) {
-    if (!il2_DomainGet || !il2_DomainGetAssemblies ||
-        !il2_AssemblyGetImage || !il2_ImageGetName) return NULL;
-    size_t cnt = 0;
-    void* domain = il2_DomainGet();
-    if (!domain) return NULL;
-    void** asms = (void**)il2_DomainGetAssemblies(domain, &cnt);
-    if (!asms) return NULL;
-    for (size_t i = 0; i < cnt; i++) {
-        void* img = il2_AssemblyGetImage(asms[i]);
-        if (!img) continue;
-        const char* n = il2_ImageGetName(img);
-        if (n && strstr(n, needle)) return img;
-    }
-    return NULL;
-}
-
-static uintptr_t FindMethodInImage(void* img, const char* ns,
-                                   const char* cls, const char* meth, int pc) {
-    if (!img) return 0;
-    void* klass = il2_ClassFromName(img, ns, cls);
-    if (!klass) return 0;
-    void* m = il2_ClassGetMethod(klass, meth, pc);
-    if (!m) return 0;
-    return (uintptr_t)il2_MethodGetPtr(m);
-}
-
-static uintptr_t FindMethodAnywhere(const char* ns,
-                                    const char* cls, const char* meth, int pc) {
-    if (!il2_DomainGet || !il2_DomainGetAssemblies || !il2_AssemblyGetImage)
-        return 0;
-    size_t cnt = 0;
-    void* domain = il2_DomainGet();
-    if (!domain) return 0;
-    void** asms = (void**)il2_DomainGetAssemblies(domain, &cnt);
-    if (!asms) return 0;
-    for (size_t i = 0; i < cnt; i++) {
-        void* img = il2_AssemblyGetImage(asms[i]);
-        if (!img) continue;
-        uintptr_t r = FindMethodInImage(img, ns, cls, meth, pc);
-        if (r) return r;
+static uintptr_t getBase() {
+    if (il2cpp_base) return il2cpp_base;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && strstr(name, "UnityFramework")) {
+            il2cpp_base = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            return il2cpp_base;
+        }
     }
     return 0;
 }
 
-static uintptr_t GetStaticFieldsOf(void* img, const char* ns, const char* cls) {
-    if (!img || !il2_ClassGetStaticFieldData) return 0;
-    void* klass = il2_ClassFromName(img, ns, cls);
-    return klass ? (uintptr_t)il2_ClassGetStaticFieldData(klass) : 0;
+// FILL: адреса методов из il2cpp dump (RVA от UnityFramework base)
+// grep "GetPlayerList\|WorldToScreenPoint\|get_position\|Transform_get_position" dump.cs для RVA
+
+typedef Il2CppObject* (*t_GetPlayerList)(Il2CppObject* instance);
+typedef Vector3       (*t_TransformGetPos)(Transform t, void* mth);
+typedef Vector2       (*t_WorldToScreen)(Camera cam, Vector3 world, void* mth);
+typedef bool          (*t_GetIsDeath)(Il2CppObject* pc, void* mth);
+typedef Il2CppObject* (*t_GetPhotonNetworkInst)(void);
+
+// Один раз резолвим через il2cpp_resolve_icall или GetMethodPointer
+// FILL: вставь реальные RVA из dump.cs
+
+#define RVA_PLAYERLIST          0x0  // FILL
+#define RVA_TRANSFORM_GETPOS    0x0  // FILL
+#define RVA_WORLD2SCREEN        0x0  // FILL
+
+static t_TransformGetPos  fn_transformGetPos  = nullptr;
+static t_WorldToScreen    fn_worldToScreen    = nullptr;
+
+static void resolveSymbols() {
+    uintptr_t b = getBase();
+    if (!b) return;
+    fn_transformGetPos = (t_TransformGetPos)(b + RVA_TRANSFORM_GETPOS);
+    fn_worldToScreen   = (t_WorldToScreen)  (b + RVA_WORLD2SCREEN);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  UNITY CALLS
-// ═══════════════════════════════════════════════════════════════════
-typedef void      (*t_GetPos)(uintptr_t, CFVec3*);
-typedef void      (*t_W2SInjected)(uintptr_t, CFVec3*, CFVec3*);
-typedef uintptr_t (*t_GetMain)();
-
-static t_GetPos      Transform_get_position = NULL;
-static t_W2SInjected Camera_W2S             = NULL;
-static t_GetMain     Camera_GetMain         = NULL;
-
-static CFVec3 GetPos(uintptr_t transform) {
-    CFVec3 v; memset(&v,0,sizeof(v));
-    if (transform >= 0x10000 && Transform_get_position)
-        Transform_get_position(transform, &v);
-    return v;
+// read<T> с нулевой проверкой
+template<typename T>
+static inline T rd(uintptr_t addr) {
+    if (!addr) return T{};
+    return *(T*)addr;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CHAMS
-// ═══════════════════════════════════════════════════════════════════
-typedef void (*t_TWH_SetOnOutline)(uintptr_t);
-typedef void (*t_TWH_SetOff)(uintptr_t);
-
-static t_TWH_SetOnOutline TWH_SetOnOutline = NULL;
-static t_TWH_SetOff       TWH_SetOff       = NULL;
-static uintptr_t          g_TWH_instance   = 0;
-
-static void ApplyChams(bool enable) {
-    if (g_TWH_instance < 0x10000) return;
-    if (enable  && TWH_SetOnOutline) TWH_SetOnOutline(g_TWH_instance);
-    if (!enable && TWH_SetOff)       TWH_SetOff(g_TWH_instance);
+static inline Vector3 bonePos(Transform bone) {
+    if (!bone || !fn_transformGetPos) return {};
+    return fn_transformGetPos(bone, nullptr);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  SCREEN / W2S
-// ═══════════════════════════════════════════════════════════════════
-static float g_sw = 0.f, g_sh = 0.f;
-static CFVec2 g_center;
-static uintptr_t g_mainCam = 0;
+// ─────────────────────────────────────────
+// MARK: — W2S
+// ─────────────────────────────────────────
 
-static bool W2S(CFVec3 world, CFVec2* out) {
-    if (!Camera_W2S || g_mainCam < 0x10000) return false;
-    CFVec3 r; memset(&r,0,sizeof(r));
-    Camera_W2S(g_mainCam, &world, &r);
-    if (r.z < 0.01f) return false;
-    out->x = r.x;
-    out->y = g_sh - r.y;
-    return true;
+static CGSize screenSize;
+
+static bool worldToScreen(Camera cam, Vector3 world, CGPoint& out) {
+    if (!cam || !fn_worldToScreen) return false;
+    Vector2 s = fn_worldToScreen(cam, world, nullptr);
+    // Unity screen Y = 0 снизу, UIKit Y = 0 сверху
+    out.x = s.x;
+    out.y = screenSize.height - s.y;
+    return (s.x > 0 && s.x < screenSize.width && s.y > 0);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  PLAYERS
-// ═══════════════════════════════════════════════════════════════════
-struct Player {
-    uintptr_t controller, network, culling, skeleton;
-    CFVec3 headPos, chestPos, pelvisPos, netPos;
-    CFVec2 headS, chestS, pelvisS, topS, botS;
-    bool   headOnS, chestOnS, pelvisOnS;
-    bool   isDead, occluded, inFrustum;
-    float  dist;
+// ─────────────────────────────────────────
+// MARK: — ESP Overlay (UIView)
+// ─────────────────────────────────────────
+
+// Хранилище per-frame данных — собираем в игровом потоке, рисуем в main
+struct PlayerESPData {
+    // box
+    CGRect    box;
+    bool      hasBox;
+    // skeleton joints (screen)
+    CGPoint   head, chest, pelvis;
+    CGPoint   lShoulder, rShoulder;
+    CGPoint   lElbow,    rElbow;
+    CGPoint   lHand,     rHand;
+    CGPoint   lHip,      rHip;
+    // head circle radius
+    float     headR;
+    bool      valid;
 };
 
-static std::vector<Player> g_players;
-static uintptr_t g_localCtrl        = 0;
-static uintptr_t g_localArms        = 0;
-static CFVec3    g_localPos;
-static uintptr_t g_cullingInstances = 0;
+static NSMutableArray<NSValue*>* g_frameData; // NSValue wrapping PlayerESPData*
+static dispatch_semaphore_t      g_dataSema;
 
-static void UpdatePlayers() {
-    g_players.clear();
-    if (g_cullingInstances < 0x10000) return;
+@interface ESPView : UIView
+@end
 
-    uintptr_t list = cfPtr(g_cullingInstances);
-    int count = listCount(list);
-    if (count <= 0 || count > 64) return;
+@implementation ESPView
 
-    for (int i = 0; i < count; i++) {
-        uintptr_t culling = listGet(list, i);
-        if (culling < 0x10000) continue;
-
-        uintptr_t ctrl = cfPtr(culling + OFF_CULL_CONTROLLER);
-        if (ctrl < 0x10000 || ctrl == g_localCtrl) continue;
-
-        bool dead = cfRd<bool>(ctrl + OFF_PC_ISDEATH);
-        if (dead) continue;
-
-        bool occ  = cfRd<bool>(culling + OFF_CULL_OCCLUDED);
-        bool frus = cfRd<bool>(culling + OFF_CULL_INFRAUSTRUM);
-
-        uintptr_t net = cfPtr(ctrl + OFF_PC_NETWORK);
-        if (net < 0x10000) continue;
-
-        CFVec3 netPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
-
-        uintptr_t animCtrl = cfPtr(ctrl + OFF_PC_ANIMCTRL);
-        uintptr_t skel     = animCtrl ? cfPtr(animCtrl + 0x20) : 0;
-
-        CFVec3 headPos, chestPos, pelvisPos;
-        memset(&headPos,   0, sizeof(headPos));
-        memset(&chestPos,  0, sizeof(chestPos));
-        memset(&pelvisPos, 0, sizeof(pelvisPos));
-
-        if (skel >= 0x10000) {
-            headPos   = GetPos(cfPtr(skel + OFF_SKEL_HEAD));
-            chestPos  = GetPos(cfPtr(skel + OFF_SKEL_CHEST));
-            pelvisPos = GetPos(cfPtr(skel + OFF_SKEL_PELVIS));
-        } else {
-            CFVec3 pivot = cfRd<CFVec3>(net + OFF_NET_CAMPIVOT);
-            headPos.x = netPos.x + pivot.x;
-            headPos.y = netPos.y + pivot.y;
-            headPos.z = netPos.z + pivot.z;
-            chestPos  = netPos; chestPos.y  += 1.0f;
-            pelvisPos = netPos; pelvisPos.y += 0.5f;
-        }
-
-        Player p;
-        memset(&p, 0, sizeof(p));
-        p.controller = ctrl; p.network = net;
-        p.culling    = culling; p.skeleton = skel;
-        p.isDead = dead; p.occluded = occ; p.inFrustum = frus;
-        p.headPos = headPos; p.chestPos = chestPos;
-        p.pelvisPos = pelvisPos; p.netPos = netPos;
-        p.dist = v3dist(g_localPos, netPos);
-
-        p.headOnS   = W2S(headPos,   &p.headS);
-        p.chestOnS  = W2S(chestPos,  &p.chestS);
-        p.pelvisOnS = W2S(pelvisPos, &p.pelvisS);
-
-        CFVec3 bot = netPos; bot.y -= 0.2f;
-        W2S(headPos, &p.topS);
-        W2S(bot,     &p.botS);
-
-        g_players.push_back(p);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  AIMBOT
-// ═══════════════════════════════════════════════════════════════════
-static void DoAimbot(uintptr_t localCtrl) {
-    if (!g_cfg.aimEnabled || localCtrl < 0x10000 || g_players.empty()) return;
-
-    float bestDist = g_cfg.aimFov;
-    const Player* best = NULL;
-
-    for (size_t i = 0; i < g_players.size(); i++) {
-        const Player& p = g_players[i];
-        if (g_cfg.aimVisOnly && p.occluded) continue;
-        if (!p.headOnS) continue;
-        CFVec2 tgt;
-        if      (g_cfg.aimBone == 1) tgt = p.chestS;
-        else if (g_cfg.aimBone == 2) tgt = p.pelvisS;
-        else                          tgt = p.headS;
-        float d = v2dist(tgt, g_center);
-        if (d < bestDist) { bestDist = d; best = &p; }
-    }
-    if (!best) return;
-
-    CFVec2 tgt;
-    if      (g_cfg.aimBone == 1) tgt = best->chestS;
-    else if (g_cfg.aimBone == 2) tgt = best->pelvisS;
-    else                          tgt = best->headS;
-
-    float dy = (tgt.y - g_center.y) / g_cfg.aimSmooth;
-
-    uintptr_t lock = cfPtr(localCtrl + OFF_PC_PLAYERLOCK);
-    if (lock < 0x10000) return;
-
-    cfWr<bool>(lock + OFF_LOCK_CANMOVE, true);
-
-    float hipFov = cfRd<float>(lock + OFF_LOCK_HIPFOV);
-    if (hipFov < 1.f) hipFov = 60.f;
-
-    float curX = cfRd<float>(lock + OFF_LOCK_ROTATIONX);
-    cfWr<float>(lock + OFF_LOCK_ROTATIONX, curX + (-dy * (hipFov / g_sh)));
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  ESP VIEW
-// ═══════════════════════════════════════════════════════════════════
-@interface CFESPView : UIView @end
-@implementation CFESPView
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = [UIColor clearColor];
+        self.backgroundColor        = UIColor.clearColor;
         self.userInteractionEnabled = NO;
-        self.opaque = NO;
+        self.layer.zPosition        = 9999;
     }
     return self;
 }
-- (void)drawRect:(CGRect)__unused rect {
+
+- (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
-    if (g_cfg.espEnabled) {
-        CGContextSetLineWidth(ctx, 1.5f);
-        for (size_t i = 0; i < g_players.size(); i++) {
-            const Player& p = g_players[i];
-            CFColor c = (p.occluded && g_cfg.espVisCheck)
-                        ? g_cfg.espColorHid : g_cfg.espColorVis;
-            CGContextSetRGBStrokeColor(ctx, c.r, c.g, c.b, c.a);
-            if (g_cfg.espBox && p.headOnS && p.pelvisOnS) {
-                float h = p.botS.y - p.topS.y;
-                if (h < 8.f) h = 8.f;
-                float w = h * 0.45f;
-                CGContextStrokeRect(ctx,
-                    CGRectMake(p.topS.x - w*0.5f, p.topS.y, w, h));
-            }
-            if (g_cfg.espSkeleton) {
-                if (p.headOnS && p.chestOnS) {
-                    CGContextMoveToPoint(ctx, p.headS.x, p.headS.y);
-                    CGContextAddLineToPoint(ctx, p.chestS.x, p.chestS.y);
-                    CGContextStrokePath(ctx);
-                }
-                if (p.chestOnS && p.pelvisOnS) {
-                    CGContextMoveToPoint(ctx, p.chestS.x, p.chestS.y);
-                    CGContextAddLineToPoint(ctx, p.pelvisS.x, p.pelvisS.y);
-                    CGContextStrokePath(ctx);
-                }
-            }
+    dispatch_semaphore_wait(g_dataSema, DISPATCH_TIME_FOREVER);
+    NSArray* snapshot = [g_frameData copy];
+    dispatch_semaphore_signal(g_dataSema);
+
+    for (NSValue* val in snapshot) {
+        PlayerESPData* d = nil;
+        [val getValue:&d];
+        if (!d || !d->valid) continue;
+
+        // ── Box ──────────────────────────────────────
+        if (g_espBox && d->hasBox) {
+            // Угловой ESP box — рисуем только 4 угла, не полный прямоугольник
+            CGRect r = d->box;
+            float cw = r.size.width  * 0.28f; // длина уголка
+            float ch = r.size.height * 0.18f;
+            CGContextSetLineWidth(ctx, 1.6f);
+
+            // Тень для читаемости на любом фоне
+            CGContextSetShadowWithColor(ctx,
+                CGSizeMake(0, 0), 3.0,
+                [UIColor.blackColor colorWithAlphaComponent:0.9f].CGColor);
+
+            // Цвет — холодный голубой
+            CGContextSetStrokeColorWithColor(ctx,
+                [UIColor colorWithRed:0.35 green:0.85 blue:1.0 alpha:g_boxAlpha].CGColor);
+
+            // Top-left
+            CGContextMoveToPoint(ctx, r.origin.x, r.origin.y + ch);
+            CGContextAddLineToPoint(ctx, r.origin.x, r.origin.y);
+            CGContextAddLineToPoint(ctx, r.origin.x + cw, r.origin.y);
+
+            // Top-right
+            CGContextMoveToPoint(ctx, r.origin.x + r.size.width - cw, r.origin.y);
+            CGContextAddLineToPoint(ctx, r.origin.x + r.size.width, r.origin.y);
+            CGContextAddLineToPoint(ctx, r.origin.x + r.size.width, r.origin.y + ch);
+
+            // Bottom-left
+            CGContextMoveToPoint(ctx, r.origin.x, r.origin.y + r.size.height - ch);
+            CGContextAddLineToPoint(ctx, r.origin.x, r.origin.y + r.size.height);
+            CGContextAddLineToPoint(ctx, r.origin.x + cw, r.origin.y + r.size.height);
+
+            // Bottom-right
+            CGContextMoveToPoint(ctx, r.origin.x + r.size.width - cw, r.origin.y + r.size.height);
+            CGContextAddLineToPoint(ctx, r.origin.x + r.size.width, r.origin.y + r.size.height);
+            CGContextAddLineToPoint(ctx, r.origin.x + r.size.width, r.origin.y + r.size.height - ch);
+
+            CGContextStrokePath(ctx);
+            CGContextSetShadowWithColor(ctx, CGSizeZero, 0, nil);
+        }
+
+        // ── Skeleton ─────────────────────────────────
+        if (g_espSkeleton) {
+            CGContextSetLineWidth(ctx, 1.1f);
+            CGContextSetStrokeColorWithColor(ctx,
+                [UIColor colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.75f].CGColor);
+            CGContextSetShadowWithColor(ctx,
+                CGSizeMake(0, 0), 2.5,
+                [UIColor.blackColor colorWithAlphaComponent:0.8f].CGColor);
+
+            // Helper lambda-style inline macro
+#define BONE_LINE(a, b) \
+            CGContextMoveToPoint(ctx, (a).x, (a).y); \
+            CGContextAddLineToPoint(ctx, (b).x, (b).y);
+
+            // Позвоночник
+            BONE_LINE(d->head,  d->chest);
+            BONE_LINE(d->chest, d->pelvis);
+
+            // Руки
+            BONE_LINE(d->chest,    d->lShoulder);
+            BONE_LINE(d->lShoulder, d->lElbow);
+            BONE_LINE(d->lElbow,   d->lHand);
+
+            BONE_LINE(d->chest,    d->rShoulder);
+            BONE_LINE(d->rShoulder, d->rElbow);
+            BONE_LINE(d->rElbow,   d->rHand);
+
+            // Ноги
+            BONE_LINE(d->pelvis, d->lHip);
+            BONE_LINE(d->pelvis, d->rHip);
+
+            CGContextStrokePath(ctx);
+            CGContextSetShadowWithColor(ctx, CGSizeZero, 0, nil);
+
+            // ── Голова — выделенный круг ──────────────
+            float r = MAX(d->headR, 6.0f);
+            CGRect headCircle = CGRectMake(
+                d->head.x - r, d->head.y - r, r * 2, r * 2);
+
+            // Заливка полупрозрачная
+            CGContextSetFillColorWithColor(ctx,
+                [UIColor colorWithRed:0.35 green:0.85 blue:1.0 alpha:0.18f].CGColor);
+            CGContextFillEllipseInRect(ctx, headCircle);
+
+            // Обводка яркая
+            CGContextSetLineWidth(ctx, 1.4f);
+            CGContextSetStrokeColorWithColor(ctx,
+                [UIColor colorWithRed:0.35 green:0.85 blue:1.0 alpha:0.95f].CGColor);
+            CGContextSetShadowWithColor(ctx,
+                CGSizeMake(0, 0), 4.0,
+                [UIColor colorWithRed:0.0 green:0.6 blue:1.0 alpha:0.9f].CGColor);
+            CGContextStrokeEllipseInRect(ctx, headCircle);
+            CGContextSetShadowWithColor(ctx, CGSizeZero, 0, nil);
+
+#undef BONE_LINE
         }
     }
-    if (g_cfg.aimEnabled) {
-        CGContextSetRGBStrokeColor(ctx, 0.12f, 0.95f, 0.32f, 0.4f);
-        CGContextSetLineWidth(ctx, 1.f);
-        CGContextStrokeEllipseInRect(ctx,
-            CGRectMake(g_center.x - g_cfg.aimFov,
-                       g_center.y - g_cfg.aimFov,
-                       g_cfg.aimFov * 2, g_cfg.aimFov * 2));
-        CGContextSetLineWidth(ctx, 0.8f);
-        CGContextMoveToPoint(ctx, g_center.x-6, g_center.y);
-        CGContextAddLineToPoint(ctx, g_center.x+6, g_center.y);
-        CGContextMoveToPoint(ctx, g_center.x, g_center.y-6);
-        CGContextAddLineToPoint(ctx, g_center.x, g_center.y+6);
-        CGContextStrokePath(ctx);
-    }
-}
-@end
-
-// ═══════════════════════════════════════════════════════════════════
-//  MENU
-// ═══════════════════════════════════════════════════════════════════
-@interface CFMenu : UIView
-@property (nonatomic, strong) UIScrollView* panel;
-@end
-
-@implementation CFMenu {
-    CGFloat _y;
-    CGPoint _drag;
 }
 
-- (instancetype)initWithScreen:(CGRect)sz {
-    CGFloat h = MIN(480.f, sz.size.height - 80.f);
-    CGFloat x = (sz.size.width  - 270.f) * 0.5f;
-    CGFloat y = (sz.size.height - h)      * 0.5f;
+@end
 
-    self = [super initWithFrame:CGRectMake(x, y, 270, h)];
+// ─────────────────────────────────────────
+// MARK: — Menu overlay
+// ─────────────────────────────────────────
+
+@interface MenuView : UIView
+@property (nonatomic, assign) CGPoint  dragOffset;
+@property (nonatomic, assign) BOOL     isDragging;
+@property (nonatomic, strong) UIButton *tabESP;
+@property (nonatomic, strong) UIView   *pageESP;
+@end
+
+@implementation MenuView
+
+static UIColor* accent()  { return [UIColor colorWithRed:0.35 green:0.85 blue:1.0 alpha:1.0]; }
+static UIColor* bg()      { return [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.94]; }
+static UIColor* bgPanel() { return [UIColor colorWithRed:0.09 green:0.09 blue:0.13 alpha:1.0]; }
+static UIColor* textPrimary()   { return [UIColor colorWithWhite:0.92 alpha:1.0]; }
+static UIColor* textSecondary() { return [UIColor colorWithWhite:0.45 alpha:1.0]; }
+
+- (instancetype)init {
+    // Горизонтальное меню: компактная полоска с табами сверху, контент снизу
+    CGFloat W = 320, H = 200;
+    CGFloat sx = [UIScreen mainScreen].bounds.size.width;
+    CGFloat sy = [UIScreen mainScreen].bounds.size.height;
+    self = [super initWithFrame:CGRectMake((sx - W) / 2, sy - H - 80, W, H)];
     if (!self) return nil;
 
-    self.backgroundColor = [UIColor colorWithRed:.07f green:.07f blue:.09f alpha:.93f];
-    self.layer.cornerRadius = 12;
-    self.layer.masksToBounds = YES;
-    self.layer.borderWidth = 1;
-    self.layer.borderColor =
-        [UIColor colorWithRed:.22f green:.22f blue:.28f alpha:.65f].CGColor;
+    // Основной фон
+    self.backgroundColor             = bg();
+    self.layer.cornerRadius          = 6;       // заострённые углы — минимум
+    self.layer.masksToBounds         = YES;
+    self.layer.borderColor           = [UIColor colorWithWhite:0.18 alpha:1.0].CGColor;
+    self.layer.borderWidth           = 0.5f;
 
-    UIView* hdr = [[UIView alloc] initWithFrame:CGRectMake(0,0,270,42)];
-    hdr.backgroundColor = [UIColor colorWithRed:.10f green:.10f blue:.13f alpha:1];
-    hdr.userInteractionEnabled = YES;
-    [self addSubview:hdr];
-
-    UIView* acc = [[UIView alloc] initWithFrame:CGRectMake(0,41,270,1)];
-    acc.backgroundColor = [UIColor colorWithRed:.27f green:.52f blue:1 alpha:.55f];
-    [self addSubview:acc];
-
-    UILabel* ttl = [[UILabel alloc] initWithFrame:CGRectMake(0,12,270,18)];
-    ttl.text = @"CF ESP";
-    ttl.textAlignment = NSTextAlignmentCenter;
-    ttl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    ttl.textColor = [UIColor colorWithWhite:.92f alpha:1];
-    [self addSubview:ttl];
-
-    UIPanGestureRecognizer* pan =
-        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
-    [hdr addGestureRecognizer:pan];
-
-    _panel = [[UIScrollView alloc] initWithFrame:CGRectMake(0,43,270,h-43)];
-    _panel.backgroundColor = [UIColor clearColor];
-    _panel.alwaysBounceVertical = YES;
-    [self addSubview:_panel];
-
+    // Тень снаружи (не clipsToBounds — нужен второй контейнер, но оставим просто shadow)
+    // shadow требует masksToBounds = NO — делаем два слоя через shadowView
     [self buildUI];
+
+    // Drag
+    UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(handlePan:)];
+    [self addGestureRecognizer:pan];
+
     return self;
 }
 
-- (void)drag:(UIPanGestureRecognizer*)g {
-    CGPoint loc = [g locationInView:self.superview];
-    if (g.state == UIGestureRecognizerStateBegan)
-        _drag = CGPointMake(loc.x - self.frame.origin.x,
-                            loc.y - self.frame.origin.y);
-    else if (g.state == UIGestureRecognizerStateChanged) {
-        CGRect f = self.frame;
-        f.origin = CGPointMake(loc.x - _drag.x, loc.y - _drag.y);
-        self.frame = f;
-    }
-}
-
-- (void)section:(NSString*)title {
-    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 16)];
-    l.text = title;
-    l.textColor = [UIColor colorWithRed:.27f green:.52f blue:1 alpha:1];
-    l.font = [UIFont boldSystemFontOfSize:10];
-    [_panel addSubview:l]; _y += 22;
-}
-
-- (void)row:(NSString*)title val:(BOOL)v sel:(SEL)s {
-    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y+4, 185, 20)];
-    l.text = title;
-    l.textColor = [UIColor whiteColor];
-    l.font = [UIFont systemFontOfSize:13];
-    [_panel addSubview:l];
-
-    UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(198, _y, 51, 31)];
-    sw.transform = CGAffineTransformMakeScale(0.78f, 0.78f);
-    sw.on = v;
-    [sw addTarget:self action:s forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:sw];
-    _y += 38;
-}
-
-- (void)slider:(NSString*)title min:(float)mn max:(float)mx val:(float)v
-           sel:(SEL)s tag:(NSInteger)tag {
-    UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 14)];
-    l.text = [NSString stringWithFormat:@"%@ : %.0f", title, v];
-    l.textColor = [UIColor lightGrayColor];
-    l.font = [UIFont systemFontOfSize:10];
-    l.tag = tag;
-    [_panel addSubview:l]; _y += 16;
-
-    UISlider* sl = [[UISlider alloc] initWithFrame:CGRectMake(10, _y, 250, 26)];
-    sl.minimumValue = mn; sl.maximumValue = mx; sl.value = v;
-    sl.minimumTrackTintColor =
-        [UIColor colorWithRed:.12f green:.95f blue:.32f alpha:.85f];
-    sl.tag = tag;
-    [sl addTarget:self action:s forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:sl]; _y += 34;
-}
-
 - (void)buildUI {
-    _y = 10;
-    [self section:@"── ESP ─────────────────"];
-    [self row:@"ESP"       val:g_cfg.espEnabled  sel:@selector(onESP:)];
-    [self row:@"Box"       val:g_cfg.espBox      sel:@selector(onBox:)];
-    [self row:@"Skeleton"  val:g_cfg.espSkeleton sel:@selector(onSkel:)];
-    [self row:@"Vis check" val:g_cfg.espVisCheck sel:@selector(onVis:)];
+    CGFloat W = self.bounds.size.width;
 
-    [self section:@"── CHAMS ───────────────"];
-    [self row:@"Chams (outline)" val:g_cfg.chamsEnabled sel:@selector(onChams:)];
+    // ── Tab bar (горизонтальная полоска вверху) ──
+    UIView* tabBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
+    tabBar.backgroundColor = bgPanel();
 
-    [self section:@"── AIMBOT ──────────────"];
-    [self row:@"Aimbot"        val:g_cfg.aimEnabled sel:@selector(onAim:)];
-    [self row:@"Только видимые" val:g_cfg.aimVisOnly sel:@selector(onAimVis:)];
-    [self slider:@"FOV"    min:10 max:350 val:g_cfg.aimFov
-              sel:@selector(onFov:)    tag:100];
-    [self slider:@"Smooth" min:1  max:25  val:g_cfg.aimSmooth
-              sel:@selector(onSmooth:) tag:101];
+    // Логотип/заголовок слева
+    UILabel* title = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 90, 36)];
+    title.text          = @"FLAME";
+    title.textColor     = accent();
+    title.font          = [UIFont systemFontOfSize:11 weight:UIFontWeightHeavy];
+    title.alpha         = 0.9f;
+    [tabBar addSubview:title];
 
-    UILabel* bl = [[UILabel alloc] initWithFrame:CGRectMake(10, _y, 250, 14)];
-    bl.text = @"Цель";
-    bl.textColor = [UIColor lightGrayColor];
-    bl.font = [UIFont systemFontOfSize:10];
-    [_panel addSubview:bl]; _y += 16;
+    // Таб ESP
+    self.tabESP = [self makeTab:@"ESP" x:90 width:70 active:YES];
+    [self.tabESP addTarget:self action:@selector(onTabESP) forControlEvents:UIControlEventTouchUpInside];
+    [tabBar addSubview:self.tabESP];
 
-    NSArray* items = @[@"Голова", @"Грудь", @"Таз"];
-    UISegmentedControl* sc = [[UISegmentedControl alloc] initWithItems:items];
-    sc.frame = CGRectMake(10, _y, 250, 28);
-    sc.selectedSegmentIndex = g_cfg.aimBone;
-    [sc addTarget:self action:@selector(onBone:)
-       forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:sc]; _y += 38;
+    // Drag handle справа
+    UILabel* handle = [[UILabel alloc] initWithFrame:CGRectMake(W - 36, 0, 36, 36)];
+    handle.text      = @"⠿";
+    handle.textColor = textSecondary();
+    handle.font      = [UIFont systemFontOfSize:14];
+    handle.textAlignment = NSTextAlignmentCenter;
+    [tabBar addSubview:handle];
 
-    _panel.contentSize = CGSizeMake(270, _y + 16);
+    [self addSubview:tabBar];
+
+    // Разделитель
+    UIView* sep = [[UIView alloc] initWithFrame:CGRectMake(0, 36, W, 0.5f)];
+    sep.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    [self addSubview:sep];
+
+    // ── Page ESP ────────────────────────────────
+    self.pageESP = [[UIView alloc] initWithFrame:CGRectMake(0, 36.5f, W, self.bounds.size.height - 36.5f)];
+    self.pageESP.backgroundColor = UIColor.clearColor;
+    [self buildESPPage:self.pageESP];
+    [self addSubview:self.pageESP];
 }
 
-- (void)onESP:(UISwitch*)s    { g_cfg.espEnabled   = s.on; }
-- (void)onBox:(UISwitch*)s    { g_cfg.espBox       = s.on; }
-- (void)onSkel:(UISwitch*)s   { g_cfg.espSkeleton  = s.on; }
-- (void)onVis:(UISwitch*)s    { g_cfg.espVisCheck  = s.on; }
-- (void)onChams:(UISwitch*)s  { g_cfg.chamsEnabled = s.on; ApplyChams(s.on); }
-- (void)onAim:(UISwitch*)s    { g_cfg.aimEnabled   = s.on; }
-- (void)onAimVis:(UISwitch*)s { g_cfg.aimVisOnly   = s.on; }
-- (void)onBone:(UISegmentedControl*)sc { g_cfg.aimBone = (int)sc.selectedSegmentIndex; }
+- (UIButton*)makeTab:(NSString*)text x:(CGFloat)x width:(CGFloat)w active:(BOOL)active {
+    UIButton* btn = [[UIButton alloc] initWithFrame:CGRectMake(x, 0, w, 36)];
+    [btn setTitle:text forState:UIControlStateNormal];
+    [btn setTitleColor:active ? accent() : textSecondary() forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
 
-- (void)onFov:(UISlider*)sl {
-    g_cfg.aimFov = sl.value;
-    UILabel* l = (UILabel*)[_panel viewWithTag:100];
-    if (l) l.text = [NSString stringWithFormat:@"FOV : %.0f", sl.value];
+    if (active) {
+        UIView* line = [[UIView alloc] initWithFrame:CGRectMake(0, 33, w, 2)];
+        line.backgroundColor  = accent();
+        line.layer.cornerRadius = 1;
+        line.tag = 99;
+        [btn addSubview:line];
+    }
+    return btn;
 }
-- (void)onSmooth:(UISlider*)sl {
-    g_cfg.aimSmooth = sl.value;
-    UILabel* l = (UILabel*)[_panel viewWithTag:101];
-    if (l) l.text = [NSString stringWithFormat:@"Smooth : %.0f", sl.value];
+
+- (void)buildESPPage:(UIView*)page {
+    CGFloat W  = page.bounds.size.width;
+    CGFloat py = 12;
+
+    // Row helper — toggle + label
+    py = [self addRow:@"ESP Box"      desc:@"Угловой box вокруг игрока"
+                value:g_espBox      page:page y:py w:W
+                onToggle:^(BOOL v){ g_espBox = v; }];
+
+    py = [self addRow:@"Skeleton"     desc:@"Тонкий скелет + голова"
+                value:g_espSkeleton page:page y:py w:W
+                onToggle:^(BOOL v){ g_espSkeleton = v; }];
 }
+
+- (CGFloat)addRow:(NSString*)name desc:(NSString*)desc value:(bool)val
+             page:(UIView*)page y:(CGFloat)y w:(CGFloat)W
+        onToggle:(void(^)(BOOL))block {
+
+    UIView* row = [[UIView alloc] initWithFrame:CGRectMake(8, y, W - 16, 44)];
+    row.backgroundColor    = bgPanel();
+    row.layer.cornerRadius = 5;
+
+    UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, W - 100, 18)];
+    lbl.text      = name;
+    lbl.textColor = textPrimary();
+    lbl.font      = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+
+    UILabel* sub = [[UILabel alloc] initWithFrame:CGRectMake(12, 24, W - 100, 13)];
+    sub.text      = desc;
+    sub.textColor = textSecondary();
+    sub.font      = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+
+    UISwitch* sw = [[UISwitch alloc] init];
+    sw.frame     = CGRectMake(W - 75, 10, 51, 31);
+    sw.transform = CGAffineTransformMakeScale(0.75f, 0.75f);
+    sw.on        = val;
+    sw.onTintColor = accent();
+    sw.tintColor   = [UIColor colorWithWhite:0.2 alpha:1.0];
+
+    // capture block
+    void(^cb)(BOOL) = block;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction* a) {
+        cb([(UISwitch*)a.sender isOn]);
+    }] forControlEvents:UIControlEventValueChanged];
+
+    [row addSubview:lbl];
+    [row addSubview:sub];
+    [row addSubview:sw];
+    [page addSubview:row];
+
+    return y + 50;
+}
+
+- (void)onTabESP { /* единственный таб, ничего */ }
+
+- (void)handlePan:(UIPanGestureRecognizer*)gr {
+    UIView* sv = self.superview;
+    if (!sv) return;
+    CGPoint t = [gr translationInView:sv];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [gr setTranslation:CGPointZero inView:sv];
+}
+
 @end
 
-// ═══════════════════════════════════════════════════════════════════
-//  UI GLOBALS
-// ═══════════════════════════════════════════════════════════════════
-static CFESPView* g_espView = nil;
-static CFMenu*    g_menu    = nil;
-static bool       g_uiReady = false;
+// ─────────────────────────────────────────
+// MARK: — Toggle button (floating)
+// ─────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════
-//  HOOKS
-// ═══════════════════════════════════════════════════════════════════
-typedef void (*t_ArmsLateUpdate)(uintptr_t);
-static t_ArmsLateUpdate orig_ArmsLateUpdate = NULL;
+static MenuView* g_menu  = nil;
+static ESPView*  g_esp   = nil;
+static bool      g_menuVisible = false;
 
-static void Hook_ArmsLateUpdate(uintptr_t thiz) {
-    // обязательно вызываем оригинал первым
-    if (orig_ArmsLateUpdate) orig_ArmsLateUpdate(thiz);
-
-    // guards
-    if (!g_uiReady)          return;
-    if (g_localCtrl == 0)    return;
-    if (g_localArms == 0)    return;
-    if (thiz != g_localArms) return;
-    if (!Camera_W2S || !Camera_GetMain) return;
-
-    // обновляем главную камеру (один раз)
-    if (g_mainCam == 0) {
-        uintptr_t mc = Camera_GetMain();
-        if (mc >= 0x10000) g_mainCam = mc;
-    }
-
-    // локальная позиция
-    uintptr_t net = cfPtr(g_localCtrl + OFF_PC_NETWORK);
-    if (net >= 0x10000) {
-        g_localPos = cfRd<CFVec3>(net + OFF_NET_POSITION);
-    }
-
-    UpdatePlayers();
-    DoAimbot(g_localCtrl);
-
-    if (g_espView) {
-        CFESPView* view = g_espView;
-        dispatch_async(dispatch_get_main_queue(), ^{ [view setNeedsDisplay]; });
-    }
+static void toggleMenu() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_menu.hidden    = g_menuVisible;
+        g_menuVisible    = !g_menuVisible;
+    });
 }
 
-typedef void (*t_Awake)(uintptr_t);
-static t_Awake orig_TWH_Awake = NULL;
-static t_Awake orig_PCAwake   = NULL;
+// ─────────────────────────────────────────
+// MARK: — ESP frame collection (game thread)
+// ─────────────────────────────────────────
 
-static void Hook_TWH_Awake(uintptr_t thiz) {
-    if (orig_TWH_Awake) orig_TWH_Awake(thiz);
-    if (g_TWH_instance == 0 && thiz >= 0x10000)
-        g_TWH_instance = thiz;
-}
+// FILL: адрес PhotonNetwork._players или итерация через _actorToView
+// Это вызывается из хука Update — раз в кадр
 
-static void Hook_PCAwake(uintptr_t thiz) {
-    if (orig_PCAwake) orig_PCAwake(thiz);
-    if (g_localCtrl != 0) return;
-    if (thiz < 0x10000) return;
+static void collectESPFrame(Camera mainCam) {
+    if (!mainCam) return;
 
-    uintptr_t fps = cfPtr(thiz + OFF_PC_FPSCAM);
-    uintptr_t net = cfPtr(thiz + OFF_PC_NETWORK);
-    if (fps < 0x10000 || net < 0x10000) return;
+    // FILL: получить массив PlayerController* из PhotonNetwork.PlayerList
+    // Шаблон — подставь свой способ итерации:
+    //
+    //   Il2CppObject* pnInst = ...; // PhotonNetwork.Instance или статик
+    //   Il2CppObject* list   = fn_getPlayerList(pnInst);
+    //   int count            = il2cpp_array_length(list);
+    //   for (int i = 0; i < count; i++) {
+    //       Il2CppObject* pc = il2cpp_array_get(list, i);
+    //       ...
+    //   }
+    //
+    // Ниже — скелет цикла с заглушкой на входе
 
-    g_localCtrl = thiz;
-    g_localArms = cfPtr(thiz + OFF_PC_ARMSCTRL);
-}
+    extern Il2CppObject** g_playerControllers;
+    extern int            g_playerCount;
 
-// ═══════════════════════════════════════════════════════════════════
-//  UI helper
-// ═══════════════════════════════════════════════════════════════════
-static UIWindowScene* GetActiveScene(void) {
-    if (@available(iOS 13.0, *)) {
-        for (UIScene* sc in [UIApplication sharedApplication].connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]] &&
-                sc.activationState == UISceneActivationStateForegroundActive) {
-                return (UIWindowScene*)sc;
+    NSMutableArray* newData = [NSMutableArray new];
+
+    for (int i = 0; i < g_playerCount; i++) {
+        Il2CppObject* pc = g_playerControllers[i];
+        if (!pc) continue;
+
+        bool isDead = rd<bool>((uintptr_t)pc + OFF_PC_IS_DEATH);
+        if (isDead) continue;
+
+        Il2CppObject* net = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_NETWORK);
+        if (!net) continue;
+
+        Vector3 wPos = rd<Vector3>((uintptr_t)net + OFF_PN_NET_POSITION);
+
+        Il2CppObject* animCtrl = rd<Il2CppObject*>((uintptr_t)pc + OFF_PC_ANIM_CTRL);
+        Il2CppObject* skeleton = animCtrl
+            ? rd<Il2CppObject*>((uintptr_t)animCtrl + OFF_PAC_SKELETON)
+            : nullptr;
+
+        PlayerESPData* d = (PlayerESPData*)calloc(1, sizeof(PlayerESPData));
+        d->valid = false;
+
+        // Кости
+        if (skeleton) {
+            Transform head     = rd<Transform>((uintptr_t)skeleton + OFF_SK_HEAD);
+            Transform chest    = rd<Transform>((uintptr_t)skeleton + OFF_SK_CHEST);
+            Transform pelvis   = rd<Transform>((uintptr_t)skeleton + OFF_SK_PELVIS);
+            Transform lArm     = rd<Transform>((uintptr_t)skeleton + OFF_SK_L_UPPER_ARM);
+            Transform rArm     = rd<Transform>((uintptr_t)skeleton + OFF_SK_R_UPPER_ARM);
+            Transform lFore    = rd<Transform>((uintptr_t)skeleton + OFF_SK_L_FOREARM);
+            Transform lHand    = rd<Transform>((uintptr_t)skeleton + OFF_SK_L_HAND);
+            Transform lThigh   = rd<Transform>((uintptr_t)skeleton + OFF_SK_L_THIGH);
+            Transform rThigh   = rd<Transform>((uintptr_t)skeleton + OFF_SK_R_THIGH);
+
+            CGPoint p;
+            bool ok = true;
+
+            #define W2S(bone, dst) \
+                ok &= worldToScreen(mainCam, bonePos(bone), p); \
+                (dst) = p;
+
+            W2S(head,   d->head);
+            W2S(chest,  d->chest);
+            W2S(pelvis, d->pelvis);
+            W2S(lArm,   d->lShoulder);
+            W2S(rArm,   d->rShoulder);
+            W2S(lFore,  d->lElbow);
+            // rElbow = lFore оффсет одинаковый — FILL
+            d->rElbow = d->lElbow;
+            W2S(lHand,  d->lHand);
+            d->rHand = d->lHand; // FILL
+            W2S(lThigh, d->lHip);
+            W2S(rThigh, d->rHip);
+
+            #undef W2S
+
+            if (ok) {
+                // Радиус головы — 1/8 высоты box
+                float boxH = d->pelvis.y - d->head.y;
+                d->headR = fabsf(boxH) * 0.09f;
+
+                // Box из head/pelvis
+                float bw = fabsf(boxH) * 0.45f;
+                d->box = CGRectMake(
+                    d->head.x - bw / 2,
+                    d->head.y - d->headR * 1.5f,
+                    bw,
+                    fabsf(boxH) + d->headR * 2);
+                d->hasBox = YES;
+                d->valid  = YES;
             }
         }
+
+        // Если скелета нет, но позиция есть — только box
+        if (!d->valid) {
+            CGPoint root;
+            Vector3 topW   = { wPos.x, wPos.y + 1.75f, wPos.z };
+            Vector3 bottomW = { wPos.x, wPos.y, wPos.z };
+            CGPoint top, bot;
+            if (worldToScreen(mainCam, topW, top) &&
+                worldToScreen(mainCam, bottomW, bot)) {
+                float bh = fabsf(bot.y - top.y);
+                float bw = bh * 0.45f;
+                d->box     = CGRectMake(top.x - bw/2, top.y, bw, bh);
+                d->hasBox  = YES;
+                d->valid   = YES;
+            }
+        }
+
+        NSValue* v = [NSValue value:&d withObjCType:@encode(PlayerESPData*)];
+        [newData addObject:v];
     }
-    return nil;
+
+    dispatch_semaphore_wait(g_dataSema, DISPATCH_TIME_FOREVER);
+
+    // Освобождаем старые
+    for (NSValue* v in g_frameData) {
+        PlayerESPData* d = nil;
+        [v getValue:&d];
+        free(d);
+    }
+    g_frameData = newData;
+
+    dispatch_semaphore_signal(g_dataSema);
+
+    // Перерисовка в main thread
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_esp setNeedsDisplay];
+    });
 }
 
-static UIWindow* GetGameWindow(UIWindowScene* scene) {
-    if (!scene) return nil;
-    for (UIWindow* w in scene.windows) {
-        if (w.rootViewController) return w;
-    }
-    return nil;
+// ─────────────────────────────────────────
+// MARK: — Hooks
+// ─────────────────────────────────────────
+
+// Hook UnityAppController applicationDidBecomeActive — создаём overlay
+// или hook первого Update на основной камере
+
+%hook UnityAppController
+
+- (void)applicationDidFinishLaunching:(UIApplication*)app {
+    %orig;
+    resolveSymbols();
+
+    g_dataSema = dispatch_semaphore_create(1);
+    g_frameData = [NSMutableArray new];
+    screenSize  = [UIScreen mainScreen].bounds.size;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIWindow* win = [UIApplication sharedApplication].windows.firstObject;
+        if (!win) return;
+
+        // ESP overlay
+        g_esp = [[ESPView alloc] initWithFrame:win.bounds];
+        g_esp.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [win addSubview:g_esp];
+
+        // Menu
+        g_menu   = [[MenuView alloc] init];
+        g_menu.hidden = YES;
+        [win addSubview:g_menu];
+
+        // Floating toggle button
+        UIButton* tog = [UIButton buttonWithType:UIButtonTypeCustom];
+        tog.frame     = CGRectMake(10, 80, 38, 38);
+        tog.backgroundColor            = [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.88];
+        tog.layer.cornerRadius         = 5;
+        tog.layer.borderWidth          = 0.5f;
+        tog.layer.borderColor          = [UIColor colorWithWhite:0.22 alpha:1.0].CGColor;
+        [tog setTitle:@"▤" forState:UIControlStateNormal];
+        [tog setTitleColor:[UIColor colorWithRed:0.35 green:0.85 blue:1.0 alpha:1.0]
+                 forState:UIControlStateNormal];
+        tog.titleLabel.font = [UIFont systemFontOfSize:18];
+        [tog addTarget:[NSBlockOperation blockOperationWithBlock:^{}]
+                action:@selector(main)
+      forControlEvents:UIControlEventTouchUpInside];
+        // UIAction вместо target/action для блока
+        [tog addAction:[UIAction actionWithHandler:^(UIAction* a){
+            toggleMenu();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:tog];
+    });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  BuildUI — ретраит пока не появится активная сцена и game-окно
-// ═══════════════════════════════════════════════════════════════════
-static void BuildUI(void) {
-    UIWindowScene* scene = GetActiveScene();
-    if (!scene) {
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{ BuildUI(); });
-        return;
-    }
+%end
 
-    UIWindow* gameWin = GetGameWindow(scene);
-    if (!gameWin) {
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{ BuildUI(); });
-        return;
-    }
+// FILL: хук на Update игрового цикла для сбора данных
+// Пример — хук на PlayerController.Update или Camera LateUpdate
+// grep "Update\b" dump.cs по PlayerController или CameraController
+//
+// %hook SomeGameUpdateClass
+// - (void)Update {
+//     %orig;
+//     Il2CppObject* cam = /* get main camera */;
+//     collectESPFrame(cam);
+// }
+// %end
 
-    if (g_uiReady) return;  // уже собрано
+// ─────────────────────────────────────────
+// MARK: — Ctor
+// ─────────────────────────────────────────
 
-    CGRect scr = [UIScreen mainScreen].bounds;
-    g_sw = scr.size.width;
-    g_sh = scr.size.height;
-    g_center.x = g_sw * 0.5f;
-    g_center.y = g_sh * 0.5f;
-
-    // ESP-слой (не перехватывает touch)
-    g_espView = [[CFESPView alloc] initWithFrame:scr];
-    g_espView.userInteractionEnabled = NO;
-    [gameWin addSubview:g_espView];
-
-    // Меню (перехватывает touch только в своей области)
-    g_menu = [[CFMenu alloc] initWithScreen:scr];
-    [gameWin addSubview:g_menu];
-
-    g_uiReady = true;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  INIT
-// ═══════════════════════════════════════════════════════════════════
-static void Init(void) {
-    ConfigInit(&g_cfg);
-    memset(&g_localPos, 0, sizeof(g_localPos));
-
-    if (!Il2CppInit()) return;
-
-    // Unity
-    Transform_get_position = (t_GetPos)
-        FindMethodAnywhere("UnityEngine", "Transform", "get_position_Injected", 1);
-    if (!Transform_get_position) {
-        Transform_get_position = (t_GetPos)
-            FindMethodAnywhere("UnityEngine", "Transform", "get_position", 0);
-    }
-
-    Camera_W2S = (t_W2SInjected)
-        FindMethodAnywhere("UnityEngine", "Camera",
-                           "WorldToScreenPoint_Injected", 1);
-    Camera_GetMain = (t_GetMain)
-        FindMethodAnywhere("UnityEngine", "Camera", "get_main", 0);
-
-    // Chams
-    TWH_SetOnOutline = (t_TWH_SetOnOutline)
-        FindMethodAnywhere("", "TournamentWallHack", "SetOnOutline", 0);
-    TWH_SetOff = (t_TWH_SetOff)
-        FindMethodAnywhere("", "TournamentWallHack", "SetOff", 0);
-
-    // PlayerCulling.Instances (статик-поле)
-    void* asmImg = FindImageByName("Assembly-CSharp");
-    if (asmImg) {
-        uintptr_t sf = GetStaticFieldsOf(asmImg, "", "PlayerCulling");
-        if (sf >= 0x10000) g_cullingInstances = sf + 0x8;
-    }
-
-    // Hooks
-    uintptr_t a = FindMethodAnywhere("", "ArmsController", "LateUpdate", 0);
-    if (a) HOOK(a, Hook_ArmsLateUpdate, &orig_ArmsLateUpdate);
-
-    a = FindMethodAnywhere("", "TournamentWallHack", "Awake", 0);
-    if (a) HOOK(a, Hook_TWH_Awake, &orig_TWH_Awake);
-
-    a = FindMethodAnywhere("", "PlayerController", "Awake", 0);
-    if (a) HOOK(a, Hook_PCAwake, &orig_PCAwake);
-
-    // UI — на main thread с ретраем
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{ BuildUI(); });
-}
-
-__attribute__((constructor))
-static void Entry(void) {
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-        ^{ Init(); });
+%ctor {
+    NSString* bundle = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bundle isEqualToString:@"com.ScarletWork.CounterFlame"]) return;
+    %init;
 }
