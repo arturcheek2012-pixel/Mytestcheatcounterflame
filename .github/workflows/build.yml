@@ -1,41 +1,122 @@
-name: Build CFEsp
+name: Build CREZ Menu
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compile
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/theos
+            ~/.cache/theos-sdks
+          key: theos-sdks-ios165-${{ runner.os }}-v2
+
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang++ \
-            -arch arm64 \
-            -isysroot $SDK \
+          sudo apt-get install -y curl git make xz-utils ca-certificates
+          git clone --recursive https://github.com/theos/theos /opt/theos
+          # iOS 16.5 SDK
+          mkdir -p /opt/theos/sdks
+          curl -Ls "https://github.com/theos/sdks/archive/master.tar.gz" | \
+            tar -xz -C /opt/theos/sdks --strip-components=2 \
+            sdks-master/iPhoneOS16.5.sdk
+          # ImGui: clone into vendor include
+          git clone --depth 1 https://github.com/ocornut/imgui /tmp/imgui
+          mkdir -p /opt/theos/vendor/include/imgui
+          cp /tmp/imgui/imgui.h         /opt/theos/vendor/include/imgui/
+          cp /tmp/imgui/imgui.cpp       /opt/theos/vendor/include/imgui/
+          cp /tmp/imgui/imgui_internal.h /opt/theos/vendor/include/imgui/
+          cp /tmp/imgui/imgui_draw.cpp  /opt/theos/vendor/include/imgui/
+          cp /tmp/imgui/imgui_tables.cpp /opt/theos/vendor/include/imgui/
+          cp /tmp/imgui/imgui_widgets.cpp /opt/theos/vendor/include/imgui/
+
+      - name: Set up Theos env
+        run: |
+          echo "THEOS=/opt/theos"    >> $GITHUB_ENV
+          echo "/opt/theos/bin"      >> $GITHUB_PATH
+
+      - name: Generate ImGui unity build
+        run: |
+          cat > /tmp/imgui_impl.cpp << 'CPPEOF'
+          #include "/opt/theos/vendor/include/imgui/imgui.cpp"
+          #include "/opt/theos/vendor/include/imgui/imgui_draw.cpp"
+          #include "/opt/theos/vendor/include/imgui/imgui_tables.cpp"
+          #include "/opt/theos/vendor/include/imgui/imgui_widgets.cpp"
+          CPPEOF
+
+      - name: Generate Makefile
+        run: |
+          cat > Makefile << 'EOF'
+          THEOS_PACKAGE_SCHEME = rootful
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = CrezMenu
+          CrezMenu_FILES = Tweak.mm /tmp/imgui_impl.cpp
+          CrezMenu_CFLAGS = \
             -fobjc-arc \
-            -O2 \
-            -dynamiclib \
-            -framework UIKit \
-            -framework CoreGraphics \
-            -framework QuartzCore \
-            -lobjc \
-            -lc++ \
-            -o CFEsp.dylib \
-            Tweak.mm
+            -std=c++17 \
+            -I$(THEOS)/vendor/include \
+            -DIMGUI_DISABLE_DEMO_WINDOWS \
+            -DIMGUI_DISABLE_DEBUG_TOOLS \
+            -DIMGUI_IMPL_METAL_CPP_EXTENSIONS \
+            -Wno-deprecated-declarations \
+            -Wno-unknown-warning-option
+          CrezMenu_CCFLAGS = $(CrezMenu_CFLAGS)
+          CrezMenu_FRAMEWORKS = UIKit Metal MetalKit QuartzCore Foundation
+          CrezMenu_PRIVATE_FRAMEWORKS = SpringBoard SpringBoardFoundation
+          ARCHS = arm64 arm64e
+          TARGET = iphone:clang:16.5:15.0
 
-      - name: Sign
-        run: xcrun -sdk iphoneos ldid -S CFEsp.dylib || true
+          include $(THEOS)/makefiles/tweak.mk
+          EOF
 
-      - name: Upload
+      - name: Generate control
+        run: |
+          cat > control << 'EOF'
+          Package: com.crez.menu
+          Name: CREZ Menu
+          Version: 1.0.0
+          Architecture: iphoneos-arm
+          Description: CREZ premium mod menu
+          Author: crez
+          Section: Tweaks
+          EOF
+
+      - name: Build
+        run: |
+          export THEOS=/opt/theos
+          make -j$(nproc) 2>&1 | tee build.log
+          echo "--- build output ---"
+          find .theos/obj -name "*.dylib" 2>/dev/null || true
+
+      - name: Collect dylibs
+        run: |
+          mkdir -p dist
+          find .theos/obj -name "*.dylib" -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CFEsp-dylib
-          path: CFEsp.dylib
-          retention-days: 14
+          name: crez-menu-dylib
+          path: dist/*.dylib
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
