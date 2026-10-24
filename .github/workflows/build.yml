@@ -1,44 +1,25 @@
-name: Build CREZ Menu
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
+name: Stage1 Engine
+on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-14
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Clone ImGui
-        run: git clone --depth 1 https://github.com/ocornut/imgui imgui
-
-      - name: Compile
-        run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang++ \
-            -arch arm64 -arch arm64e \
-            -isysroot $SDK \
-            -std=c++17 -fobjc-arc -O2 \
-            -I. \
-            -DIMGUI_DISABLE_DEMO_WINDOWS \
-            -DIMGUI_DISABLE_DEBUG_TOOLS \
-            -dynamiclib \
-            -framework UIKit -framework Metal -framework MetalKit \
-            -framework QuartzCore -framework Foundation \
-            -lobjc -lc++ \
-            imgui/imgui.cpp imgui/imgui_draw.cpp \
-            imgui/imgui_tables.cpp imgui/imgui_widgets.cpp \
-            Tweak.mm \
-            -o CrezMenu.dylib
-
-      - name: Sign
-        run: xcrun -sdk iphoneos ldid -S CrezMenu.dylib || true
-
+      - run: |
+          git clone --recursive https://github.com/nillerusr/source-engine.git
+          cd source-engine
+          python3 waf --help > ../waf_help.txt 2>&1 || true
+          grep -rn -i "ios\|apple\|darwin\|osx" wscript scripts/waifulib/*.py > ../platform_refs.txt 2>&1 || true
+          export SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0"
+          export CXX="xcrun -sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=15.0"
+          python3 waf configure -T release --togles --disable-warns --build-games=cstrike 2>&1 | tee ../configure.log || true
+          python3 waf build -j4 2>&1 | tee ../build.log || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: crez-menu-dylib
-          path: CrezMenu.dylib
-          if-no-files-found: error
+          name: stage1-logs
+          path: |
+            waf_help.txt
+            platform_refs.txt
+            configure.log
+            build.log
