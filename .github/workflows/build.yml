@@ -21,8 +21,14 @@ jobs:
           export PKG_CONFIG_LIBDIR=$P/lib/pkgconfig:$P/share/pkgconfig
           export PKG_CONFIG_PATH=$PKG_CONFIG_LIBDIR
           python3 waf configure -T release --ios --togles --disable-warns --build-games=cstrike --prefix=out/ 2>&1 | tee ../configure.log
-          python3 waf build -j4 2>&1 | tee ../build.log
+          python3 waf build -j4 -k 2>&1 | tee ../build.log
           python3 waf install 2>&1 | tee ../install.log
+      - name: Errors summary
+        if: always()
+        run: |
+          grep -E "error:" build.log | sed -E 's/^.*error: //' | sort | uniq -c | sort -rn | head -60 > errors_grouped.txt || true
+          grep -m40 -E "error:" build.log > errors_first.txt || true
+          wc -l errors_grouped.txt errors_first.txt || true
       - name: App
         run: |
           xcodegen generate
@@ -47,3 +53,5 @@ jobs:
             configure.log
             build.log
             install.log
+            errors_grouped.txt
+            errors_first.txt
