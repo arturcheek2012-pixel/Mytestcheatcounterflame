@@ -60,39 +60,78 @@ typedef int CGLGlobalOption;
 typedef int CGLRendererProperty;
 #define kCGLNoError 0
 """
+INC_CGL = '#pragma once\n#include <OpenGL/CGLTypes.h>\n'
+
+GLES_GL = """#pragma once
+#include <OpenGLES/ES3/gl.h>
+#include <OpenGLES/ES3/glext.h>
+#ifndef IOS_GL_COMPAT_TYPES
+#define IOS_GL_COMPAT_TYPES
+typedef double GLdouble;
+typedef double GLclampd;
+#endif
+"""
+
+CARBON = """#pragma once
+#include <stdint.h>
+#include <CoreFoundation/CoreFoundation.h>
+typedef struct __PasteboardRef *PasteboardRef;
+typedef void *PasteboardItemID;
+typedef uint32_t PasteboardSyncFlags;
+typedef uint32_t PasteboardFlavorFlags;
+#define kPasteboardClipboard CFSTR("com.apple.pasteboard.clipboard")
+enum { kPasteboardModified = 1, kPasteboardClientIsOwner = 2 };
+static inline int32_t PasteboardCreate(CFStringRef n, PasteboardRef *p) { (void)n; *p = 0; return -1; }
+static inline int32_t PasteboardClear(PasteboardRef p) { (void)p; return -1; }
+static inline PasteboardSyncFlags PasteboardSynchronize(PasteboardRef p) { (void)p; return 0; }
+static inline int32_t PasteboardGetItemCount(PasteboardRef p, uint32_t *c) { (void)p; *c = 0; return -1; }
+static inline int32_t PasteboardGetItemIdentifier(PasteboardRef p, CFIndex i, PasteboardItemID *o) { (void)p; (void)i; *o = 0; return -1; }
+static inline int32_t PasteboardCopyItemFlavorData(PasteboardRef p, PasteboardItemID i, CFStringRef f, CFDataRef *d) { (void)p; (void)i; (void)f; *d = 0; return -1; }
+static inline int32_t PasteboardPutItemFlavor(PasteboardRef p, PasteboardItemID i, CFStringRef f, CFDataRef d, PasteboardFlavorFlags fl) { (void)p; (void)i; (void)f; (void)d; (void)fl; return -1; }
+"""
+
+OAL_EXT = """#pragma once
+#include <OpenAL/al.h>
+typedef ALvoid (*alBufferDataStaticProcPtr)(const ALint bid, ALenum format, ALvoid *data, ALsizei size, ALsizei freq);
+"""
+
 SHIMS = {
     'OpenGL/CGLTypes.h': CGL,
-    'OpenGL/OpenGL.h': '#pragma once\n#include <OpenGL/CGLTypes.h>\n',
-    'OpenGL/CGLCurrent.h': '#pragma once\n#include <OpenGL/CGLTypes.h>\n',
+    'OpenGL/OpenGL.h': INC_CGL,
+    'OpenGL/CGLCurrent.h': INC_CGL,
+    'OpenGL/CGLRenderers.h': INC_CGL,
+    'OpenGL/CGLProfiler.h': INC_CGL,
+    'OpenGL/gl.h': GLES_GL,
+    'OpenGL/glext.h': '#pragma once\n#include <OpenGL/gl.h>\n',
+    'OpenGL/glu.h': '#pragma once\n',
     'ApplicationServices/ApplicationServices.h':
         '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n'
-        '#include <CoreGraphics/CoreGraphics.h>\n#include <CFNetwork/CFNetwork.h>\n',
-    'Carbon/Carbon.h': '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n',
+        '#include <CoreGraphics/CoreGraphics.h>\n#include <CFNetwork/CFNetwork.h>\n'
+        '#include <Carbon/Carbon.h>\n',
+    'Carbon/Carbon.h': CARBON,
     'Cocoa/Cocoa.h': '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n'
                      '#ifdef __OBJC__\n#import <UIKit/UIKit.h>\n#endif\n',
-    'OpenAL/MacOSX_OALExtensions.h': '#pragma once\n',
+    'OpenAL/MacOSX_OALExtensions.h': OAL_EXT,
 }
 for rel, text in SHIMS.items():
     p = root / 'ios_shims' / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text)
 
-# --- точечные патчи ---
-edit('public/togles/linuxwin/glbase.h', lambda s: s.replace(
-    "#include <OpenGL/CGLCurrent.h>",
-    "#ifndef IOS\n#include <OpenGL/CGLCurrent.h>\n#endif"))
+# --- замена glmgrcocoa.mm: одна функция-мостик ---
+STUB = """#include <OpenGL/CGLTypes.h>
+typedef void _PseudoNSGLContext;
+typedef _PseudoNSGLContext *PseudoNSGLContextPtr;
+CGLContextObj GetCGLContextFromNSGL( PseudoNSGLContextPtr ) { return 0; }
+"""
+(root / 'togles/linuxwin/ios_stubs.cpp').write_text(STUB)
+edit('togles/wscript', lambda s: s.replace(
+    "'linuxwin/glmgrcocoa.mm'", "'linuxwin/ios_stubs.cpp'"))
 
 # system() недоступен на iOS
 p = root / 'vgui2/vgui_controls/FileOpenDialog.cpp'
 if p.exists():
     p.write_text('#include <stdlib.h>\n#define system(x) (-1)\n' + p.read_text())
-
-# macOS-only файл Cocoa
-p = root / 'togles/wscript'
-if p.exists():
-    s = p.read_text()
-    s2 = re.sub(r"""['"][^'"]*glmgrcocoa\.mm['"]\s*,?""", "", s)
-    p.write_text(s2)
 
 # прокси через SystemConfiguration/CFNetwork
 PRE = (b'#include <CoreFoundation/CoreFoundation.h>\n#include <CFNetwork/CFNetwork.h>\n'
