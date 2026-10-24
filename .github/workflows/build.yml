@@ -16,8 +16,9 @@ jobs:
           cd engine
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           P=$GITHUB_WORKSPACE/ios-prefix
-          export CC="clang -target arm64-apple-ios15.0 -isysroot $SDK"
-          export CXX="clang++ -target arm64-apple-ios15.0 -isysroot $SDK"
+          S=$PWD/ios_shims
+          export CC="clang -target arm64-apple-ios15.0 -isysroot $SDK -I$S -DGLES_SILENCE_DEPRECATION"
+          export CXX="clang++ -target arm64-apple-ios15.0 -isysroot $SDK -I$S -DGLES_SILENCE_DEPRECATION"
           export PKG_CONFIG_LIBDIR=$P/lib/pkgconfig:$P/share/pkgconfig
           export PKG_CONFIG_PATH=$PKG_CONFIG_LIBDIR
           python3 waf configure -T release --ios --togles --disable-warns --build-games=cstrike --prefix=out/ 2>&1 | tee ../configure.log
