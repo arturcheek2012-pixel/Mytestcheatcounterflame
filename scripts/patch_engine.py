@@ -44,7 +44,68 @@ edit('wscript', wscript)
 edit('appframework/wscript', lambda s: s.replace(
     "if bld.env.DEST_OS == 'darwin' and bld.env.GL:",
     "if bld.env.DEST_OS == 'darwin' and bld.env.GL and not bld.env.IOS:"))
+
+# --- заглушки macOS-заголовков для iOS ---
+CGL = """#pragma once
+#include <stdint.h>
+typedef struct _CGLContextObject *CGLContextObj;
+typedef struct _CGLPixelFormatObject *CGLPixelFormatObj;
+typedef struct _CGLRendererInfoObject *CGLRendererInfoObj;
+typedef struct _CGLPBufferObject *CGLPBufferObj;
+typedef int CGLError;
+typedef int CGLPixelFormatAttribute;
+typedef int CGLContextEnable;
+typedef int CGLContextParameter;
+typedef int CGLGlobalOption;
+typedef int CGLRendererProperty;
+#define kCGLNoError 0
+"""
+SHIMS = {
+    'OpenGL/CGLTypes.h': CGL,
+    'OpenGL/OpenGL.h': '#pragma once\n#include <OpenGL/CGLTypes.h>\n',
+    'OpenGL/CGLCurrent.h': '#pragma once\n#include <OpenGL/CGLTypes.h>\n',
+    'ApplicationServices/ApplicationServices.h':
+        '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n'
+        '#include <CoreGraphics/CoreGraphics.h>\n#include <CFNetwork/CFNetwork.h>\n',
+    'Carbon/Carbon.h': '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n',
+    'Cocoa/Cocoa.h': '#pragma once\n#include <CoreFoundation/CoreFoundation.h>\n'
+                     '#ifdef __OBJC__\n#import <UIKit/UIKit.h>\n#endif\n',
+    'OpenAL/MacOSX_OALExtensions.h': '#pragma once\n',
+}
+for rel, text in SHIMS.items():
+    p = root / 'ios_shims' / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+
+# --- точечные патчи ---
 edit('public/togles/linuxwin/glbase.h', lambda s: s.replace(
     "#include <OpenGL/CGLCurrent.h>",
     "#ifndef IOS\n#include <OpenGL/CGLCurrent.h>\n#endif"))
+
+# system() недоступен на iOS
+p = root / 'vgui2/vgui_controls/FileOpenDialog.cpp'
+if p.exists():
+    p.write_text('#include <stdlib.h>\n#define system(x) (-1)\n' + p.read_text())
+
+# macOS-only файл Cocoa
+p = root / 'togles/wscript'
+if p.exists():
+    s = p.read_text()
+    s2 = re.sub(r"""['"][^'"]*glmgrcocoa\.mm['"]\s*,?""", "", s)
+    p.write_text(s2)
+
+# прокси через SystemConfiguration/CFNetwork
+PRE = (b'#include <CoreFoundation/CoreFoundation.h>\n#include <CFNetwork/CFNetwork.h>\n'
+       b'#include <SystemConfiguration/SystemConfiguration.h>\n'
+       b'#define SCDynamicStoreCopyProxies(x) ((CFDictionaryRef)NULL)\n')
+SKIP = {'thirdparty', 'lib', 'build', 'ios_shims', '.git'}
+for f in root.rglob('*'):
+    if f.suffix in ('.cpp', '.cc', '.mm', '.m', '.c') and f.is_file():
+        if set(f.relative_to(root).parts) & SKIP:
+            continue
+        data = f.read_bytes()
+        if b'SCDynamicStoreCopyProxies' in data:
+            f.write_bytes(PRE + data)
+            print('proxy patched:', f)
+
 print('patched')
