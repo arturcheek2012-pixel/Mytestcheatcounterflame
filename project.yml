@@ -1,1 +1,16 @@
-
+name: CSS
+options:
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  CSS:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.css.ios
+      INFOPLIST_FILE: App/Info.plist
+      GENERATE_INFOPLIST_FILE: NO
+      SWIFT_VERSION: "5.0"
+      SWIFT_OBJC_BRIDGING_HEADER: App/Bridge.h
+      TARGETED_DEVICE_FAMILY: "1,2"
