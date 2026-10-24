@@ -26,6 +26,7 @@ jobs:
       - name: App
         run: |
           xcodegen generate
+          sed -i '' -e 's/objectVersion = 77/objectVersion = 56/' -e '/preferredProjectObjectVersion/d' CSS.xcodeproj/project.pbxproj
           xcodebuild -project CSS.xcodeproj -scheme CSS -sdk iphoneos -configuration Release \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
       - name: IPA
