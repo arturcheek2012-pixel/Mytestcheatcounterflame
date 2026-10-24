@@ -1,25 +1,48 @@
-name: Stage1 Engine
+name: Build CSS iOS
 on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - run: |
-          git clone --recursive https://github.com/nillerusr/source-engine.git
-          cd source-engine
-          python3 waf --help > ../waf_help.txt 2>&1 || true
-          grep -rn -i "ios\|apple\|darwin\|osx" wscript scripts/waifulib/*.py > ../platform_refs.txt 2>&1 || true
-          export SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
-          export CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0"
-          export CXX="xcrun -sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=15.0"
-          python3 waf configure -T release --togles --disable-warns --build-games=cstrike 2>&1 | tee ../configure.log || true
-          python3 waf build -j4 2>&1 | tee ../build.log || true
+      - uses: actions/checkout@v4
+      - run: brew install pkgconf xcodegen
+      - name: Deps
+        run: bash scripts/build_deps.sh
+      - name: Engine
+        continue-on-error: true
+        run: |
+          git clone --recursive --depth 1 https://github.com/nillerusr/source-engine engine
+          python3 scripts/patch_engine.py engine
+          cd engine
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          P=$GITHUB_WORKSPACE/ios-prefix
+          export CC="clang -target arm64-apple-ios15.0 -isysroot $SDK"
+          export CXX="clang++ -target arm64-apple-ios15.0 -isysroot $SDK"
+          export PKG_CONFIG_LIBDIR=$P/lib/pkgconfig:$P/share/pkgconfig
+          export PKG_CONFIG_PATH=$PKG_CONFIG_LIBDIR
+          python3 waf configure -T release --ios --togles --disable-warns --build-games=cstrike --prefix=out/ 2>&1 | tee ../configure.log
+          python3 waf build -j4 2>&1 | tee ../build.log
+          python3 waf install 2>&1 | tee ../install.log
+      - name: App
+        run: |
+          xcodegen generate
+          xcodebuild -project CSS.xcodeproj -scheme CSS -sdk iphoneos -configuration Release \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CSS.app Payload/
+          mkdir -p Payload/CSS.app/bin
+          cp engine/out/bin/*.dylib Payload/CSS.app/bin/ || true
+          cp -L ios-prefix/lib/libSDL2*.dylib Payload/CSS.app/bin/ || true
+          bash scripts/fix_dylibs.sh Payload/CSS.app/bin
+          zip -qr CSS.ipa Payload
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stage1-logs
+          name: css-ios
           path: |
-            waf_help.txt
-            platform_refs.txt
+            CSS.ipa
             configure.log
             build.log
+            install.log
