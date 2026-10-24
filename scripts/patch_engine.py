@@ -44,4 +44,7 @@ edit('wscript', wscript)
 edit('appframework/wscript', lambda s: s.replace(
     "if bld.env.DEST_OS == 'darwin' and bld.env.GL:",
     "if bld.env.DEST_OS == 'darwin' and bld.env.GL and not bld.env.IOS:"))
+edit('public/togles/linuxwin/glbase.h', lambda s: s.replace(
+    "#include <OpenGL/CGLCurrent.h>",
+    "#ifndef IOS\n#include <OpenGL/CGLCurrent.h>\n#endif"))
 print('patched')
